@@ -44,12 +44,15 @@ class RuntimeWorkerError(RuntimeErrorBase):
         *,
         error_code: str | None = None,
         failure_payload: Mapping[str, object] | None = None,
+        diagnostic_exception_type: str | None = None,
     ) -> None:
         super().__init__(message)
         if error_code is not None:
             self.error_code = error_code
         if failure_payload is not None:
             self.failure_payload = dict(failure_payload)
+        if diagnostic_exception_type is not None:
+            self.diagnostic_exception_type = diagnostic_exception_type
 
 
 __all__ = [

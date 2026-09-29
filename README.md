@@ -32,7 +32,7 @@ python -m research_pipeline --help
   → Result
   → verify
   → VerificationResult
-  → report / compare / export-result / Dashboard
+  → report / compare / analysis / export-result / Dashboard
 ```
 
 最短命令示例：
@@ -40,14 +40,21 @@ python -m research_pipeline --help
 ```powershell
 python -m research_pipeline catalog dataset search daily --catalog-lock <持久Catalog-Lock目录> --format json
 python -m research_pipeline package init work/my_research --json
+python -m research_pipeline package expand-variants --base work/my_research --manifest work/variants.yaml --output-root work/variants --json
 python -m research_pipeline package lint --package work/my_research --catalog-lock <搜索结果.catalog_context.lock_reference> --json
 python -m research_pipeline package admit --package work/my_research --catalog-lock <搜索结果.catalog_context.lock_reference> --data-db <source:prod只读DuckDB> --output work/plan --json
 python -m research_pipeline run --plan work/plan --data-db <只读DuckDB> --artifact-root work/artifacts --handoff-out work/handoff.json --run-root work/run --result-store work/results --clock 2026-01-01T00:00:00+08:00 --root-seed 0 --json
 python -m research_pipeline verify --result <Result目录> --result-store work/results --output work/verification-result.json --json
-python -m research_pipeline report --verification-result work/verification-result.json --result-store work/results --json
+python -m research_pipeline report --verification-result work/verification-result.json --result-store work/results --output work/verification-report.md --format markdown --json
 ```
 
+需要对 Result 中的时间序列表做逐年统计、复合收益或回撤时，先在仓库外编写显式
+`AnalysisRequest`，再使用 `analysis run` 生成独立 `AnalysisResult`。框架不会根据列名、单位、
+项目或市场猜收益语义；多份结果只通过 `analysis compare` 按显式指标和方向比较。
+
 `package init` 只创建未填写研究事实的四份声明草稿。先明确来源、市场适配、指标、数据请求、研究时点和算子图；草稿 `lint` 会指出当前阻断的字段，未补齐前不能 `admit`。上述流程中的后续步骤以填写完整且通过严格校验的包为前提。
+
+多个研究只差少量既有算子参数时，可以用仓库外变体清单先展开多个完整包；展开器不接受任意 YAML 合并、Python 或 SQL。每个输出包仍须独立 lint、admit、run 和 verify。新 run 可重复提供 `--reuse-run-root <已完成run>`，机会式复用节点身份完全一致、内容复验通过且声明为 `pure/cacheable` 的 checkpoint；未命中时正常执行。若指定节点禁止回退重算，可重复增加 `--require-reused-node <节点>`：Runtime 会在任何 Worker 启动前完整复验指定节点及其必要上游，这些显式节点可以不是 `pure/cacheable`，但任一节点不可复用时整次 run 直接拒绝。修正 ResultSpec 等不改变 DAG 的计划后，也可显式提供 `--reuse-failed-run-root <失败run>`，把该失败运行中已成功的 checkpoint 完整复验并复制到新 run，再从首个未成功节点继续。两种来源不能混用，均不会自动扫描磁盘或把 ResultStore 当作上游缓存。
 
 `catalog dataset/field search` 的机器结果会返回本次实际加载的
 `catalog_context.lock_reference`、Catalog 身份和 source profile/environment；dataset 命中项还会
@@ -123,15 +130,19 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 
 ## 每一步校验由谁消费
 
-- `package lint`：由 AI 或操作者消费；一次返回 package、字段、算子、指标、ResultSpec、已声明资源预算和准入缺口。它不授予运行资格。
+- `package lint`：由 AI 或操作者消费；一次返回 package、字段、算子、指标、ResultSpec、已声明资源预算和 `required_inputs`。尚缺数据源或输出目录时不生成带占位符的伪命令，也不授予运行资格。
 - `package admit`：由 `run` 消费；自动观察显式只读数据源的 Catalog 漂移和 PIT 合同，生成不可变计划并在发布/加载时校验准入事实。
-- Runtime 校验：由 `resume`、`retry-node`、`rerun-from` 和 ResultAssembler 消费；身份、clock、seed、实现或 checkpoint 漂移时拒绝复用。节点间只用已验证的 typed ExternalArtifact 交接；同一次 execute 由 Supervisor 完整验证一次并复用冻结文件列表，新的 run/resume 进程重新验证。ResultAssembler 从 Runtime 输出索引汇总数据引用，不读取 artifact/handoff 阶段旁路。
+- Runtime 校验：由 `resume`、`retry-node`、`rerun-from`、显式 `run --reuse-run-root`、`run --reuse-failed-run-root` 和 ResultAssembler 消费；身份、clock、seed、实现或 checkpoint 漂移时拒绝复用。普通跨运行来源必须是已经成功发布 Result 的完成态 run，只机会式复用 `pure/cacheable` 节点，未命中时正常执行；同时提供 `--require-reused-node` 时，指定节点及其必要上游可以不是 `pure/cacheable`，但必须在任何 Worker 启动前全部通过节点身份、输入和 checkpoint 内容复验，否则拒绝整次 run。失败 run 来源则必须处于失败终态，且新旧 DAG、节点身份环境、clock 和 seed 完全一致，只导入事件状态为成功且内容复验通过的 checkpoint。命中后以普通字节复制 ExternalArtifact 并提交目标 run 自己的 checkpoint；存在同身份但损坏的候选时失败关闭。节点间只用已验证的 typed ExternalArtifact 交接；同一次 execute 由 Supervisor 完整验证一次并复用冻结文件列表，新的 run/resume 进程重新验证。项目 Worker 失败时保留稳定错误码和脱敏、限长的根异常摘要；ResultSpec 选中的 Parquet 前缀在生产节点提交后立即校验。ResultAssembler 从 Runtime 输出索引汇总数据引用，不读取 artifact/handoff 阶段旁路。
+- 项目准入事实：项目 Worker 只能读取节点参数显式绑定的 request。普通列式输入携带已验证数据表及准入元数据；原始 1 分钟扫描输入只投影与当前 admitted plan 对齐的准入元数据，不开放分钟文件。Worker 必须完整消费，Supervisor 复核来源身份、schema 和 metadata-only 轨迹。
+- 项目参数 ABI：薄声明可登记 `parameter_preflight: {module, function}`。package 编译会在打开数据库和执行 DAG 前，把真实冻结后的 `ProjectOperatorContext` 交给独立短进程；JSON 对象表现为只读 `Mapping`，列表表现为 `tuple`。预检函数只接收 context，必须返回 `None`。未登记钩子的历史 bundle 仍可读取，但不会获得项目源码级参数解释预检。
 - 多请求 data 节点恢复：每个已提交 DatasetArtifactRef 按 request 原子记录在 run 内 partial index；retry/resume 逐项复验并只重做失效 request。partial 不进入最终 ExternalArtifact、checkpoint 或 Result。
 - Data Plane 资源准入：QueryIR 的 `max_rows/max_bytes` 只限制输出，不再冒充进程内存上界。admit 把数据节点预算编译为 DuckDB、batch/writer 和进程余量三部分；当前已校准的 provider 进程树支持包络下限是 256 MiB，低于下限会在对象统计和扫描前拒绝。正式 provider 仍设置 DuckDB memory/temp、Arrow batch 和 CPU；Runtime 现有 ResourceObservation 记录实际进程树 RSS 与 scratch 峰值。该包络由全新进程中的真实 DuckDB/Parquet/Arrow 代表查询回归，不承诺任意第三方 allocator 的数学硬上界。
-- 下游分区消费：完整矩阵消费者先读 Parquet footer，明显超预算时在数据页读取前拒绝；项目 Worker 在本次节点资源预算内自行管理并行。内部 worker 默认 1 个，显式指定不能超过 CPU 或 `max_workers` 容量。
-- `inspect` 恢复诊断：只读重放事件并复用正式 checkpoint 校验，返回每个节点的最后错误、尝试余额、checkpoint 拒绝原因、独立 finalize 状态和唯一下一条命令。旧 run 缺 finalize 投影时明确显示 `unknown`，不根据 Runtime succeeded 猜 Result 已发布。
-- Result 完整性：由 `verify` 消费；表字节、schema、行数、lineage、指标可达性和验证闭包不一致时不生成 VerificationResult。金融 oracle 以稳定 Arrow 批次和受 memory/temp 配额约束的只读 DuckDB 扫描 canonical/TCA；不再因 Result 超过固定 512 MiB 而直接拒绝，也不会把完整表转成 Python 行。资源不足会使整次验证失败，不会跳过金融复核。
-- 五类 validity：由 `verify` 重算；`report`、`compare`、`export-result` 可消费 `status=fail` 结果用于诊断，Dashboard 只接收 `status=pass`。`export-result` 只复制并复核已验证 Result，不重新执行研究。按研究和 claim 适用，确实不适用时记录稳定 `N/A` 原因。
+- JSON 数组 VIEW：受支持的“单数组 + 有限分类”形状由 admit 从只读对象定义冻结为结构化执行证据，provider 用投影式 `UNNEST(from_json(...))` 读取原始表，避免 `json_each` 横向连接放大临时工作集。日期、分类、元素输出和 QueryIR 过滤仍按原 VIEW 语义执行；形状识别不完整时失败关闭。
+- 下游分区消费：完整矩阵消费者先读 Parquet footer，明显超预算时在数据页读取前拒绝；项目 Worker 在本次节点资源预算内自行管理并行。Operator 资源声明同时包含 CPU 与进程槽；逐分区和 causal Worker 共用节点 wall-time 截止时间，不按调用次数重置。
+- `inspect` 恢复诊断：只读重放事件并复用正式 checkpoint 校验，返回依赖等待、资源等待、执行、checkpoint、Result finalize 或终态阶段，以及节点时长、心跳、进程健康、资源申请/租约、最后错误、尝试余额和 checkpoint 拒绝原因。共享资源池读取不会清理或改写治理文件。`run --json` 失败时会直接从同一份正式 diagnostic 事件返回 `failed_node`、`root_error`、`run_root` 和完整 `inspect` 命令，不另写第二套错误日志。完整后续命令同时提供 `next_command` 和 `next_command_argv`；缺少操作者选择时返回 `required_inputs`。旧 run 缺 finalize 投影时明确显示 `unknown`，不根据 Runtime succeeded 猜 Result 已发布。
+- Result 完整性：由 `verify` 消费；表字节、schema、行数、lineage、指标可达性和验证闭包不一致时不生成 VerificationResult。新项目 Result 会内嵌 Plan 中已经冻结并复验的 Verifier bundle，可直接 verify；历史项目 Result 仍接受显式 `--verifier-bundle`，不会被迁移或改写。金融 oracle 以稳定 Arrow 批次和受 memory/temp 配额约束的只读 DuckDB 扫描 canonical/TCA；不再因 Result 超过固定 512 MiB 而直接拒绝，也不会把完整表转成 Python 行。资源不足会使整次验证失败，不会跳过金融复核。
+- 五类 validity：由 `verify` 重算；统计矩阵默认要求列满秩，列数多于有效观察行的宽矩阵必须由独立项目 Verifier 复算行数、非零有效行数、列数和秩，并达到该矩阵可实现的秩上限。`report`、`compare`、`export-result` 可消费 `status=fail` 结果用于诊断，`analysis` 和 Dashboard 只接收 `status=pass`。`analysis` 只派生结构化分析事实，不提升原有 claim；`export-result` 只复制并复核已验证 Result，不重新执行研究。按研究和 claim 适用，确实不适用时记录稳定 `N/A` 原因。
+- 通用 Result 分析：`analysis run` 通过同一 verified context 复核 Result 根身份和所选表文件，只投影请求中的日期列和值列。值语义、频率、期间数、单位、费用口径、缺失值和年度完整性政策都由请求显式声明；公共核心不包含项目、因子、市场、币种、阈值或固定业务列名。`analysis compare` 只消费规范 AnalysisResult；分析规格、实际窗口、列类型或 claim 事实不一致时整次不给排名。
 - 跨方案比较：直接 `compare` 只比较已经验证的指标单位、方向、窗口、样本量、状态和实际 claim
   事实，返回 `verified_metric_facts_only` 并明确未检查 package 合同；完整研究语义比较使用
   `package compare`，由 `packages.delivery` 唯一检查两侧 metric/claim 合同。不同 plan 只作说明，
@@ -159,7 +170,8 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 - 研究主链只读消费已正式发布的因子，不导入因子 Publisher，也不承担因子发布或数据库写入；发布由项目侧独立授权执行。
 - 框架保留项目无关的 Catalog/PIT、typed ports、Runtime、Result/VerificationResult envelope 和已准入的通用因子原语；具体模型、关系表组合和研究画像归项目侧，不能作为公共内建能力调用。
 
-- 项目 Verifier 与 Operator bundle 分开冻结身份、版本、源码摘要和授权输入。`package lint/admit --verifier-bundle` 冻结身份，`verify --verifier-bundle` 显式提供同一 bundle；Verifier 只能读取 Result 已封存且显式授权的表和支持工件，不能读取完整 ResultStore、运行目录或未授权兄弟工件；项目结论以统一 VerificationResult envelope 返回。
+- 项目 Verifier 与 Operator bundle 分开冻结身份、版本、源码摘要和授权输入。`package lint/admit --verifier-bundle` 把复验后的 bundle 封入 Plan；新 Result 再把该闭包封入 `verifiers/<bundle_hash>`，所以正式 `verify` 不依赖外部路径。历史 Result 仍可显式提供冻结身份一致的 bundle。一个 Verifier 可以声明供多个项目变体共用的指标定义超集，当前 Package 只把自己 MetricContract 选中的定义编入正式可达性证明，未选指标不会成为正式指标。项目源码闭包只纳入 UTF-8 Python 源码，并忽略解释器生成的 `__pycache__`，使同一源码在导入前后保持相同身份。Verifier 只能读取 Result 已封存且显式授权的表和支持工件，不能读取完整 ResultStore、运行目录或未授权兄弟工件；项目结论以统一 VerificationResult envelope 返回。
+- 新建 MetricDefinition 使用 v3，并显式冻结 `quantity`、`numerator`、`denominator`、`observation_timing` 和 `aggregation`。这些测量语义进入定义摘要、Verifier bundle、Result 和比较身份；同名同单位但口径不同的指标不能混比。历史 v2 定义仍可只读加载，框架不会替旧结果猜测缺失口径。
 - 项目源码、ResearchPackage、因子定义和历史验收材料保留在项目侧，不进入公开 core 包。
 - ResearchPackage 不会根据出现的日频、模型、因子或事件算子自动补齐或强制完整整图。
   当前只执行 typed ports、DAG、Feature/Label 祖先、ResearchSemantics、时间、PIT、seed、
@@ -180,15 +192,15 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 | --- | --- | --- | --- | --- |
 | `catalog.lock` | `local_only` | `catalog` | `local_acceptance` / `local_only` | Catalog 编译、锁定和漂移检查由显式来源文件驱动；公开仓库不附带个人 Catalog 或独立发布验收记录。 |
 | `research_package.plan` | `local_only` | `package lint`<br>`package admit` | `local_acceptance` / `local_only` | ResearchPackage 只能声明受控合同，不接受自由 SQL、动态模块或项目 runner。lint 一次返回声明、算子、指标、结果和准入缺口；admit 从显式只读数据源生成漂移/PIT 闭包并在发布/加载时校验准入事实。 |
-| `runtime.recovery` | `local_only` | `resume`<br>`retry-node`<br>`inspect`<br>`rerun-from` | `local_acceptance` / `local_only` | resume、retry-node、inspect 和 rerun-from 只消费当前 invocation、计划内算子闭包和已验证 checkpoint；同一次 execute 复用 Supervisor 已冻结的工件验证结果，新的 resume 进程、rerun child 或新 run 必须重新完整验证。多请求 data 节点另以 run 内 partial index 逐项复验已提交 DatasetArtifactRef，只重做失效 request；partial 不进入正式输出。身份变化必须重新 admit 并新建 run。该边界仍为 local_only。 |
-| `evidence.consume` | `local_only` | `verify`<br>`report`<br>`export-result`<br>`compare` | `local_acceptance` / `local_only` | verify 直接从自包含 Result 生成结构化 VerificationResult；report、compare、export-result 和 Dashboard 只消费 VerificationResult 与 ResultStore，不依赖 run-root。直接 compare 只比较已验证指标事实并明示未检查 package 合同；package compare 由 delivery 唯一检查 metric/claim 合同。不同 plan 只作说明，口径不一致时整次拒绝且不输出部分 delta。export-result 仅复制并复核已验证 Result，不重新执行研究。该合同尚未通过独立发布验收，因此保持 local_only。 |
+| `runtime.recovery` | `local_only` | `resume`<br>`retry-node`<br>`inspect`<br>`rerun-from`<br>`run --reuse-run-root`<br>`run --require-reused-node`<br>`run --reuse-failed-run-root` | `local_acceptance` / `local_only` | resume、retry-node、inspect 和 rerun-from 消费当前 invocation、计划内算子闭包和已验证 checkpoint；普通 run --reuse-run-root 只按显式顺序接受现行节点局部身份下已成功发布 Result 的完成态 run，并机会式复用 pure/cacheable 节点。配合 --require-reused-node 时，指定节点及其必要上游允许不是 pure/cacheable，但必须在 Worker 启动前全部通过节点局部身份、输入、checkpoint、typed 输出和 ExternalArtifact 内容复验，且不得回退执行。run --reuse-failed-run-root 只接受一个显式失败终态 run，要求新旧 DAG、节点身份环境、clock 和 seed 完全一致，只把状态为成功且完整复验通过的 checkpoint 复制进目标 run，再从首个未成功节点继续。两种跨运行来源不能混用，不扫描磁盘或依赖裸 ResultStore。同一次 execute 复用 Supervisor 已冻结的工件验证结果，新的 resume 进程、rerun child 或新 run 必须重新完整验证。多请求 data 节点另以 run 内 partial index 逐项复验已提交 DatasetArtifactRef，只重做失效 request；partial 不进入正式输出。旧计划仍可 inspect/resume/retry，但不能开启跨运行复用。该边界仍为 local_only。 |
+| `evidence.consume` | `local_only` | `verify`<br>`report`<br>`export-result`<br>`compare`<br>`analysis run`<br>`analysis compare` | `local_acceptance` / `local_only` | verify 直接从自包含 Result 生成结构化 VerificationResult；report、compare、analysis、export-result 和 Dashboard 不依赖 run-root。analysis run 只消费 status=pass 的 VerificationResult，要求外部请求显式声明表列、窗口、值语义、频率、单位、费用口径和处理政策，只投影日期和值两列并生成独立 AnalysisResult，不修改 Result、VerificationResult 或 claim。analysis compare 只对同规格、同实际窗口和同 claim 事实的 AnalysisResult 排名，任一必要事实不一致时不输出部分排名。直接 compare 仍只比较已验证指标事实并明示未检查 package 合同；package compare 由 delivery 唯一检查 metric/claim 合同。export-result 仅复制并复核已验证 Result，不重新执行研究。该合同尚未通过独立发布验收，因此保持 local_only。 |
 | `evidence.validity_recompute` | `local_only` | `verify` | `local_acceptance` / `local_only` | 独立 verify 从已封存的 canonical 六表与 Bar TCA 四表复核金融守恒、费用与 lineage；金融 oracle 使用有界 Arrow 批次和受配额 DuckDB 扫描，篡改或资源不足均阻止生成 VerificationResult。公开源码提供合同测试，不附带个人真实数据 Result 或独立发布验收；能力保持 local_only，不代表策略盈利、实盘成交或可交易性。 |
 | `operator_graph.generic_run` | `local_only` | `run`<br>`resume`<br>`retry-node`<br>`inspect` | `local_acceptance` / `local_only` | 正式 run 由 Runtime v2 调度，节点返回按端口索引的 typed refs，checkpoint 绑定全部端口；成功后唯一 finalize 自包含 Result，再由独立 verify 生成 VerificationResult。该边界尚缺独立发布验收，因此仍是 local_only。 |
 | `research.walk_forward_model` | `local_only` | `package admit`<br>`run` | `local_acceptance` / `local_only` | 公共模型七阶段保留 purge/embargo、fold 内预处理、validation 选模、test 与唯一候选 locked holdout；输入 Feature/Label 必须由当前研究包提供。split 先检查 Label row group 与时间可见性，再读取开发目标；holdout 打开后失败仍消耗访问资格。本地验证不代表真实策略、可交易性或已发布模型结论。 |
 | `minute_line.complete` | `local_only` | `run` | `local_acceptance` / `local_only` | 四类中国市场资产可按当前 Catalog、已完成分钟 bar、PIT 快照与历史规则进入同一研究主链；随包规则仅覆盖文档列明的参考标的及窗口，范围外无默认规则。公开源码提供合同与合成示例，不附带真实分钟数据或研究结果；能力保持 local_only，不代表全历史、全品种或实盘可交易。 |
 | `minute_line.real_data_smoke` | `local_only` | `run` | `local_acceptance` / `local_only` | 公开包提供四资产分钟输入和只读 Result/VerificationResult 合同，不附带供应商原始数据或个人真实运行收据。真实数据观察须由使用者在自己的来源、窗口和规则下重新执行并独立验证；当前能力只到 local_only，不宣称供应商历史版本精确重放或分钟交易仿真。 |
 | `simulation.bar_tca` | `local_only` | `package admit`<br>`run` | `local_acceptance` / `local_only` | Bar TCA 只消费统一 SimulationResult 的正式订单与成交和账本身份，不二次撮合。分钟路径要求决策时可见基准、已完成执行 bar、可见容量与正式 fill，缺任何必要事实均失败关闭。随包参考规则只有有界中国市场标的窗口；公开源码不包含个人真实研究结果，能力保持 local_only。 |
-| `capability.discovery` | `local_only` | `capabilities --format json`<br>`operator list/describe/scaffold/validate/build`<br>`artifact describe`<br>`recipe list/describe/scaffold`<br>`catalog dataset/field search`<br>`package lint` | `local_acceptance` / `local_only` | capabilities 命令逐字段读取本清单；operator、artifact、catalog 和 package lint 的发现结果来自正式 registry、schema、Catalog Lock 或 package compiler。当前没有获准的公共 recipe，使用 package init 创建通用起点；项目完整拓扑由 ResearchPackage 声明。operator scaffold 生成可验证的最小项目算子；正式 Feature/Label 需必填 causal_plan，且来源必须可由已准入请求证明。validate/build 只复验显式源码闭包，不扫描目录或自动安装。 |
+| `capability.discovery` | `local_only` | `capabilities --format json`<br>`operator list/describe/scaffold/validate/build`<br>`artifact describe`<br>`recipe list/describe/scaffold`<br>`catalog dataset/field search`<br>`package lint`<br>`package expand-variants` | `local_acceptance` / `local_only` | capabilities 命令逐字段读取本清单；operator、artifact、catalog 和 package lint 的发现结果来自正式 registry、schema、Catalog Lock 或 package compiler。package expand-variants 只覆盖基包中已存在的 node 参数，原子生成普通完整包，不接受深层 YAML 合并、模板、Python 或 SQL。当前没有获准的公共 recipe，使用 package init 创建通用起点；项目完整拓扑由 ResearchPackage 声明。operator scaffold 生成可验证的最小项目算子；正式 Feature/Label 需必填 causal_plan，且来源必须可由已准入请求证明。validate/build 只复验显式源码闭包，不扫描目录或自动安装。 |
 | `resource.governance` | `local_only` | `run --resource-state-dir` | `local_acceptance` / `local_only` | 数据节点预算先编译为 DuckDB、batch/writer 与进程余量；当前 provider 支持包络下限为 256 MiB，低于下限在对象统计和扫描前拒绝。完整矩阵消费者用 footer 做数据页前的明显超界拒绝；内部 worker 默认 1 个，显式指定不能超过 CPU 或 max_workers 容量，并共用节点总预算。全新隔离进程中的真实 DuckDB/Parquet/Arrow 探针回归整个进程树 RSS、读取量与 temp 峰值，不把局部公式称为任意 allocator 的硬上界。多个 CLI/worker 的 FIFO 租约与父子令牌仍共用总容量；资源不足不改变样本、频率、参数或 seed。合成探针不进入正式运行校准总体。 |
 <!-- CAPABILITIES_TABLE:END -->
 

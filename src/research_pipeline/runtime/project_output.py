@@ -70,8 +70,18 @@ class ProjectOutputRoot(type(Path())):
                 handle.write(chunk)
         return self._commit(target, "runtime_state", "runtime.project-state", schema_hash)
 
-    def commit_directory(self, *, port, artifact_type, relative_path, files):
+    def commit_directory(
+        self,
+        *,
+        port,
+        artifact_type,
+        relative_path,
+        files,
+        publish_at_artifact_root=False,
+    ):
         """把一个端口的全部已写文件作为同一工件提交。"""
+        if type(publish_at_artifact_root) is not bool:
+            raise ValueError("project_output_publish_location_invalid")
         root = self.resolve(strict=True)
         directory = (root / relative_path).resolve(strict=True)
         if not directory.is_relative_to(root) or directory == root or not directory.is_dir():
@@ -83,7 +93,13 @@ class ProjectOutputRoot(type(Path())):
         ))
         if not actual or tuple(sorted(set(declared))) != actual or len(declared) != len(actual):
             raise ValueError("project_output_directory_file_closure_invalid")
-        return {
+        if publish_at_artifact_root and any(
+            "/" not in path
+            and path.casefold() in {"manifest.json", "committed"}
+            for path in actual
+        ):
+            raise ValueError("project_output_artifact_control_file_reserved")
+        commit = {
             "port": port,
             "artifact_type": artifact_type,
             "relative_path": directory.relative_to(root).as_posix(),
@@ -96,6 +112,9 @@ class ProjectOutputRoot(type(Path())):
                 for path in actual
             ],
         }
+        if publish_at_artifact_root:
+            commit["publish_at_artifact_root"] = True
+        return commit
 
     def _commit(self, target: Path, port: str, artifact_type: str, schema_hash: str):
         return {

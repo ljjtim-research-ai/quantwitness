@@ -15,12 +15,16 @@ RUN_TRANSITIONS = {
 }
 NODE_TRANSITIONS = {
     None: {"pending"}, "pending": {"ready", "blocked", "cancelled"},
-    "ready": {"running", "cancelled", "blocked"}, "running": {"retryable_failed", "succeeded", "exhausted", "cancelled"},
+    "ready": {"waiting_for_resources", "running", "cancelled", "blocked"},
+    "waiting_for_resources": {"running", "retryable_failed", "exhausted", "cancelled"},
+    "running": {"retryable_failed", "succeeded", "exhausted", "cancelled"},
     "retryable_failed": {"ready", "exhausted", "cancelled"}, "succeeded": set(), "exhausted": set(), "cancelled": set(), "blocked": set(),
 }
 ATTEMPT_TRANSITIONS = {
     None: {"pending"}, "pending": {"admitted", "cancelled"}, "admitted": {"ready", "cancelled"},
-    "ready": {"running", "cancelled"}, "running": {"succeeded", "failed", "cancelled", "lost"},
+    "ready": {"waiting_for_resources", "running", "cancelled"},
+    "waiting_for_resources": {"running", "failed", "cancelled", "lost"},
+    "running": {"succeeded", "failed", "cancelled", "lost"},
     "succeeded": set(), "failed": set(), "cancelled": set(), "lost": set(),
 }
 

@@ -155,6 +155,27 @@ class AdmittedProjectOperatorRegistry(TrustedOperatorRegistry):
         """按已编译 DAG 中的实现 ID 取回不可调用的准入令牌。"""
         return self._project_tokens_by_implementation.get(implementation_id)
 
+    def preflight_parameters(
+        self,
+        recipe: object,
+        *,
+        fixed_clock: str,
+        root_seed: int,
+    ) -> None:
+        """用当前已准入项目闭包预检真实冻结参数。"""
+        from research_pipeline.platform.operator_contracts import OperatorGraphRecipe
+
+        from .project_parameter_preflight import preflight_project_operator_parameters
+
+        if not isinstance(recipe, OperatorGraphRecipe):
+            raise ExtensionError("项目算子参数预检 recipe 无效")
+        preflight_project_operator_parameters(
+            recipe,
+            registry=self,
+            fixed_clock=fixed_clock,
+            root_seed=root_seed,
+        )
+
 
 def build_admitted_operator_registry(
     bundle_paths: Iterable[str | Path],

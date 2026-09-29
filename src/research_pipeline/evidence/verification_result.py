@@ -28,6 +28,7 @@ from research_pipeline.platform.metric_contracts import (
     compose_metric_registry,
 )
 from research_pipeline.platform.semantic_governance import (
+    MAINLINE_BUILTIN_SEMANTIC_REVISIONS,
     MAINLINE_SEMANTIC_PROMOTION_REVIEWS,
     validate_public_semantic_inventory,
 )
@@ -75,7 +76,7 @@ from .validity_recompute import (
 )
 
 
-VERIFICATION_RESULT_VERSION = "research-verification-result-v3"
+VERIFICATION_RESULT_VERSION = "research-verification-result-v4"
 _VERIFICATION_CATALOG_VERSION = "research-result-verification-catalog-v1"
 _VERIFICATION_LINEAGE_VERSION = "research-result-verification-lineage-v1"
 _FORMAL_FEATURE_ARTIFACT_TYPES = frozenset({
@@ -260,10 +261,10 @@ BUILTIN_RESULT_SCHEMA_SET_IDENTITIES = frozenset({
 })
 BUILTIN_VERIFIER_IDENTITIES = frozenset({
     "default:data.pit:verifier.data-pit.v1",
-    "default:financial.tradability:verifier.financial-tradability.v2",
+    "default:financial.tradability:verifier.financial-tradability.v3",
     "default:label.split:verifier.label-split.v2",
     "default:search.holdout:verifier.search-holdout.v1",
-    "default:statistics:verifier.statistics.v1",
+    "default:statistics:verifier.statistics.v2",
     "minute:data.pit:verifier.minute-data-pit.v2",
     "minute:financial.tradability:verifier.minute-financial.v2",
     "minute:label.split:verifier.minute-label-split.v2",
@@ -353,6 +354,7 @@ def validate_builtin_verification_semantics() -> None:
         verifier_identities,
         builtin_identities=BUILTIN_VERIFIER_IDENTITIES,
         reviews=MAINLINE_SEMANTIC_PROMOTION_REVIEWS,
+        builtin_revisions=MAINLINE_BUILTIN_SEMANTIC_REVISIONS,
     )
 
 
@@ -848,13 +850,27 @@ def verify_result(
     project_verifier = None
     verifier_identity = snapshot.bundle.verification.verifier_identity
     if verifier_identity is not None:
-        if verifier_bundle is None:
+        embedded_path = snapshot.bundle.verification.verifier_bundle_path
+        selected_bundle = verifier_bundle
+        if embedded_path is not None:
+            selected_bundle = snapshot.directory / embedded_path
+            if verifier_bundle is not None:
+                from research_pipeline.extensions.verifier_bundle import (
+                    verify_project_verifier_bundle,
+                )
+
+                external_manifest = verify_project_verifier_bundle(verifier_bundle)
+                if external_manifest.identity() != dict(verifier_identity):
+                    raise EvidenceContractError(
+                        "显式 Verifier bundle 与 Result 冻结身份不一致"
+                    )
+        elif verifier_bundle is None:
             raise EvidenceContractError(
-                "Result 声明了项目 Verifier，verify 必须显式提供 bundle"
+                "历史 Result 声明了项目 Verifier，verify 必须显式提供 bundle"
             )
         from research_pipeline.evidence.project_verifier_runtime import execute_project_verifier
         project_verifier = execute_project_verifier(
-            bundle_path=verifier_bundle,
+            bundle_path=selected_bundle,
             snapshot=snapshot,
             expected_identity=verifier_identity,
             scratch_root=(
@@ -926,6 +942,11 @@ def verify_result(
             ()
             if minute_statistics["split_assignments"] not in declared_schema_ids
             else _snapshot_rows(snapshot, minute_statistics["split_assignments"])
+        ),
+        verified_statistics_matrix=(
+            None
+            if project_verifier is None
+            else project_verifier.statistics_matrix_evidence
         ),
     )
     integrity = ArtifactIntegrityFacet.build(catalog_hash)
@@ -1052,6 +1073,7 @@ def load_verified_result_context(
     verification_result: str | Path,
     *,
     result_store: str | Path,
+    additional_table_ids: Iterable[str] = (),
 ) -> VerifiedResultContext:
     try:
         raw = Path(verification_result).read_text(encoding="utf-8")
@@ -1070,7 +1092,10 @@ def load_verified_result_context(
         run_id=reference.run_id,
         result_id=reference.result_id,
     )
-    schema_ids = _verified_consumer_schema_ids(bundle)
+    schema_ids = _verified_consumer_schema_ids(
+        bundle,
+        additional_table_ids=additional_table_ids,
+    )
     snapshot = store.load_snapshot_by_identity(
         project_id=bundle.project_id,
         run_id=bundle.run_id,
@@ -1087,11 +1112,31 @@ def load_verified_result_context(
     )
 
 
-def _verified_consumer_schema_ids(bundle) -> tuple[str, ...]:
+def _verified_consumer_schema_ids(
+    bundle,
+    *,
+    additional_table_ids: Iterable[str] = (),
+) -> tuple[str, ...]:
     """只加载报告与比较实际消费的小型正式表。"""
 
+    requested_ids = tuple(additional_table_ids)
+    if any(not isinstance(table_id, str) or not table_id for table_id in requested_ids):
+        raise EvidenceContractError("附加 Result table_id 必须是非空字符串")
+    if len(requested_ids) != len(set(requested_ids)):
+        raise EvidenceContractError("附加 Result table_id 不能重复")
+    table_by_id = {table.table_id: table for table in bundle.tables}
+    unknown = sorted(set(requested_ids) - set(table_by_id))
+    if unknown:
+        raise EvidenceContractError(f"Result 不包含附加分析表: {unknown}")
+    for table_id in requested_ids:
+        schema_id = table_by_id[table_id].schema_id
+        if sum(table.schema_id == schema_id for table in bundle.tables) != 1:
+            raise EvidenceContractError(
+                f"附加分析表 schema_id 在 Result 中不唯一: {schema_id}"
+            )
     return tuple(sorted({
-        proof.result_schema_id for proof in bundle.metric_proofs
+        *(proof.result_schema_id for proof in bundle.metric_proofs),
+        *(table_by_id[table_id].schema_id for table_id in requested_ids),
     }))
 
 

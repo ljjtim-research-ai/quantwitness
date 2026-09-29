@@ -8,6 +8,14 @@ from types import MappingProxyType
 from typing import Mapping
 
 
+class ProjectTableInputError(ValueError):
+    """项目表输入的稳定错误码和有界诊断。"""
+
+    def __init__(self, error_code: str, message: str) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+
+
 class ProjectTableInput:
     """按提交清单读取表格或命名 JSON，不扫描相邻文件。"""
 
@@ -64,8 +72,40 @@ class ProjectTableInput:
 
     def _path(self, relative_path: str) -> Path:
         if not isinstance(relative_path, str) or relative_path not in self._paths:
-            raise ValueError("project_table_input_unknown_file")
+            available = ", ".join(self.file_paths[:20])
+            raise ProjectTableInputError(
+                "project_table_input_unknown_file",
+                f"项目输入文件不存在: {relative_path!r}; 可用文件: {available}",
+            )
         return self._paths[relative_path]
+
+    @staticmethod
+    def _validate_projection(
+        schema,
+        *,
+        columns: tuple[str, ...],
+        batch_size: int,
+        max_batch_rows: int,
+    ) -> None:
+        if type(batch_size) is not int or not 0 < batch_size <= max_batch_rows:
+            raise ProjectTableInputError(
+                "project_table_input_projection_or_batch_invalid",
+                f"项目输入 batch_size 必须在 1 到 {max_batch_rows} 之间: {batch_size!r}",
+            )
+        if not columns or len(set(columns)) != len(columns):
+            raise ProjectTableInputError(
+                "project_table_input_projection_or_batch_invalid",
+                "项目输入列投影不能为空或包含重复列",
+            )
+        missing = tuple(sorted(set(columns) - set(schema.names)))
+        if missing:
+            raise ProjectTableInputError(
+                "project_table_input_projection_or_batch_invalid",
+                (
+                    f"项目输入缺少列: {list(missing)}; "
+                    f"可用列: {list(schema.names)}"
+                ),
+            )
 
     def read_bytes(self, relative_path: str, *, max_bytes: int = 32 * 1024 * 1024) -> bytes:
         """读取明确命名的小文件；大表仍必须走批次接口。"""
@@ -109,12 +149,12 @@ class ProjectTableInput:
         paths = tuple(self._paths[path] for path in self._parquet_paths)
         schema = self._schema_for(paths)
         assert schema is not None
-        if (
-            type(batch_size) is not int or not 0 < batch_size <= self._max_batch_rows
-            or not columns or len(set(columns)) != len(columns)
-            or not set(columns).issubset(schema.names)
-        ):
-            raise ValueError("project_table_input_projection_or_batch_invalid")
+        self._validate_projection(
+            schema,
+            columns=columns,
+            batch_size=batch_size,
+            max_batch_rows=self._max_batch_rows,
+        )
         self._started = True
         self._consumed_columns = tuple(columns)
         self._active_streams += 1
@@ -145,14 +185,12 @@ class ProjectTableInput:
             raise ValueError("project_table_input_file_not_parquet")
         schema = self._schema_for((path,))
         assert schema is not None
-        if (
-            type(batch_size) is not int
-            or not 0 < batch_size <= self._max_batch_rows
-            or not columns
-            or len(set(columns)) != len(columns)
-            or not set(columns).issubset(schema.names)
-        ):
-            raise ValueError("project_table_input_projection_or_batch_invalid")
+        self._validate_projection(
+            schema,
+            columns=columns,
+            batch_size=batch_size,
+            max_batch_rows=self._max_batch_rows,
+        )
         self._started = True
         self._opened_files.add(relative_path)
         self._active_streams += 1
@@ -272,6 +310,54 @@ class ProjectRequestTableInput:
                     if request_id in self._opened
                     else {"metadata_only": True}
                 ),
+            }
+            for request_id in self._requests
+        }
+
+
+class ProjectRequestAdmissionInput:
+    """只暴露 Supervisor 核对后的 request 准入事实，不交付数据文件。"""
+
+    def __init__(
+        self,
+        *,
+        port: str,
+        artifact_type: str,
+        source_identity: str,
+        requests: Mapping[str, Mapping[str, object]],
+    ) -> None:
+        self.port = port
+        self.artifact_type = artifact_type
+        self.source_identity = source_identity
+        self._requests = MappingProxyType(dict(sorted(requests.items())))
+        self._admission_reads: set[str] = set()
+
+    def admission(self, request_id: str) -> Mapping[str, object]:
+        """读取当前输入工件绑定的正式 request 准入事实。"""
+
+        if request_id not in self._requests:
+            raise ValueError("project_request_admission_unknown_request")
+        facts = self._requests[request_id].get("admission")
+        if not isinstance(facts, Mapping):
+            raise ValueError("project_request_admission_unavailable")
+        self._admission_reads.add(request_id)
+        return MappingProxyType(dict(facts))
+
+    @property
+    def request_ids(self) -> tuple[str, ...]:
+        return tuple(self._requests)
+
+    def assert_complete(self) -> None:
+        if self._admission_reads != set(self._requests):
+            raise ValueError("project_request_admission_not_all_requested")
+
+    def consumption_trace(self) -> dict[str, object]:
+        self.assert_complete()
+        return {
+            request_id: {
+                "source_identity": self._requests[request_id]["source_identity"],
+                "schema_hash": self._requests[request_id]["schema_hash"],
+                "metadata_only": True,
             }
             for request_id in self._requests
         }

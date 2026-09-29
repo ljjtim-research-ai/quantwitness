@@ -14,6 +14,12 @@ __all__ = [
     "VALIDITY_GATE_REASON_CODES",
     "VALIDITY_REASON_MESSAGES",
     "VERIFICATION_RESULT_VERSION",
+    "ANALYSIS_REQUEST_VERSION",
+    "ANALYSIS_RESULT_VERSION",
+    "ANALYSIS_COMPARISON_VERSION",
+    "AnalysisComparison",
+    "AnalysisRequest",
+    "AnalysisResult",
     "ArtifactIntegrityFacet",
     "ClaimAssessment",
     "ClaimFacet",
@@ -38,6 +44,13 @@ __all__ = [
     "export_verified_result",
     "verify_result",
     "write_verification_result",
+    "analyze_verified_result",
+    "compare_analysis_results",
+    "load_analysis_comparison",
+    "load_analysis_request",
+    "load_analysis_result",
+    "write_analysis_comparison",
+    "write_analysis_result",
 ]
 
 
@@ -77,6 +90,19 @@ _LAZY_EXPORTS = {
     "export_verified_result": ".verification_result",
     "verify_result": ".verification_result",
     "write_verification_result": ".verification_result",
+    "ANALYSIS_REQUEST_VERSION": ".analysis_contracts",
+    "ANALYSIS_RESULT_VERSION": ".analysis_contracts",
+    "ANALYSIS_COMPARISON_VERSION": ".analysis_contracts",
+    "AnalysisComparison": ".analysis_contracts",
+    "AnalysisRequest": ".analysis_contracts",
+    "AnalysisResult": ".analysis_contracts",
+    "analyze_verified_result": ".result_analysis",
+    "compare_analysis_results": ".result_analysis",
+    "load_analysis_comparison": ".result_analysis",
+    "load_analysis_request": ".result_analysis",
+    "load_analysis_result": ".result_analysis",
+    "write_analysis_comparison": ".result_analysis",
+    "write_analysis_result": ".result_analysis",
 }
 
 

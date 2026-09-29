@@ -150,6 +150,16 @@ def test_source_bundle_rejects_binary_extension(tmp_path: Path) -> None:
         project_source_hash(source)
 
 
+def test_source_bundle_ignores_python_bytecode_cache(tmp_path: Path) -> None:
+    source = _source(tmp_path)
+    source_hash = project_source_hash(source)
+    cache = source / "__pycache__"
+    cache.mkdir()
+    (cache / "operator.cpython-310.pyc").write_bytes(b"python-cache")
+
+    assert project_source_hash(source) == source_hash
+
+
 def test_bundle_requires_project_declaration_for_factor_analysis_artifact(
     tmp_path: Path,
 ) -> None:

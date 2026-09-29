@@ -9,6 +9,8 @@ from typing import Any
 
 from research_pipeline.platform import error_code_for_exception
 
+from .command_suggestion import command_suggestion
+
 
 CLI_RESULT_VERSION = "research-cli-result-v1"
 
@@ -31,14 +33,63 @@ def execute_guarded(args: Any, handler: Callable[[Any], dict[str, object]]) -> i
         return emit(args, status="pass", data=handler(args), code=0)
     except Exception as exc:
         failure_payload = getattr(exc, "failure_payload", None)
+        data = dict(failure_payload) if isinstance(failure_payload, dict) else {}
+        run_root = getattr(args, "run_root", None)
+        runtime_failure = _runtime_failure_details(exc, run_root)
+        if runtime_failure is not None:
+            data.update(runtime_failure)
+            if run_root is not None:
+                data["run_root"] = str(run_root)
+                data.update(command_suggestion(
+                    "python",
+                    "-m",
+                    "research_pipeline",
+                    "inspect",
+                    "--run-root",
+                    str(run_root),
+                    "--json",
+                ))
         return emit(
             args,
             status="fail",
             error_code=error_code_for_exception(exc),
             message=str(exc),
-            data=failure_payload if isinstance(failure_payload, dict) else None,
+            data=data or None,
             code=1,
         )
+
+
+def _runtime_failure_details(
+    error: BaseException,
+    run_root: object,
+) -> dict[str, object] | None:
+    if run_root is None:
+        return None
+    try:
+        from research_pipeline.runtime.errors import RuntimeWorkerError
+        from research_pipeline.runtime.store import EventStore
+
+        if not isinstance(error, RuntimeWorkerError):
+            return None
+        events = EventStore(run_root).read_events()
+    except Exception:
+        return None
+    diagnostic = next(
+        (event for event in reversed(events) if event.kind == "diagnostic"),
+        None,
+    )
+    if diagnostic is None or diagnostic.node_id is None:
+        return None
+    root_error = {
+        key: diagnostic.payload.get(key)
+        for key in ("error_code", "exception_type", "message")
+    }
+    if any(not isinstance(value, str) or not value for value in root_error.values()):
+        return None
+    return {
+        "failed_node": diagnostic.node_id,
+        "root_error": root_error,
+    }
 
 
 def emit(

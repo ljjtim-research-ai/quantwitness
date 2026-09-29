@@ -39,6 +39,7 @@ PROJECT_OPERATOR_BUNDLE_VERSION = "project-operator-extension-bundle-v2"
 PROJECT_OPERATOR_ABI_VERSION = "project-operator-abi-v2"
 PROJECT_OPERATOR_DECLARATION_VERSION = "project-operator-declaration-v2"
 PROJECT_OPERATOR_REQUIRES_PYTHON = ">=3.10"
+_PROJECT_OPERATOR_REUSE_SCOPES = frozenset({"same_run", "cross_run"})
 _ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _MODULE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _FUNCTION_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -147,6 +148,7 @@ def _source_paths(root: Path) -> tuple[Path, ...]:
     paths = []
     for directory, directories, names in os.walk(root, followlinks=True):
         current = Path(directory)
+        directories[:] = [name for name in directories if name != "__pycache__"]
         ancestors = {current.resolve()}
         ancestors.update(parent.resolve() for parent in current.parents
                          if parent == root or root in parent.parents)
@@ -349,17 +351,26 @@ class ProjectDirectoryCommit:
     artifact_type: str
     relative_path: str
     files: tuple[Mapping[str, object], ...]
+    publish_at_artifact_root: bool = False
 
     def __post_init__(self) -> None:
         _safe_id(self.port, "directory_commit.port")
         _safe_id(self.artifact_type, "directory_commit.artifact_type")
         _safe_relative_path(self.relative_path, "directory_commit.relative_path")
+        if type(self.publish_at_artifact_root) is not bool:
+            raise ExtensionError("目录提交发布位置无效")
         paths = []
         for item in self.files:
             if set(item) != {"relative_path", "content_hash", "byte_size"}:
                 raise ExtensionError("目录提交文件描述无效")
             path = str(item["relative_path"])
             _safe_relative_path(path, "directory_commit.file")
+            if (
+                self.publish_at_artifact_root
+                and "/" not in path
+                and path.casefold() in {"manifest.json", "committed"}
+            ):
+                raise ExtensionError("根级目录提交不得占用 ExternalArtifact 控制文件")
             if (
                 not _HASH_PATTERN.fullmatch(str(item["content_hash"]))
                 or type(item["byte_size"]) is not int
@@ -371,17 +382,21 @@ class ProjectDirectoryCommit:
             raise ExtensionError("目录提交文件必须非空、唯一且排序")
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload = {
             "port": self.port,
             "artifact_type": self.artifact_type,
             "relative_path": self.relative_path,
             "files": [dict(item) for item in self.files],
         }
+        if self.publish_at_artifact_root:
+            payload["publish_at_artifact_root"] = True
+        return payload
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "ProjectDirectoryCommit":
+        expected = {"port", "artifact_type", "relative_path", "files"}
         if (
-            set(payload) != {"port", "artifact_type", "relative_path", "files"}
+            set(payload) not in (expected, expected | {"publish_at_artifact_root"})
             or not isinstance(payload["files"], (list, tuple))
             or any(not isinstance(item, Mapping) for item in payload["files"])
         ):
@@ -391,6 +406,7 @@ class ProjectDirectoryCommit:
             artifact_type=str(payload["artifact_type"]),
             relative_path=str(payload["relative_path"]),
             files=tuple(dict(item) for item in payload["files"]),
+            publish_at_artifact_root=payload.get("publish_at_artifact_root", False),
         )
 
 
@@ -406,8 +422,11 @@ class ProjectOperatorBundleManifest:
     dependency_lock: Mapping[str, str]
     dependency_lock_hash: str
     permissions: ProjectOperatorPermissionProfile
+    reuse_scope: str
     requires_python: str
     bundle_hash: str
+    parameter_preflight_module: str | None = None
+    parameter_preflight_function: str | None = None
     contract_version: str = PROJECT_OPERATOR_BUNDLE_VERSION
     abi_version: str = PROJECT_OPERATOR_ABI_VERSION
 
@@ -416,6 +435,17 @@ class ProjectOperatorBundleManifest:
         _safe_id(self.bundle_id, "bundle_id")
         if not _MODULE_PATTERN.fullmatch(self.entry_module) or not _FUNCTION_PATTERN.fullmatch(self.entry_function):
             raise ExtensionError("项目算子入口描述符无效")
+        preflight_values = (
+            self.parameter_preflight_module,
+            self.parameter_preflight_function,
+        )
+        if (preflight_values[0] is None) != (preflight_values[1] is None):
+            raise ExtensionError("项目算子参数预检描述符必须同时声明 module 和 function")
+        if preflight_values[0] is not None and (
+            not _MODULE_PATTERN.fullmatch(preflight_values[0])
+            or not _FUNCTION_PATTERN.fullmatch(preflight_values[1])
+        ):
+            raise ExtensionError("项目算子参数预检描述符无效")
         hashes = (self.source_tree_hash, self.dependency_lock_hash, self.bundle_hash)
         if any(not _HASH_PATTERN.fullmatch(value) for value in hashes):
             raise ExtensionError("项目 bundle 身份字段无效")
@@ -423,6 +453,8 @@ class ProjectOperatorBundleManifest:
             raise ExtensionError("operator code_hash 必须绑定完整项目源码闭包")
         if self.contract_version != PROJECT_OPERATOR_BUNDLE_VERSION or self.abi_version != PROJECT_OPERATOR_ABI_VERSION:
             raise ExtensionError("项目 bundle 或 ABI 版本不受支持")
+        if self.reuse_scope not in _PROJECT_OPERATOR_REUSE_SCOPES:
+            raise ExtensionError("项目 bundle reuse_scope 不受支持")
         if self.requires_python != PROJECT_OPERATOR_REQUIRES_PYTHON:
             raise ExtensionError("项目 bundle requires-python 不受支持")
         if tuple(sorted(self.source_files, key=lambda item: str(item["path"]))) != self.source_files:
@@ -441,7 +473,7 @@ class ProjectOperatorBundleManifest:
             raise ExtensionError("项目 bundle hash 不一致")
 
     def payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "project_id": self.project_id,
             "bundle_id": self.bundle_id,
             "operator_spec": self.operator_spec.to_dict(),
@@ -455,6 +487,14 @@ class ProjectOperatorBundleManifest:
             "contract_version": self.contract_version,
             "abi_version": self.abi_version,
         }
+        if self.reuse_scope == "cross_run":
+            payload["reuse_scope"] = self.reuse_scope
+        if self.parameter_preflight_module is not None:
+            payload["parameter_preflight"] = {
+                "module": self.parameter_preflight_module,
+                "function": self.parameter_preflight_function,
+            }
+        return payload
 
     def to_dict(self) -> dict[str, object]:
         return {**self.payload(), "bundle_hash": self.bundle_hash}
@@ -466,12 +506,24 @@ class ProjectOperatorBundleManifest:
             "dependency_lock", "dependency_lock_hash", "permissions", "requires_python",
             "bundle_hash", "contract_version", "abi_version",
         }
+        if payload.get("contract_version") != PROJECT_OPERATOR_BUNDLE_VERSION:
+            raise ExtensionError("项目 bundle 或 ABI 版本不受支持")
+        if "reuse_scope" in payload:
+            expected.add("reuse_scope")
+        if "parameter_preflight" in payload:
+            expected.add("parameter_preflight")
         if set(payload) != expected:
             raise ExtensionError("项目 bundle manifest schema 无效")
         if not isinstance(payload["operator_spec"], Mapping) or not isinstance(payload["entry"], Mapping):
             raise ExtensionError("项目 bundle operator/entry 合同无效")
         if set(payload["entry"]) != {"module", "function"}:
             raise ExtensionError("项目 bundle entry schema 无效")
+        preflight = payload.get("parameter_preflight")
+        if preflight is not None and (
+            not isinstance(preflight, Mapping)
+            or set(preflight) != {"module", "function"}
+        ):
+            raise ExtensionError("项目 bundle parameter_preflight schema 无效")
         if not isinstance(payload["source_files"], list) or any(not isinstance(item, Mapping) for item in payload["source_files"]):
             raise ExtensionError("项目 bundle source_files 无效")
         if not isinstance(payload["dependency_lock"], Mapping) or not isinstance(payload["permissions"], Mapping):
@@ -487,8 +539,15 @@ class ProjectOperatorBundleManifest:
             dependency_lock={str(key): str(value) for key, value in payload["dependency_lock"].items()},
             dependency_lock_hash=str(payload["dependency_lock_hash"]),
             permissions=ProjectOperatorPermissionProfile.from_dict(payload["permissions"]),
+            reuse_scope=str(payload.get("reuse_scope", "same_run")),
             requires_python=str(payload["requires_python"]),
             bundle_hash=str(payload["bundle_hash"]),
+            parameter_preflight_module=(
+                None if preflight is None else str(preflight["module"])
+            ),
+            parameter_preflight_function=(
+                None if preflight is None else str(preflight["function"])
+            ),
             contract_version=str(payload["contract_version"]),
             abi_version=str(payload["abi_version"]),
         )
@@ -504,6 +563,9 @@ class ProjectOperatorDeclaration:
     entry_function: str
     dependency_lock: Mapping[str, str]
     permissions: ProjectOperatorPermissionProfile
+    parameter_preflight_module: str | None = None
+    parameter_preflight_function: str | None = None
+    reuse_scope: str = "same_run"
     project_artifact_types: tuple[str, ...] = ()
     contract_version: str = PROJECT_OPERATOR_DECLARATION_VERSION
 
@@ -513,8 +575,21 @@ class ProjectOperatorDeclaration:
             self.entry_function
         ):
             raise ExtensionError("项目算子入口描述符无效")
+        preflight_values = (
+            self.parameter_preflight_module,
+            self.parameter_preflight_function,
+        )
+        if (preflight_values[0] is None) != (preflight_values[1] is None):
+            raise ExtensionError("项目算子参数预检描述符必须同时声明 module 和 function")
+        if preflight_values[0] is not None and (
+            not _MODULE_PATTERN.fullmatch(preflight_values[0])
+            or not _FUNCTION_PATTERN.fullmatch(preflight_values[1])
+        ):
+            raise ExtensionError("项目算子参数预检描述符无效")
         if self.contract_version != PROJECT_OPERATOR_DECLARATION_VERSION:
             raise ExtensionError("项目算子薄声明版本不受支持")
+        if self.reuse_scope not in _PROJECT_OPERATOR_REUSE_SCOPES:
+            raise ExtensionError("项目算子 reuse_scope 不受支持")
         normalized_lock = dict(
             sorted((str(key), str(value)) for key, value in self.dependency_lock.items())
         )
@@ -535,7 +610,7 @@ class ProjectOperatorDeclaration:
         operator = self.operator_spec.to_dict()
         operator.pop("code_hash")
         operator.pop("spec_hash")
-        return {
+        payload = {
             "contract_version": self.contract_version,
             "project_id": self.project_id,
             "operator": operator,
@@ -547,6 +622,14 @@ class ProjectOperatorDeclaration:
             "permissions": self.permissions.to_dict(),
             "project_artifact_types": list(self.project_artifact_types),
         }
+        if self.reuse_scope == "cross_run":
+            payload["reuse_scope"] = self.reuse_scope
+        if self.parameter_preflight_module is not None:
+            payload["parameter_preflight"] = {
+                "module": self.parameter_preflight_module,
+                "function": self.parameter_preflight_function,
+            }
+        return payload
 
     @classmethod
     def from_dict(
@@ -563,7 +646,11 @@ class ProjectOperatorDeclaration:
             "dependency_lock",
             "permissions",
         }
-        allowed = expected | {"project_artifact_types"}
+        allowed = expected | {"project_artifact_types", "parameter_preflight"}
+        if payload.get("contract_version") != PROJECT_OPERATOR_DECLARATION_VERSION:
+            raise ExtensionError("项目算子薄声明版本不受支持")
+        if "reuse_scope" in payload:
+            allowed.add("reuse_scope")
         if not expected.issubset(payload) or not set(payload).issubset(allowed):
             missing = expected - set(payload)
             raise ExtensionError(
@@ -576,12 +663,11 @@ class ProjectOperatorDeclaration:
                     ),
                 ),
             )
-        if payload.get("contract_version") != PROJECT_OPERATOR_DECLARATION_VERSION:
-            raise ExtensionError("项目算子薄声明版本不受支持")
         operator = payload.get("operator")
         entry = payload.get("entry")
         dependency_lock = payload.get("dependency_lock")
         permissions = payload.get("permissions")
+        parameter_preflight = payload.get("parameter_preflight")
         if (
             not isinstance(operator, Mapping)
             or not isinstance(entry, Mapping)
@@ -589,6 +675,11 @@ class ProjectOperatorDeclaration:
             or not isinstance(permissions, Mapping)
         ):
             raise ExtensionError("项目算子薄声明字段类型无效")
+        if parameter_preflight is not None and (
+            not isinstance(parameter_preflight, Mapping)
+            or set(parameter_preflight) != {"module", "function"}
+        ):
+            raise ExtensionError("项目算子薄声明 parameter_preflight schema 无效")
         operator_expected = {
             "operator_id",
             "operator_version",
@@ -645,6 +736,21 @@ class ProjectOperatorDeclaration:
             for item in operator[field]
         ) or not isinstance(operator["resource_profile"], Mapping):
             raise ExtensionError("项目算子薄声明 port/parameter/resource schema 无效")
+        expected_resources = {
+            "memory_bytes",
+            "cpu_slots",
+            "temp_bytes",
+            "process_slots",
+            "wall_seconds",
+        }
+        if set(operator["resource_profile"]) != expected_resources:
+            raise ExtensionError(
+                "项目算子薄声明 resource_profile 必须显式包含五类资源"
+            )
+        if operator["resource_profile"].get("process_slots", 0) < 2:
+            raise ExtensionError(
+                "项目算子 process_slots 必须至少容纳 Supervisor 和 Worker"
+            )
         try:
             specification = OperatorSpec.build(
                 operator_id=str(operator["operator_id"]),
@@ -670,6 +776,17 @@ class ProjectOperatorDeclaration:
             entry_function=str(entry["function"]),
             dependency_lock={str(key): str(value) for key, value in dependency_lock.items()},
             permissions=ProjectOperatorPermissionProfile.from_dict(permissions),
+            parameter_preflight_module=(
+                None
+                if parameter_preflight is None
+                else str(parameter_preflight["module"])
+            ),
+            parameter_preflight_function=(
+                None
+                if parameter_preflight is None
+                else str(parameter_preflight["function"])
+            ),
+            reuse_scope=str(payload.get("reuse_scope", "same_run")),
             project_artifact_types=tuple(
                 str(item) for item in payload.get("project_artifact_types", ())
             ),
@@ -767,6 +884,43 @@ def _validate_entry_abi(tree: ast.Module, entry_function: str) -> None:
         )
 
 
+def _validate_parameter_preflight_abi(
+    tree: ast.Module,
+    preflight_function: str,
+) -> None:
+    entries = [
+        node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == preflight_function
+    ]
+    if not entries:
+        raise ExtensionError("项目算子参数预检函数不存在")
+    entry = entries[0]
+    positional_count = len(entry.args.posonlyargs) + len(entry.args.args)
+    required_positional_count = positional_count - len(entry.args.defaults)
+    required_keyword_only = tuple(
+        argument.arg
+        for argument, default in zip(
+            entry.args.kwonlyargs,
+            entry.args.kw_defaults,
+            strict=True,
+        )
+        if default is None
+    )
+    signature_valid = (
+        isinstance(entry, ast.FunctionDef)
+        and len(entries) == 1
+        and required_positional_count <= 1
+        and (positional_count >= 1 or entry.args.vararg is not None)
+        and not required_keyword_only
+    )
+    if not signature_valid:
+        raise ExtensionError(
+            "项目算子参数预检 ABI 必须是可由框架以一个位置参数同步调用的函数"
+        )
+
+
 def compile_project_operator_bundle(
     *,
     source_root: str | Path,
@@ -779,6 +933,9 @@ def compile_project_operator_bundle(
     registered_operator_specs: Iterable[OperatorSpec],
     project_artifact_types: Iterable[str] = (),
     permissions: ProjectOperatorPermissionProfile | None = None,
+    reuse_scope: str = "same_run",
+    parameter_preflight_module: str | None = None,
+    parameter_preflight_function: str | None = None,
 ) -> Path:
     """从显式受信源码根生成内容寻址、不可变的项目算子 bundle。"""
     _safe_id(project_id, "project_id")
@@ -802,7 +959,34 @@ def compile_project_operator_bundle(
         raise ExtensionError("项目算子入口模块不在源码闭包")
     tree = ast.parse(entry_path.read_text(encoding="utf-8"), filename=str(entry_path))
     _validate_entry_abi(tree, entry_function)
+    if (parameter_preflight_module is None) != (parameter_preflight_function is None):
+        raise ExtensionError("项目算子参数预检必须同时声明 module 和 function")
+    if parameter_preflight_module is not None:
+        if (
+            not _MODULE_PATTERN.fullmatch(parameter_preflight_module)
+            or not _FUNCTION_PATTERN.fullmatch(parameter_preflight_function)
+        ):
+            raise ExtensionError("项目算子参数预检描述符无效")
+        preflight_path = root / Path(*parameter_preflight_module.split(".")).with_suffix(
+            ".py"
+        )
+        if (
+            not preflight_path.is_file()
+            or preflight_path.relative_to(root).as_posix()
+            not in {str(item["path"]) for item in entries}
+        ):
+            raise ExtensionError("项目算子参数预检模块不在源码闭包")
+        preflight_tree = ast.parse(
+            preflight_path.read_text(encoding="utf-8"),
+            filename=str(preflight_path),
+        )
+        _validate_parameter_preflight_abi(
+            preflight_tree,
+            parameter_preflight_function,
+        )
     permission_profile = permissions or ProjectOperatorPermissionProfile()
+    if reuse_scope not in _PROJECT_OPERATOR_REUSE_SCOPES:
+        raise ExtensionError("项目算子 reuse_scope 不受支持")
     dependency_lock_hash = typed_canonical_hash(normalized_lock)
     bundle_id = f"project.{project_id}.{operator_spec.operator_id}.{operator_spec.operator_version}"
     payload = {
@@ -819,6 +1003,13 @@ def compile_project_operator_bundle(
         "contract_version": PROJECT_OPERATOR_BUNDLE_VERSION,
         "abi_version": PROJECT_OPERATOR_ABI_VERSION,
     }
+    if reuse_scope == "cross_run":
+        payload["reuse_scope"] = reuse_scope
+    if parameter_preflight_module is not None:
+        payload["parameter_preflight"] = {
+            "module": parameter_preflight_module,
+            "function": parameter_preflight_function,
+        }
     bundle_hash = typed_canonical_hash(payload)
     manifest = ProjectOperatorBundleManifest(
         project_id=project_id,
@@ -831,8 +1022,11 @@ def compile_project_operator_bundle(
         dependency_lock=normalized_lock,
         dependency_lock_hash=dependency_lock_hash,
         permissions=permission_profile,
+        reuse_scope=reuse_scope,
         requires_python=PROJECT_OPERATOR_REQUIRES_PYTHON,
         bundle_hash=bundle_hash,
+        parameter_preflight_module=parameter_preflight_module,
+        parameter_preflight_function=parameter_preflight_function,
     )
     output = Path(output_root).resolve() / bundle_hash
     output_parent = output.parent
@@ -876,10 +1070,6 @@ def verify_project_operator_bundle(path: str | Path) -> object:
     manifest_path = root / "manifest.json"
     if not manifest_path.is_file():
         raise ExtensionError("项目 bundle 缺少 manifest.json")
-    try:
-        contract_probe = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ExtensionError("项目 bundle manifest 无法读取") from exc
     expected_top = {"sources", "dependency-lock.json", "manifest.json", "COMMITTED"}
     if {item.name for item in root.iterdir()} != expected_top:
         raise ExtensionError("项目 bundle 顶层文件集合漂移")

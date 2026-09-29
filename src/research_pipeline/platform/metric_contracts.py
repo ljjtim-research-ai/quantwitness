@@ -17,7 +17,8 @@ from research_pipeline.platform.semantic_governance import (
 )
 
 
-METRIC_DEFINITION_VERSION = "research-metric-definition-v2"
+LEGACY_METRIC_DEFINITION_VERSION = "research-metric-definition-v2"
+METRIC_DEFINITION_VERSION = "research-metric-definition-v3"
 METRIC_ARTIFACT_VERSION = "research-metric-artifact-v1"
 METRIC_REACHABILITY_VERSION = "research-metric-reachability-v2"
 BUILTIN_METRIC_IDENTITIES = frozenset({
@@ -65,6 +66,49 @@ def _string_mapping(value: Mapping[str, str], field: str) -> Mapping[str, str]:
 
 
 @dataclass(frozen=True)
+class MetricMeasurementSemantics:
+    quantity: str
+    numerator: str
+    denominator: str
+    observation_timing: str
+    aggregation: str
+
+    def __post_init__(self) -> None:
+        for field in (
+            "quantity",
+            "numerator",
+            "denominator",
+            "observation_timing",
+            "aggregation",
+        ):
+            _text(getattr(self, field), f"measurement_semantics.{field}")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "quantity": self.quantity,
+            "numerator": self.numerator,
+            "denominator": self.denominator,
+            "observation_timing": self.observation_timing,
+            "aggregation": self.aggregation,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: Mapping[str, object]) -> "MetricMeasurementSemantics":
+        expected = {
+            "quantity",
+            "numerator",
+            "denominator",
+            "observation_timing",
+            "aggregation",
+        }
+        if set(payload) != expected:
+            raise MetricContractError("MetricMeasurementSemantics schema 无效")
+        if any(not isinstance(payload[key], str) for key in expected):
+            raise MetricContractError("MetricMeasurementSemantics 字段必须是字符串")
+        return cls(**{key: payload[key] for key in expected})
+
+
+@dataclass(frozen=True)
 class MetricDefinition:
     metric_id: str
     version: str
@@ -80,6 +124,7 @@ class MetricDefinition:
     implementation_ref: str
     implementation_digest: str
     definition_digest: str
+    measurement_semantics: MetricMeasurementSemantics | None = None
     contract_version: str = METRIC_DEFINITION_VERSION
 
     def __post_init__(self) -> None:
@@ -106,8 +151,16 @@ class MetricDefinition:
         if self.direction not in {"higher_is_better", "lower_is_better", "neutral"}:
             raise MetricContractError("MetricDefinition direction 无效")
         _digest(self.implementation_digest, "implementation_digest")
-        if self.contract_version != METRIC_DEFINITION_VERSION:
+        if self.contract_version not in {
+            LEGACY_METRIC_DEFINITION_VERSION,
+            METRIC_DEFINITION_VERSION,
+        }:
             raise MetricContractError("MetricDefinition contract version 不受支持")
+        if self.contract_version == METRIC_DEFINITION_VERSION:
+            if not isinstance(self.measurement_semantics, MetricMeasurementSemantics):
+                raise MetricContractError("MetricDefinition v3 必须声明完整测量语义")
+        elif self.measurement_semantics is not None:
+            raise MetricContractError("MetricDefinition v2 不支持测量语义")
         if self.definition_digest != typed_canonical_hash(self.payload()):
             raise MetricContractError("MetricDefinition digest 不一致")
 
@@ -116,7 +169,7 @@ class MetricDefinition:
         return f"{self.metric_id}@{self.version}"
 
     def payload(self) -> dict[str, object]:
-        return {
+        payload = {
             "metric_id": self.metric_id,
             "version": self.version,
             "input_artifact_type": self.input_artifact_type,
@@ -132,6 +185,9 @@ class MetricDefinition:
             "implementation_digest": self.implementation_digest,
             "contract_version": self.contract_version,
         }
+        if self.measurement_semantics is not None:
+            payload["measurement_semantics"] = self.measurement_semantics.to_dict()
+        return payload
 
     @classmethod
     def build(
@@ -150,7 +206,13 @@ class MetricDefinition:
         direction: str,
         implementation_ref: str,
         implementation_digest: str,
+        measurement_semantics: MetricMeasurementSemantics | Mapping[str, object],
     ) -> "MetricDefinition":
+        semantics = (
+            measurement_semantics
+            if isinstance(measurement_semantics, MetricMeasurementSemantics)
+            else MetricMeasurementSemantics.from_dict(measurement_semantics)
+        )
         values = {
             "metric_id": metric_id,
             "version": version,
@@ -165,9 +227,14 @@ class MetricDefinition:
             "direction": direction,
             "implementation_ref": implementation_ref,
             "implementation_digest": implementation_digest,
+            "measurement_semantics": semantics.to_dict(),
             "contract_version": METRIC_DEFINITION_VERSION,
         }
-        return cls(**values, definition_digest=typed_canonical_hash(values))
+        return cls(
+            **{key: value for key, value in values.items() if key != "measurement_semantics"},
+            measurement_semantics=semantics,
+            definition_digest=typed_canonical_hash(values),
+        )
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> "MetricDefinition":
@@ -178,11 +245,28 @@ class MetricDefinition:
             "implementation_ref", "implementation_digest", "definition_digest",
             "contract_version",
         }
+        version = payload.get("contract_version")
+        if version == METRIC_DEFINITION_VERSION:
+            expected.add("measurement_semantics")
+        elif version != LEGACY_METRIC_DEFINITION_VERSION:
+            raise MetricContractError("MetricDefinition contract version 不受支持")
         if set(payload) != expected or not isinstance(payload["output_schema"], Mapping):
             raise MetricContractError("MetricDefinition schema 无效")
+        semantics = payload.get("measurement_semantics")
+        if semantics is not None and not isinstance(semantics, Mapping):
+            raise MetricContractError("MetricDefinition measurement_semantics 无效")
         return cls(
-            **{key: payload[key] for key in expected if key != "output_schema"},
+            **{
+                key: payload[key]
+                for key in expected
+                if key not in {"output_schema", "measurement_semantics"}
+            },
             output_schema=dict(payload["output_schema"]),
+            measurement_semantics=(
+                None
+                if semantics is None
+                else MetricMeasurementSemantics.from_dict(semantics)
+            ),
         )
 
 
@@ -483,6 +567,7 @@ def _definition(
     direction: str,
     implementation_ref: str,
     modules: Sequence[str],
+    measurement_semantics: MetricMeasurementSemantics,
 ) -> MetricDefinition:
     result_schemas = {
         "data.columnar-bundle.v1": "data.columnar-bundle.metrics.v1",
@@ -511,6 +596,7 @@ def _definition(
         direction=direction,
         implementation_ref=implementation_ref,
         implementation_digest=_implementation_digest(implementation_ref, modules),
+        measurement_semantics=measurement_semantics,
     )
 
 
@@ -535,6 +621,13 @@ def build_mainline_metric_registry() -> MetricRegistry:
             direction="neutral",
             implementation_ref="dataset_manifest.row_count",
             modules=("research_pipeline.data_plane.snapshots",),
+            measurement_semantics=MetricMeasurementSemantics(
+                quantity="materialized_row_count",
+                numerator="materialized_rows",
+                denominator="not_applicable",
+                observation_timing="snapshot_commit",
+                aggregation="sum_across_partitions",
+            ),
         ),
         _definition(
             "minute.row_count",
@@ -549,6 +642,13 @@ def build_mainline_metric_registry() -> MetricRegistry:
                 "research_pipeline.data_plane.partitioned_artifacts",
                 "research_pipeline.runtime.adapters.minute_data",
             ),
+            measurement_semantics=MetricMeasurementSemantics(
+                quantity="completed_minute_row_count",
+                numerator="completed_minute_rows",
+                denominator="not_applicable",
+                observation_timing="bounded_window_commit",
+                aggregation="sum_across_partitions",
+            ),
         ),
         _definition(
             "statistics.adjusted_p",
@@ -560,6 +660,13 @@ def build_mainline_metric_registry() -> MetricRegistry:
             direction="lower_is_better",
             implementation_ref="minute_statistics.adjusted_p_value",
             modules=(minute_module,),
+            measurement_semantics=MetricMeasurementSemantics(
+                quantity="multiple_testing_adjusted_probability",
+                numerator="candidate_p_values",
+                denominator="candidate_family",
+                observation_timing="post_candidate_evaluation",
+                aggregation="declared_multiple_testing_adjustment",
+            ),
         ),
     )
     registry = MetricRegistry(definitions)
@@ -580,6 +687,7 @@ __all__ = [
     "MetricArtifact",
     "MetricContractError",
     "MetricDefinition",
+    "MetricMeasurementSemantics",
     "MetricReachabilityProof",
     "MetricRegistry",
     "UnknownMetricError",

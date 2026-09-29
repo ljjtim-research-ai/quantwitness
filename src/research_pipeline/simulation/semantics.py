@@ -179,13 +179,29 @@ class SimulationSemanticsV1:
             raise SimulationContractError("SimulationSemantics 版本不受支持")
         if self.signal_at > self.decision_at:
             raise SimulationContractError("signal_at 晚于 decision_at")
-        if not (
-            self.decision_at
+        base_order_is_valid = (
+            self.signal_at <= self.decision_at
+            and self.decision_at
             <= self.order_submitted_at
             <= self.execution_at
+        )
+        forward_holding_window = (
+            self.execution_at
             <= self.valuation_at
             <= self.return_start_at
             < self.return_end_at
+        )
+        close_to_close_account_window = (
+            self.decision_at
+            <= self.return_start_at
+            <= self.execution_at
+            <= self.valuation_at
+            <= self.return_end_at
+            and self.return_start_at < self.return_end_at
+        )
+        if not (
+            base_order_is_valid
+            and (forward_holding_window or close_to_close_account_window)
         ):
             raise SimulationContractError("决策、提交、成交、估值和收益窗口顺序无效")
         stage_times = {

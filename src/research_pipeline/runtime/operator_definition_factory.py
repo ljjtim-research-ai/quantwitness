@@ -136,7 +136,6 @@ _ADAPTER_FAMILY_DEPENDENCIES = {
     ),
     "research_pipeline.application.grid_data": (
         "research_pipeline.application.grid_data_contract",
-        "research_pipeline.application.grid_measurement",
         "research_pipeline.data_plane.service",
         "research_pipeline.data_plane.admitted_plan_codec",
         "research_pipeline.data_plane.dataset_artifacts",

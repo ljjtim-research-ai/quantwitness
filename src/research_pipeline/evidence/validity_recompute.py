@@ -40,9 +40,64 @@ GATE_ALGORITHM_VERSIONS = {
     "data.pit": "verifier.data-pit.v1",
     "label.split": "verifier.label-split.v2",
     "search.holdout": "verifier.search-holdout.v1",
-    "statistics": "verifier.statistics.v1",
-    "financial.tradability": "verifier.financial-tradability.v2",
+    "statistics": "verifier.statistics.v2",
+    "financial.tradability": "verifier.financial-tradability.v3",
 }
+
+
+def _statistics_matrix_is_nondegenerate(
+    statistics: Mapping[str, object],
+    verified_matrix: Mapping[str, object] | None,
+) -> bool:
+    rank = statistics.get("matrix_rank")
+    columns = statistics.get("matrix_columns")
+    if (
+        type(rank) is not int
+        or type(columns) is not int
+        or rank <= 0
+        or columns <= 0
+        or rank > columns
+    ):
+        return False
+    if verified_matrix is None:
+        return rank == columns
+    expected = {
+        "contract_version",
+        "matrix_rows",
+        "matrix_effective_rows",
+        "matrix_columns",
+        "matrix_rank",
+    }
+    if (
+        set(verified_matrix) != expected
+        or verified_matrix.get("contract_version")
+        != "research-statistics-matrix-evidence-v1"
+    ):
+        return False
+    values = {
+        name: verified_matrix.get(name)
+        for name in (
+            "matrix_rows",
+            "matrix_effective_rows",
+            "matrix_columns",
+            "matrix_rank",
+        )
+    }
+    if any(type(value) is not int for value in values.values()):
+        return False
+    rows = int(values["matrix_rows"])
+    effective_rows = int(values["matrix_effective_rows"])
+    verified_columns = int(values["matrix_columns"])
+    verified_rank = int(values["matrix_rank"])
+    reachable_rank = min(verified_columns, effective_rows)
+    return (
+        rows > 0
+        and verified_columns > 0
+        and 0 < effective_rows <= rows
+        and verified_columns == columns
+        and verified_rank == rank
+        and verified_rank == reachable_rank
+    )
 
 
 def build_validity_gate_input_hashes(
@@ -337,6 +392,7 @@ def _recompute_issue_map(
     require_bar_tca_oracle: bool = True,
     minute_statistics_observations: object = (),
     minute_statistics_split_assignments: object = (),
+    verified_statistics_matrix: Mapping[str, object] | None = None,
 ) -> dict[str, set[str]]:
     issues = {gate_id: set() for gate_id in VALIDITY_GATE_IDS}
     raw_analysis = facts.get("analysis_semantics")
@@ -726,7 +782,10 @@ def _recompute_issue_map(
             )
         ):
             issues["statistics"].add("statistics.method_not_applicable")
-        if type(statistics.get("matrix_rank")) is not int or type(statistics.get("matrix_columns")) is not int or statistics["matrix_rank"] < statistics["matrix_columns"]:
+        if not _statistics_matrix_is_nondegenerate(
+            statistics,
+            verified_statistics_matrix,
+        ):
             issues["statistics"].add("statistics.degenerate_matrix")
         if statistics.get("multiple_testing_method") not in {
             "holm",
@@ -959,11 +1018,28 @@ def _verify_simulation_semantics_payload(payload: Mapping[str, object]) -> None:
         raise _SimulationTimeSemanticsError(
             "simulation semantics 时间必须使用 Asia/Shanghai 偏移"
         )
-    if not (
+    base_order_is_valid = (
         times["signal_at"] <= times["decision_at"]
+        and times["decision_at"]
         <= times["order_submitted_at"] <= times["execution_at"]
-        <= times["valuation_at"] <= times["return_start_at"]
+    )
+    forward_holding_window = (
+        times["execution_at"]
+        <= times["valuation_at"]
+        <= times["return_start_at"]
         < times["return_end_at"]
+    )
+    close_to_close_account_window = (
+        times["decision_at"]
+        <= times["return_start_at"]
+        <= times["execution_at"]
+        <= times["valuation_at"]
+        <= times["return_end_at"]
+        and times["return_start_at"] < times["return_end_at"]
+    )
+    if not (
+        base_order_is_valid
+        and (forward_holding_window or close_to_close_account_window)
     ):
         raise _SimulationTimeSemanticsError("simulation semantics 时间顺序无效")
     stage_times = {
@@ -1136,6 +1212,7 @@ def recompute_gate_results(
     require_bar_tca_oracle: bool = True,
     minute_statistics_observations: object = (),
     minute_statistics_split_assignments: object = (),
+    verified_statistics_matrix: Mapping[str, object] | None = None,
 ) -> tuple[ValidityGateResult, ...]:
     """从 facts 重算门禁；只有未签名 draft 阶段可延后独立 TCA oracle。"""
     normalized_inputs = tuple(sorted(input_hashes))
@@ -1145,6 +1222,7 @@ def recompute_gate_results(
         require_bar_tca_oracle=require_bar_tca_oracle,
         minute_statistics_observations=minute_statistics_observations,
         minute_statistics_split_assignments=minute_statistics_split_assignments,
+        verified_statistics_matrix=verified_statistics_matrix,
     )
     analysis_only = isinstance(facts.get("analysis_semantics"), Mapping) and facts[
         "analysis_semantics"

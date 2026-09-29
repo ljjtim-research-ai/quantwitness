@@ -240,6 +240,7 @@ class ResultStore:
         bundle: ResultBundle,
         *,
         run_root: str | Path,
+        verifier_bundle_source: str | Path | None = None,
         phase_hook: Callable[[str], None] | None = None,
     ) -> Path:
         """从 Runtime 工件单次读取并复制，之后 Result 不再依赖 run-root。"""
@@ -248,10 +249,12 @@ class ResultStore:
             runtime_root = PathRolePolicy().resolve_root(
                 run_root, role="result_runtime_root"
             )
-            PathRolePolicy().validate(
-                {"result_store": self.root, "runtime_root": runtime_root},
-                read_only_roles=("runtime_root",),
-            )
+            roles = {"result_store": self.root, "runtime_root": runtime_root}
+            read_only_roles = ["runtime_root"]
+            if verifier_bundle_source is not None:
+                roles["verifier_bundle_input"] = verifier_bundle_source
+                read_only_roles.append("verifier_bundle_input")
+            PathRolePolicy().validate(roles, read_only_roles=tuple(read_only_roles))
         except DataPlaneError as exc:
             raise ResultContractError("ResultBundle 发布路径安全验证失败") from exc
         namespace = self._namespace(bundle.project_id, bundle.run_id)
@@ -270,7 +273,12 @@ class ResultStore:
         try:
             if staging.stat().st_dev != namespace.stat().st_dev:
                 raise ResultContractError("ResultBundle staging 与目标不在同一卷")
-            self._materialize_files(staging, bundle, runtime_root)
+            self._materialize_files(
+                staging,
+                bundle,
+                runtime_root,
+                verifier_bundle_source=verifier_bundle_source,
+            )
             self._write_controls(staging, bundle)
             staged = self._read_controls(staging, require_namespace=False)
             if staged != bundle:
@@ -445,6 +453,8 @@ class ResultStore:
         staging: Path,
         bundle: ResultBundle,
         runtime_root: Path,
+        *,
+        verifier_bundle_source: str | Path | None,
     ) -> None:
         reader = ExternalArtifactReader(runtime_root / "external-artifacts")
         snapshots: dict[str, ExternalArtifactSnapshot] = {}
@@ -485,6 +495,28 @@ class ResultStore:
             reader.copy_file(
                 source, support.source_path, staging / support.relative_path
             )
+        embedded_path = bundle.verification.verifier_bundle_path
+        if embedded_path is None:
+            if verifier_bundle_source is not None:
+                raise ResultContractError("核心 Result 不得携带项目 Verifier bundle")
+            return
+        if verifier_bundle_source is None:
+            raise ResultContractError("项目 Result 缺少 Plan 冻结 Verifier bundle")
+        from research_pipeline.extensions.verifier_bundle import (
+            verify_project_verifier_bundle,
+        )
+
+        source_path = Path(verifier_bundle_source).resolve(strict=True)
+        source_manifest = verify_project_verifier_bundle(source_path)
+        if source_manifest.identity() != dict(
+            bundle.verification.verifier_identity or {}
+        ):
+            raise ResultContractError("Plan Verifier bundle 与 Result 冻结身份不一致")
+        destination = staging / embedded_path
+        shutil.copytree(source_path, destination)
+        copied_manifest = verify_project_verifier_bundle(destination)
+        if copied_manifest.identity() != source_manifest.identity():
+            raise ResultContractError("Result 内嵌 Verifier bundle 复制后漂移")
 
     @staticmethod
     def _write_controls(directory: Path, bundle: ResultBundle) -> None:
@@ -562,6 +594,7 @@ class ResultStore:
             RESULT_COMMITTED_NAME,
             *(path for table in bundle.tables for path in table.files),
             *(item.relative_path for item in bundle.support_files),
+            *self._embedded_verifier_files(directory, bundle),
         }
         actual_files = self._result_payload_paths(directory)
         if actual_files != expected_files:
@@ -644,6 +677,35 @@ class ResultStore:
             support_bytes,
             verified_schema_ids,
         )
+
+    @staticmethod
+    def _embedded_verifier_files(
+        directory: Path,
+        bundle: ResultBundle,
+    ) -> set[str]:
+        relative_root = bundle.verification.verifier_bundle_path
+        if relative_root is None:
+            return set()
+        from research_pipeline.extensions.verifier_bundle import (
+            verify_project_verifier_bundle,
+        )
+
+        verifier_root = directory / relative_root
+        try:
+            manifest = verify_project_verifier_bundle(verifier_root)
+        except Exception as exc:
+            raise ResultContractError("Result 内嵌 Verifier bundle 无法复验") from exc
+        if manifest.identity() != dict(bundle.verification.verifier_identity or {}):
+            raise ResultContractError("Result 内嵌 Verifier bundle 身份漂移")
+        return {
+            f"{relative_root}/manifest.json",
+            f"{relative_root}/dependency-lock.json",
+            f"{relative_root}/COMMITTED",
+            *(
+                f"{relative_root}/sources/{item['path']}"
+                for item in manifest.source_files
+            ),
+        }
 
     @staticmethod
     def _read_verified_file(

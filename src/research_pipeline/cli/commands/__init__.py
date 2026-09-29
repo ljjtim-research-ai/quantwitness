@@ -9,6 +9,7 @@ COMMAND_MODULES = {
     "verify": "research_pipeline.cli.commands.evidence_lifecycle",
     "report": "research_pipeline.cli.commands.evidence_lifecycle",
     "compare": "research_pipeline.cli.commands.evidence_lifecycle",
+    "analysis": "research_pipeline.cli.commands.result_analysis",
     "export-result": "research_pipeline.cli.commands.evidence_lifecycle",
     "doctor": "research_pipeline.cli.commands.operations_lifecycle",
     "gc": "research_pipeline.cli.commands.operations_lifecycle",

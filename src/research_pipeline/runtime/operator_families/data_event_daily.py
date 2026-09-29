@@ -27,7 +27,7 @@ def build_data_event_daily_operator_definitions() -> tuple[OperatorDefinition, .
                 "temp_bytes": 64 * _MIB,
                 "wall_seconds": 300,
             },
-            code_fingerprint="compiled-catalog-pit-admission-v1",
+            code_fingerprint="compiled-catalog-pit-admission-v2",
             capability="data.catalog.admission.v1",
             module_name="research_pipeline.catalog.compiler",
             symbol_name="CatalogPreflight",

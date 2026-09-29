@@ -30,6 +30,7 @@ from research_pipeline.extensions import (
     verify_project_operator_bundle,
 )
 from research_pipeline.platform import canonical_json, typed_canonical_hash
+from research_pipeline.platform.redaction import redact_text
 
 from .project_operator_runtime import (
     PROJECT_RUNTIME_IDENTITY_VERSION,
@@ -39,7 +40,11 @@ from .project_operator_runtime import (
 from .project_output import ProjectOutputRoot
 from .identity import environment_fingerprint
 from research_pipeline.data_plane.snapshots import _sha256
-from .project_table_input import ProjectRequestTableInput, ProjectTableInput
+from .project_table_input import (
+    ProjectRequestAdmissionInput,
+    ProjectRequestTableInput,
+    ProjectTableInput,
+)
 
 
 _WINDOWS_JOB_KILL_ON_CLOSE = 0x00002000
@@ -257,7 +262,12 @@ def main(argv: list[str] | None = None) -> int:
         for item in inputs:
             if "causal_context" not in task and isinstance(
                 item,
-                (ProjectPartitionInput, ProjectRequestTableInput, ProjectTableInput),
+                (
+                    ProjectPartitionInput,
+                    ProjectRequestAdmissionInput,
+                    ProjectRequestTableInput,
+                    ProjectTableInput,
+                ),
             ):
                 item.assert_complete()
         commits, state_commit = _normalize_result(raw_commits)
@@ -281,7 +291,10 @@ def main(argv: list[str] | None = None) -> int:
         request_traces = {
             item.port: item.consumption_trace()
             for item in inputs
-            if isinstance(item, ProjectRequestTableInput)
+            if isinstance(
+                item,
+                (ProjectRequestAdmissionInput, ProjectRequestTableInput),
+            )
         }
         if request_traces:
             payload["request_traces"] = request_traces
@@ -292,9 +305,21 @@ def main(argv: list[str] | None = None) -> int:
         os.fsync(result_handle.fileno())
         return 0
     except BaseException as exc:
+        message = redact_text(" ".join(str(exc).split())) or type(exc).__name__
+        if len(message) > 500:
+            message = f"{message[:499]}…"
+        error_code = getattr(exc, "error_code", None)
+        if not isinstance(error_code, str) or not error_code:
+            error_code = (
+                str(exc)
+                if isinstance(exc, ValueError) and str(exc)
+                else type(exc).__name__
+            )
         payload = {
             "status": "failed",
-            "error_code": str(exc) if isinstance(exc, ValueError) else type(exc).__name__,
+            "error_code": error_code,
+            "exception_type": type(exc).__name__,
+            "message": message,
         }
         result_handle.seek(0)
         result_handle.truncate()
@@ -514,6 +539,48 @@ def _load_input(
             artifact_type=str(item["artifact_type"]),
             source_identity=str(item["source_identity"]),
             source_root=Path(str(item["source_root"])).resolve(strict=True),
+            requests=normalized,
+        )
+    if kind == "request_admissions":
+        expected_request_input = {
+            "input_kind", "invocation", "port", "artifact_type",
+            "source_identity", "requests",
+        }
+        requests = item.get("requests")
+        if (
+            set(item) != expected_request_input
+            or not isinstance(requests, list)
+            or not requests
+        ):
+            raise ValueError("project_request_admission_input_invalid")
+        normalized: dict[str, Mapping[str, object]] = {}
+        for request in requests:
+            if (
+                not isinstance(request, Mapping)
+                or set(request) != {
+                    "request_id", "source_identity", "schema_hash", "admission",
+                }
+                or not isinstance(request["request_id"], str)
+                or not request["request_id"]
+                or not isinstance(request["source_identity"], str)
+                or not isinstance(request["schema_hash"], str)
+                or not isinstance(request["admission"], Mapping)
+            ):
+                raise ValueError("project_request_admission_input_invalid")
+            request_id = request["request_id"]
+            if request_id in normalized:
+                raise ValueError("project_request_admission_input_invalid")
+            normalized[request_id] = {
+                "source_identity": request["source_identity"],
+                "schema_hash": request["schema_hash"],
+                "admission": dict(request["admission"]),
+            }
+        if tuple(normalized) != tuple(sorted(normalized)):
+            raise ValueError("project_request_admission_input_invalid")
+        return ProjectRequestAdmissionInput(
+            port=str(item["port"]),
+            artifact_type=str(item["artifact_type"]),
+            source_identity=str(item["source_identity"]),
             requests=normalized,
         )
     if kind == "file":

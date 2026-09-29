@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from .grid_data_contract import _columnar_materialization_plans, _verify_data_bundle
-from .grid_measurement import _measurement
 from datetime import datetime
 from pathlib import Path
 from research_pipeline.data_plane import ArtifactResolver, DataPlaneError, DataPlaneRequestExecutionError, DatasetArtifactRef, SnapshotIntegrityError
@@ -13,7 +12,6 @@ from research_pipeline.data_plane.service import _write_json_atomic, materialize
 from research_pipeline.platform.metric_contracts import build_mainline_metric_registry
 from research_pipeline.runtime.adapters.common import _capture, _environment, _external_result
 from research_pipeline.runtime.operator_runtime import OperatorRuntimeContext, RuntimeNodeValue
-from time import perf_counter
 from typing import Mapping
 import json
 
@@ -48,7 +46,6 @@ def execute_operator_graph_data(
     source_fingerprints_before = {
         profile: _fingerprint(path) for profile, path in sorted(databases.items())
     }
-    started = perf_counter()
     verified_dataset_manifests: dict[str, Mapping[str, object]] = {}
     execution_estimates = load_execution_estimates(
         manifest.get("execution_estimates"),
@@ -69,7 +66,6 @@ def execute_operator_graph_data(
             else Path(request_recovery_root).resolve() / "partial-index.json"
         ),
     )
-    measurement = _measurement("data_plane", started, data_bundle["bundle_hash"])
     database_after = _fingerprint(database)
     source_fingerprints_after = {
         profile: _fingerprint(path) for profile, path in sorted(databases.items())
@@ -88,7 +84,6 @@ def execute_operator_graph_data(
         "database_fingerprints_by_profile_before": source_fingerprints_before,
         "database_fingerprints_by_profile_after": source_fingerprints_after,
         "database_unchanged": True,
-        "measurement": measurement,
     }
     # 只在同一调用栈内交给 Runtime adapter 生成观察指标，不持久化第二份 manifest。
     result["_verified_dataset_manifests"] = verified_dataset_manifests

@@ -13,7 +13,10 @@ from types import MappingProxyType
 from typing import Iterable, Mapping
 
 from research_pipeline.platform import typed_canonical_hash
-from research_pipeline.platform.metric_contracts import MetricDefinition
+from research_pipeline.platform.metric_contracts import (
+    METRIC_DEFINITION_VERSION,
+    MetricDefinition,
+)
 
 from .errors import ExtensionError
 from .project_bundle import (
@@ -25,7 +28,6 @@ from .project_bundle import (
     _assert_regular_file,
     _canonical_bytes,
     _safe_id,
-    _safe_relative_path,
     _source_entries,
     _source_paths,
     _validate_imports,
@@ -242,6 +244,12 @@ def compile_project_verifier_bundle(
     dependency_lock: Mapping[str, str],
 ) -> Path:
     """从显式源码根生成与 Operator bundle 分离的 Verifier bundle。"""
+    definitions = tuple(metric_definitions)
+    if any(
+        definition.contract_version != METRIC_DEFINITION_VERSION
+        for definition in definitions
+    ):
+        raise ExtensionError("新建项目 Verifier 必须使用当前 MetricDefinition 合同")
     root, entries = _source_entries(source_root)
     source_hash = typed_canonical_hash({"source_files": list(entries)})
     normalized_lock = dict(sorted((str(key), str(value)) for key, value in dependency_lock.items()))
@@ -258,7 +266,7 @@ def compile_project_verifier_bundle(
         ),
         "metric_definitions": [
             {**item.payload(), "definition_digest": item.definition_digest}
-            for item in sorted(metric_definitions, key=lambda definition: definition.metric_ref)
+            for item in sorted(definitions, key=lambda definition: definition.metric_ref)
         ],
         "source_files": list(entries),
         "source_tree_hash": source_hash,

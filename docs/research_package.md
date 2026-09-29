@@ -11,6 +11,12 @@ spec/research.yaml
 
 `package init` 只生成四份可编辑的中性草稿，不附带证券、数据集、论文、日期或研究图。补齐字段后，同一严格 loader 才会产生正式 ResearchPackage；草稿 `lint` 指出当前阻断字段，不能准入或运行。
 
+## 参数变体
+
+`package expand-variants --base <基包> --manifest <清单> --output-root <目录>` 从一个完整基包原子生成多个普通 ResearchPackage。清单必须绑定基包 hash，并为每个变体提供稳定 `variant_id`、package slug、显示名、版本、graph ID，以及用 `node_id + parameter_name` 定位的既有参数覆盖。它不支持深层合并、表达式、模板、Python 或 SQL。
+
+任一变体引用未知节点、未知参数、重复标识或不兼容值类型时，整个输出目录不发布。成功生成的包没有特殊运行语义，仍分别经过原有 loader、Operator 参数 schema、lint、admit、PIT、ResultSpec、run 和 verify。
+
 ## package.yaml
 
 记录 package 身份、当前 builder、指标合同和 claim 上限。当前创建入口只生成 operator graph package。

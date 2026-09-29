@@ -96,9 +96,12 @@ def safe_error_summary(
     message = redact_text(" ".join(str(error).split())) or type(error).__name__
     if len(message) > limit:
         message = f"{message[: limit - 1]}…"
+    exception_type = getattr(error, "diagnostic_exception_type", None)
+    if not isinstance(exception_type, str) or not exception_type:
+        exception_type = type(error).__name__
     result: dict[str, object] = {
         "error_code": error_code,
-        "exception_type": type(error).__name__,
+        "exception_type": exception_type,
         "message": message,
     }
     failure_context = getattr(error, "failure_payload", None)

@@ -51,7 +51,8 @@ def execute_project_causal_node(service, *, node_context, run_id, attempt_id, en
             attempt_root=work_root, inputs=inputs,
             parameters={**parameters, "causal_plan": work_plan.to_dict()},
             fixed_clock=node_context.fixed_clock, root_seed=node_context.root_seed,
-            budget=node_context.effective_resource_budget, state_in=state_input,
+            budget=node_context.remaining_resource_budget(), state_in=state_input,
+            process_slots=node_context.process_slots,
             causal_context={"plan": work_plan.to_dict(), "inherited_lineage": list(lineage),
                             "partition_identities": identities, "source_timezones": timezones},
         )

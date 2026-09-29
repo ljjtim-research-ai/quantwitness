@@ -37,6 +37,7 @@ from research_pipeline.runtime import (
     ResourceGovernorConfig,
     ResourceVector,
 )
+from research_pipeline.runtime.liveness import RuntimeLiveness
 from research_pipeline.runtime.scheduler import (
     DEFAULT_RUNTIME_MEMORY_BYTES,
     DEFAULT_RUNTIME_SCRATCH_BYTES,
@@ -49,13 +50,21 @@ from research_pipeline.runtime.diagnostics import (
 from research_pipeline.runtime.operator_definitions import build_mainline_operator_manifest
 from research_pipeline.runtime.adapters.common import ResearchRunEnvironment
 from research_pipeline.runtime.operator_registry import (
+    NODE_IDENTITY_PROJECTION_LEGACY,
     admitted_implementation_manifest_hash,
+    operator_process_slots_by_node,
 )
 from research_pipeline.runtime.operator_graph_admission import (
     load_study_reproduction_proof,
 )
+from research_pipeline.runtime.failed_run_reuse import prepare_failed_run_reuse
+from research_pipeline.runtime.required_run_reuse import prepare_required_run_reuse
 
-from ..research_plan_store import load_operator_graph_research_plan
+from ..research_plan_store import (
+    load_operator_graph_research_plan,
+    resolve_plan_verifier_bundle,
+)
+from ..command_suggestion import command_suggestion
 from ..result import execute_guarded
 
 
@@ -72,8 +81,12 @@ def _execute_operator_graph(args) -> dict[str, object]:
         raise ValueError("execution_engine 迁移参数已删除；正式运行只使用统一 Runtime")
     _require_data_run_arguments(args)
     _validate_run_paths(args)
-    manifest, admitted, dag, registry = load_operator_graph_research_plan(
+    manifest, admitted, dag, recipe, registry = load_operator_graph_research_plan(
         target=args.plan,
+    )
+    verifier_bundle_source = resolve_plan_verifier_bundle(
+        args.plan,
+        manifest.get("verifier_admission"),
     )
     implementation_manifest_hash = admitted_implementation_manifest_hash(registry)
     if args.root_seed != manifest["root_seed"] or args.clock != manifest["fixed_clock"]:
@@ -86,7 +99,15 @@ def _execute_operator_graph(args) -> dict[str, object]:
         capacity=resource_capacity,
         registry=registry,
     )
-    _validate_resource_governance_arguments(args)
+    declared_process_slots = operator_process_slots_by_node(
+        dag,
+        recipe,
+        registry,
+    )
+    _validate_resource_governance_arguments(
+        args,
+        required_process_slots=max(declared_process_slots.values()),
+    )
     database = Path(args.data_db).resolve()
     if not database.is_file():
         raise ValueError("显式只读 data-db 不存在")
@@ -133,6 +154,7 @@ def _execute_operator_graph(args) -> dict[str, object]:
         manifest=manifest,
         admitted=admitted,
         dag=dag,
+        recipe=recipe,
         registry=registry,
         database=database,
         source_databases=source_databases,
@@ -149,6 +171,7 @@ def _execute_operator_graph(args) -> dict[str, object]:
         manifest=manifest,
         admitted=admitted,
         runtime_result=runtime_result,
+        verifier_bundle_source=verifier_bundle_source,
         implementation_manifest_hash=implementation_manifest_hash,
         database=database,
         database_probe=database_probe,
@@ -159,8 +182,28 @@ def _execute_operator_graph(args) -> dict[str, object]:
     completion = {
         **result_payload,
         "next_action": "运行 verify，以自包含 Result 生成结构化 VerificationResult；通过后可使用 report、compare、export-result 或 Dashboard 消费结果。",
+        **command_suggestion(
+            "python", "-m", "research_pipeline", "verify",
+            "--result", result_payload["result_directory"],
+            "--result-store", args.result_store,
+            "--output", str(
+                _available_verification_output(Path(args.run_root).resolve())
+            ),
+            "--json",
+        ),
     }
     return completion
+
+
+def _available_verification_output(run_root: Path) -> Path:
+    candidate = run_root / "verification-result.json"
+    if not candidate.exists():
+        return candidate
+    for index in range(2, 10_000):
+        candidate = run_root / f"verification-result-{index}.json"
+        if not candidate.exists():
+            return candidate
+    raise ValueError("无法为 VerificationResult 选择未占用输出路径")
 
 
 def _finalize_operator_graph_result(
@@ -175,10 +218,12 @@ def _finalize_operator_graph_result(
     source_databases: Mapping[str, Path],
     source_database_probes: Mapping[str, tuple[int, int]],
     study_proof,
+    verifier_bundle_source: Path | None = None,
 ) -> dict[str, object]:
     """投影 Runtime 之后的唯一 Result finalize 生命周期。"""
 
     write_finalize_status(args.run_root, status="pending")
+    liveness: RuntimeLiveness | None = None
     result_bundle = None
     result_directory = None
 
@@ -188,6 +233,11 @@ def _finalize_operator_graph_result(
         result_directory = directory
 
     try:
+        liveness = RuntimeLiveness(
+            args.run_root,
+            run_id=str(runtime_result["run_id"]),
+            phase="finalizing",
+        ).start()
         completion_metadata = runtime_result.get("completion_metadata")
         if not isinstance(completion_metadata, Mapping):
             raise ValueError("统一 Runtime 缺少 completion metadata")
@@ -246,6 +296,7 @@ def _finalize_operator_graph_result(
             verification_policy_id=policy_id_for_claim(effective_claim_level),
             validity_producer_hash=VALIDITY_FACTS_PRODUCER_HASH,
             verifier_identity=manifest.get("verifier_admission"),
+            verifier_bundle_source=verifier_bundle_source,
             formal_input_request_ids=tuple(manifest["consumed_request_ids"]),
             input_claim_ceilings=manifest["input_claim_ceilings"],
             published_hook=capture_published_result,
@@ -296,6 +347,9 @@ def _finalize_operator_graph_result(
             # 状态投影写入失败不能掩盖真实 finalize 异常。
             pass
         raise
+    finally:
+        if liveness is not None:
+            liveness.stop()
     return result_payload
 
 
@@ -305,6 +359,7 @@ def _execute_unified_operator_runtime(
     manifest,
     admitted,
     dag,
+    recipe,
     registry,
     database,
     source_databases,
@@ -377,8 +432,15 @@ def _execute_unified_operator_runtime(
             registry if isinstance(registry, AdmittedProjectOperatorRegistry) else None
         ),
         project_parameters_by_node=node_parameters,
+        result_table_requirements_by_node=_result_table_requirements_by_node(
+            manifest
+        ),
     )
-    process_slots_by_node = {node.node_id: 1 for node in dag.nodes}
+    process_slots_by_node = operator_process_slots_by_node(
+        dag,
+        recipe,
+        registry,
+    )
     runtime_kwargs = {
         "dag": dag,
         "environment": environment,
@@ -388,10 +450,48 @@ def _execute_unified_operator_runtime(
         "fixed_clock": args.clock,
         "mode": ExecutionMode(args.mode),
         "process_slots_by_node": process_slots_by_node,
+        "reuse_run_roots": tuple(getattr(args, "reuse_run_root", ())),
+        "node_identity_projection": str(
+            manifest.get(
+                "node_identity_projection",
+                NODE_IDENTITY_PROJECTION_LEGACY,
+            )
+        ),
     }
     recovery = None
     parent_run_root = getattr(args, "runtime_rerun_parent_root", None)
-    if parent_run_root:
+    failed_reuse_root = getattr(args, "reuse_failed_run_root", None)
+    required_reused_nodes = tuple(
+        getattr(args, "require_reused_node", ())
+    )
+    if required_reused_nodes:
+        prepare_required_run_reuse(
+            service=service,
+            dag=dag,
+            source_run_roots=tuple(getattr(args, "reuse_run_root", ())),
+            target_run_root=runtime_root,
+            root_seed=args.root_seed,
+            fixed_clock=args.clock,
+            required_node_ids=required_reused_nodes,
+            node_identity_projection=str(
+                manifest.get(
+                    "node_identity_projection",
+                    NODE_IDENTITY_PROJECTION_LEGACY,
+                )
+            ),
+        )
+    if failed_reuse_root:
+        recovery = prepare_failed_run_reuse(
+            service=service,
+            dag=dag,
+            source_run_root=failed_reuse_root,
+            target_run_root=runtime_root,
+            project_id=str(manifest["package_id"]),
+            root_seed=args.root_seed,
+            fixed_clock=args.clock,
+            mode=ExecutionMode(args.mode),
+        )
+    elif parent_run_root:
         recovery_path = runtime_root / "recovery-plan.json"
         if recovery_path.is_file():
             recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
@@ -406,6 +506,7 @@ def _execute_unified_operator_runtime(
                 mode=ExecutionMode(args.mode),
                 node_id=str(args.runtime_rerun_node),
             )
+    if recovery is not None:
         runtime_kwargs.update({
             "parent_run_id": recovery["parent_run_id"],
             "rerun_from_node": recovery["rerun_from_node"],
@@ -418,6 +519,31 @@ def _execute_unified_operator_runtime(
         **runtime_kwargs,
         resume=bool(getattr(args, "runtime_resume", False)),
     )
+
+
+def _result_table_requirements_by_node(
+    manifest: Mapping[str, object],
+) -> dict[str, tuple[dict[str, str], ...]]:
+    """把已编译 ResultSpec 投影为节点提交后的即时结构校验。"""
+
+    raw = manifest.get("result_spec")
+    if not isinstance(raw, Mapping):
+        raise ValueError("统一 Runtime 缺少已编译 ResultSpec")
+    result_spec = ResultSpec.from_dict(raw)
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for table in result_spec.tables:
+        grouped.setdefault(table.source_node_id, []).append(
+            {
+                "table_id": table.table_id,
+                "source_port": table.source_port,
+                "artifact_type": table.artifact_type,
+                "path_prefix": table.path_prefix,
+            }
+        )
+    return {
+        node_id: tuple(sorted(items, key=lambda item: item["table_id"]))
+        for node_id, items in sorted(grouped.items())
+    }
 
 
 def _build_runtime_audit_environment(
@@ -462,9 +588,21 @@ def _write_or_verify_runtime_invocation(runtime_root: Path, args) -> None:
     target = runtime_root / "operator-dag-invocation.json"
     source_databases = _source_database_arguments(args)
     rerun_enabled = bool(getattr(args, "runtime_rerun_parent_root", None))
+    failed_reuse_root = getattr(args, "reuse_failed_run_root", None)
+    required_reused_nodes = sorted(
+        set(getattr(args, "require_reused_node", ()))
+    )
     resource_capacity = _runtime_resource_capacity(args)
     payload = {
-        "contract_version": "research-operator-dag-invocation-v10",
+        "contract_version": (
+            "research-operator-dag-invocation-v13"
+            if required_reused_nodes
+            else (
+                "research-operator-dag-invocation-v12"
+                if failed_reuse_root
+                else "research-operator-dag-invocation-v11"
+            )
+        ),
         "plan": str(Path(args.plan).resolve()),
         "data_db": str(Path(args.data_db).resolve()),
         "source_dbs": {
@@ -489,7 +627,15 @@ def _write_or_verify_runtime_invocation(runtime_root: Path, args) -> None:
         ),
         "execution_engine": "unified",
         "resource_capacity": resource_capacity.to_dict(),
+        "reuse_run_roots": [
+            str(Path(path).resolve())
+            for path in getattr(args, "reuse_run_root", ())
+        ],
     }
+    if required_reused_nodes:
+        payload["required_reused_nodes"] = required_reused_nodes
+    if failed_reuse_root:
+        payload["reuse_failed_run_root"] = str(Path(failed_reuse_root).resolve())
     if rerun_enabled:
         payload["parent_run_root"] = str(Path(args.runtime_rerun_parent_root).resolve())
         payload["rerun_from_node"] = str(args.runtime_rerun_node)
@@ -525,20 +671,49 @@ def _load_operator_invocation(run_root: str | Path) -> Namespace:
         "acceptance_proof", "execution_engine", "resource_capacity",
         "resource_governance",
     }
+    if version == "research-operator-dag-invocation-v13":
+        expected.update({"reuse_run_roots", "required_reused_nodes"})
+    elif version == "research-operator-dag-invocation-v12":
+        expected.update({"reuse_run_roots", "reuse_failed_run_root"})
+    elif version == "research-operator-dag-invocation-v11":
+        expected.add("reuse_run_roots")
+    elif version != "research-operator-dag-invocation-v10":
+        raise ValueError("正式 operator DAG invocation 版本、路径或 hash 无效")
     if "parent_run_root" in payload or "rerun_from_node" in payload:
         expected.update({"parent_run_root", "rerun_from_node"})
     if (
         set(payload) != expected
-        or version != "research-operator-dag-invocation-v10"
-        or payload.get("run_root") != str(root)
+        or
+        payload.get("run_root") != str(root)
         or payload.get("execution_engine") != "unified"
         or invocation_hash != typed_canonical_hash(original_payload)
     ):
         raise ValueError("正式 operator DAG invocation 版本、路径或 hash 无效")
     source_dbs = payload.pop("source_dbs")
+    reuse_run_roots = payload.pop("reuse_run_roots", [])
+    reuse_failed_run_root = payload.pop("reuse_failed_run_root", None)
+    required_reused_nodes = payload.pop("required_reused_nodes", [])
     payload.setdefault("minute_data_root", None)
     if not isinstance(source_dbs, Mapping):
         raise ValueError("正式 operator DAG source_dbs 无效")
+    if (
+        not isinstance(reuse_run_roots, list)
+        or any(not isinstance(path, str) or not path for path in reuse_run_roots)
+    ):
+        raise ValueError("正式 operator DAG reuse_run_roots 无效")
+    if reuse_failed_run_root is not None and (
+        not isinstance(reuse_failed_run_root, str) or not reuse_failed_run_root
+    ):
+        raise ValueError("正式 operator DAG reuse_failed_run_root 无效")
+    if (
+        not isinstance(required_reused_nodes, list)
+        or any(
+            not isinstance(node_id, str) or not node_id
+            for node_id in required_reused_nodes
+        )
+        or len(set(required_reused_nodes)) != len(required_reused_nodes)
+    ):
+        raise ValueError("正式 operator DAG required_reused_nodes 无效")
     capacity_payload = payload.pop("resource_capacity", None)
     if not isinstance(capacity_payload, Mapping) or set(capacity_payload) != {
         "memory_bytes", "cpu_slots", "temp_bytes", "max_workers"
@@ -558,6 +733,9 @@ def _load_operator_invocation(run_root: str | Path) -> Namespace:
     return Namespace(
         **{key: value for key, value in payload.items() if key != "contract_version"},
         source_db=[f"{profile}={path}" for profile, path in sorted(source_dbs.items())],
+        reuse_run_root=reuse_run_roots,
+        reuse_failed_run_root=reuse_failed_run_root,
+        require_reused_node=required_reused_nodes,
         json=True,
         runtime_resume=True,
         runtime_retry_node=None,
@@ -577,7 +755,7 @@ def inspect_operator_graph(run_root: str | Path) -> dict[str, object]:
     """只读取计划闭包和 run-root，按正式身份复验 checkpoint。"""
 
     args = _load_operator_invocation(run_root)
-    _manifest, _admitted, dag, registry = load_operator_graph_research_plan(
+    _manifest, _admitted, dag, _recipe, registry = load_operator_graph_research_plan(
         target=args.plan
     )
     audit, dependencies = _build_runtime_audit_environment()
@@ -712,6 +890,23 @@ def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:
 
 
 def _validate_run_paths(args) -> None:
+    required_reused_nodes = tuple(
+        getattr(args, "require_reused_node", ())
+    )
+    if required_reused_nodes and not getattr(args, "reuse_run_root", ()):
+        raise ValueError("要求节点复用时必须提供 --reuse-run-root")
+    if len(set(required_reused_nodes)) != len(required_reused_nodes):
+        raise ValueError("--require-reused-node 不得重复")
+    if getattr(args, "reuse_failed_run_root", None) and getattr(
+        args, "reuse_run_root", ()
+    ):
+        raise ValueError("失败 run checkpoint 复用不能与完成态跨运行复用同时启用")
+    if getattr(args, "reuse_failed_run_root", None) and required_reused_nodes:
+        raise ValueError("失败 run checkpoint 复用不能要求完成态节点复用")
+    if getattr(args, "reuse_failed_run_root", None) and getattr(
+        args, "runtime_rerun_parent_root", None
+    ):
+        raise ValueError("失败 run checkpoint 复用不能与 rerun-from 同时启用")
     roles = {
         "plan_input": args.plan,
         "database_input": args.data_db,
@@ -727,6 +922,13 @@ def _validate_run_paths(args) -> None:
     if getattr(args, "resource_state_dir", None):
         roles["resource_governance_output"] = args.resource_state_dir
     read_only = ["plan_input", "database_input"]
+    for index, path in enumerate(getattr(args, "reuse_run_root", ())):
+        role = f"reuse_run_input_{index}"
+        roles[role] = path
+        read_only.append(role)
+    if getattr(args, "reuse_failed_run_root", None):
+        roles["failed_reuse_run_input"] = args.reuse_failed_run_root
+        read_only.append("failed_reuse_run_input")
     if getattr(args, "minute_data_root", None):
         read_only.append("minute_data_input")
     for profile, path in sorted(_source_database_arguments(args).items()):
@@ -752,7 +954,11 @@ def _require_data_run_arguments(args) -> None:
         raise ValueError(f"正式数据研究缺少必需参数: {', '.join(missing)}")
 
 
-def _validate_resource_governance_arguments(args) -> ResourceCapacity:
+def _validate_resource_governance_arguments(
+    args,
+    *,
+    required_process_slots: int = 1,
+) -> ResourceCapacity:
     capacity = _runtime_resource_capacity(args)
     state_dir = getattr(args, "resource_state_dir", None)
     if state_dir is None:
@@ -781,11 +987,12 @@ def _validate_resource_governance_arguments(args) -> ResourceCapacity:
     if getattr(args, "resource_stale_seconds", 0) <= 0:
         raise ValueError("resource-stale-seconds 必须为正数")
     requested_workers = getattr(args, "workers", None)
-    required_process_slots = (
+    worker_process_slots = (
         1
         if requested_workers in (None, 1)
         else int(requested_workers) + 1
     )
+    required_process_slots = max(required_process_slots, worker_process_slots)
     if int(args.resource_process_slots) < required_process_slots:
         raise ValueError("resource-process-slots 小于本次 CLI 与内部 worker 所需槽位")
     return capacity

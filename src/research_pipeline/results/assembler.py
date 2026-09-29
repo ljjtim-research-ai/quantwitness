@@ -18,6 +18,7 @@ from research_pipeline.platform.metric_contracts import MetricReachabilityProof
 from research_pipeline.platform.operator_contracts import operator_dag_runtime_hash
 from .artifact_reader import ExternalArtifactReader, RuntimeArtifactReference
 from .contracts import (
+    RESULT_EMBEDDED_VERIFIER_CLOSURE_VERSION,
     ResultBundle,
     ResultInputRevision,
     ResultReference,
@@ -66,6 +67,7 @@ class ResultAssembler:
         verification_policy_id: str,
         validity_producer_hash: str,
         verifier_identity: Mapping[str, object] | None = None,
+        verifier_bundle_source: str | Path | None = None,
         formal_input_request_ids: tuple[str, ...] | None = None,
         input_claim_ceilings: Mapping[str, str] | None = None,
         phase_hook: Callable[[str], None] | None = None,
@@ -248,9 +250,20 @@ class ResultAssembler:
             status=run_projection.status,
             mode=run_projection.mode,
             fixed_clock=run_projection.fixed_clock,
-            event_chain_head=run_projection.event_chain_head,
             node_statuses=run_projection.node_statuses,
         )
+        if verifier_identity is None and verifier_bundle_source is not None:
+            raise ResultContractError(
+                "未冻结 Verifier identity 的 Result 不得携带 bundle"
+            )
+        verifier_bundle_path = None
+        verification_contract = None
+        if verifier_identity is not None and verifier_bundle_source is not None:
+            verifier_bundle_path = f"verifiers/{verifier_identity['bundle_hash']}"
+            verification_contract = RESULT_EMBEDDED_VERIFIER_CLOSURE_VERSION
+        verification_kwargs = {}
+        if verification_contract is not None:
+            verification_kwargs["contract_version"] = verification_contract
         verification = ResultVerificationClosure(
             policy_id=verification_policy_id,
             validity_artifact_key=validity_support.artifact_key,
@@ -259,6 +272,8 @@ class ResultAssembler:
             validity_producer_hash=validity_producer_hash,
             run=run_summary,
             verifier_identity=verifier_identity,
+            verifier_bundle_path=verifier_bundle_path,
+            **verification_kwargs,
         )
         bundle = ResultBundle.build(
             project_id=project_id,
@@ -297,6 +312,7 @@ class ResultAssembler:
         destination = self.store.publish(
             bundle,
             run_root=root,
+            verifier_bundle_source=verifier_bundle_source,
             phase_hook=track_publish,
         )
         # 幂等 finalize 命中既有同一 Result 时不会再次触发 renamed。

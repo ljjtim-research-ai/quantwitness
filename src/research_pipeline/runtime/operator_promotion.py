@@ -54,7 +54,7 @@ BUILTIN_ARTIFACT_TYPE_IDENTITIES = frozenset({
 
 # 公共定义集合经审查固定；有意修改实现需同步复核本常量。
 BUILTIN_OPERATOR_DEFINITION_SET_HASH = (
-    "7ef7ecd8ec5163c9fdf0cfd5a8c9d5066c6af138d092e0823d2246abd3d58be0"
+    "e3cfac2e705d742bf9cc0d931f533a2c2c027aa2b52ee99b1930f7232ce35195"
 )
 
 

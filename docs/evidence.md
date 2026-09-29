@@ -1,15 +1,16 @@
 # Result 与 VerificationResult
 
-当前公开产物只有两层：
+研究与独立验证的公开产物保持两层；只读消费层可以另外生成独立 AnalysisResult：
 
 - Result：自包含的计算结果、输入闭包、lineage、运行摘要、validity facts 和金融控制材料。
 - VerificationResult：独立 verifier 对 Result 完整性、适用门禁和结论上限的结构化判断。
+- AnalysisResult：用外部显式 AnalysisRequest 对通过验证的 Result 表做通用时间序列统计；不修改前两层，也不提高 claim。
 
 ## Result
 
-ResultAssembler 只选择 ResultSpec 声明的已提交 typed outputs。它不打开数据库、不重算研究、不改变 claim。结果目录包含 `result.json`、`COMMITTED`、公共表和声明的支持文件；同一 run 只能有一个不可覆盖结果。
+ResultAssembler 只选择 ResultSpec 声明的已提交 typed outputs。它不打开数据库、不重算研究、不改变 claim。发布前会重放 Runtime 事件链并核对完整成功终态；事件链留在 run-root 作为具体执行审计，Result 只封存稳定终态摘要，资源排队和 attempt 时序不改变 Result 身份。结果目录包含 `result.json`、`COMMITTED`、公共表和声明的支持文件；同一 run 只能有一个不可覆盖结果。
 
-ResultStore 读取时验证实际文件字节、Parquet schema、行数、路径边界、manifest 和语义身份。同一次操作复用已验证 snapshot，避免重复完整扫描。
+ResultStore 读取时验证实际文件字节、Parquet schema、行数、路径边界、manifest 和语义身份。同一次操作复用已验证 snapshot，避免重复完整扫描。声明项目 Verifier 的新 Result 还包含 `verifiers/<bundle_hash>`：发布时从已准入 Plan 复制并复验，读取时按 bundle manifest 核对精确源码闭包和冻结身份。历史 Result 不回填该目录，仍通过显式外部 bundle 验证。
 
 凡是正式结论可达的 Feature/Label，ResultSpec 编译器都会自动加入对应逐行因果时间表；只在
 diagnostic 分支、且不是正式结论祖先的 Feature/Label 不封存。Feature 表逐行保存
@@ -57,9 +58,17 @@ S-04 的固定资源验收为 2,000 万键、4 个 Parquet 分区；独立 probe
 
 项目专属表集合、数值重算和结论不进入 core 内建 verifier。项目通过独立 Verifier bundle
 声明实际读取的 Result 表和支持工件；Package 准入冻结 verifier identity、版本、源码摘要和
-授权输入，`verify` 只向 worker 提供本次 Result 中已封存且显式授权的内容。项目 verifier 的
+授权输入，新 Result 随后内嵌该 Plan 闭包，`verify` 默认从 Result 自身执行，只向 worker 提供
+本次 Result 中已封存且显式授权的内容。历史 Result 仍可显式提供身份一致的 bundle。项目 verifier 的
 状态、findings 和 outcome hash 进入通用 VerificationResult，executor 自报成功不能替代独立
 复核。具体项目是否迁移到当前 Verifier bundle ABI，由项目自行决定，不属于 core 内建能力。
+
+普通统计矩阵继续以列满秩为通过条件。候选数大于有效观察行数时，列满秩在数学上不可达；
+这类宽矩阵必须由项目 Verifier 从正式 Result 表独立重建矩阵，并通过
+`project-verifier-output-v2` 返回总行数、非零有效行数、列数和实际秩。公共 statistics gate
+同时核对 validity facts 中的列数和秩，并要求实际秩等于
+`min(列数, 非零有效行数)`。缺少证据、字段不一致或仍存在额外线性退化都会失败关闭；项目
+Operator 自报的行数不能替代独立复算。
 
 门禁按 ResearchPackage、算子图和 claim 触发。真正不适用时记录稳定 `N/A` 原因；缺材料、未执行或不认识的原因不能冒充 `N/A`。
 
@@ -77,12 +86,19 @@ ETF 日频 Result 还必须封存 `simulation/daily-context.json`。该支持文
 ## 消费
 
 ```powershell
-python -m research_pipeline report --verification-result <VerificationResult.json> --result-store <ResultStore> --json
+python -m research_pipeline report --verification-result <VerificationResult.json> --result-store <ResultStore> --output <报告.md> --format markdown --json
 python -m research_pipeline compare --left-verification-result <左.json> --left-result-store <左Store> --right-verification-result <右.json> --right-result-store <右Store> --json
+python -m research_pipeline analysis run --verification-result <VerificationResult.json> --result-store <ResultStore> --request <AnalysisRequest.yaml> --output <AnalysisResult.json> --analysis-memory-bytes <字节> --json
+python -m research_pipeline analysis compare --analysis-result <左AnalysisResult.json> --analysis-result <右AnalysisResult.json> --measure overall.compounded_return --direction higher_is_better --output <AnalysisComparison.json> --json
 python -m research_pipeline export-result --verification-result <VerificationResult.json> --result-store <ResultStore> --output <导出目录> --json
 ```
 
-所有消费者先通过同一个 verified context 复验 VerificationResult 与 Result，不直接猜目录或解析 Runtime 中间文件。`report`、`compare`、`export-result` 保留对 `status=fail` 的诊断消费；Workspace 与 Dashboard 在此基础上只接收 `status=pass`。`export-result` 只复制并复核已验证 Result，不重新执行研究。run-root 清理后仍可消费。
+所有消费者先通过同一个 verified context 复验 VerificationResult 与 Result，不直接猜目录或解析 Runtime 中间文件。`report`、`compare`、`export-result` 保留对 `status=fail` 的诊断消费；`analysis`、Workspace 与 Dashboard 只接收 `status=pass`。`export-result` 只复制并复核已验证 Result，不重新执行研究。run-root 清理后仍可消费。
+
+`report --output` 在目标同目录按 UTF-8 写临时文件并以不覆盖方式原子发布。目标已存在时失败且
+原字节不变。`--format markdown` 写可直接阅读的正文；`--format json` 写
+`research-verification-report-v1` 结构。机器 stdout 只保留输出路径、格式、Result ID 和
+Verification hash 的短回执。省略 `--output` 时继续返回 stdout 报告。
 
 直接 `compare` 的范围固定为 `verified_metric_facts_only`：它只比较两侧已经验证的 metric ref、
 注册表单位与方向、逐指标样本窗口/样本量/状态，以及实际 policy、claim level 和 ceiling，并明确
@@ -93,6 +109,34 @@ python -m research_pipeline export-result --verification-result <VerificationRes
 需要完整研究语义时使用 `package compare`。该入口先由 `packages.delivery` 唯一检查两侧
 ResearchPackage 的 metric/claim 合同和各自 Result 绑定，再复用上述指标事实比较，并返回
 `package_contract_and_verified_metric_facts`。CLI 不复制第二份包级合同门。
+
+### 通用时间序列分析
+
+`analysis run` 使用外部 AnalysisRequest 选择 Result 中的一张表及其日期列和值列。请求必须显式
+绑定 Result ID 和 Verification hash，并声明：
+
+- 请求窗口、`observation / level / simple_return / log_return` 值语义；
+- `point / non_overlapping_period` 区间语义、频率和年化期间数；
+- 单位、`gross / net / unspecified / not_applicable` 费用口径；
+- 空值、不完整年度、预期年度观察数和需要的聚合集。
+
+公共核心不根据列名、schema、表角色、项目名称或单位字样猜收益语义。`observation` 只支持
+计数、均值、正负零计数和极值；`level` 还支持首值、末值和绝对变化；只有显式声明为非重叠
+期间收益的 `simple_return` 或 `log_return` 才能计算复合收益、几何年化和最大回撤。期间收益
+必须使用 `missing=reject`。没有显式 `expected_observations_per_year` 时，年度完整性记录为
+`not_assessed`，框架不猜交易日历。
+
+分析表通过 ResultStore 的原摘要、schema 和行数验证进入同一 verified snapshot。计算只投影日期
+和值两列，按 Arrow batch 顺序处理；日期重复、倒序、空窗口、非有限数值和不合法简单收益都会
+拒绝。`--analysis-memory-bytes` 只控制这两个投影列的批次预算，不代表整个 Python 进程的绝对
+内存上限。AnalysisResult 记录来源 Result、Verification、package、plan、claim、表身份、实际
+窗口、Arrow 类型、行数闭包、总体统计和逐年统计，并以规范 UTF-8 JSON 原子发布且不覆盖已有
+文件。
+
+`analysis compare` 只读取两份或多份规范 AnalysisResult。分析规格、实际窗口、日期/数值 Arrow
+类型、claim policy、claim level 或 claim ceiling 任一不一致时，比较结果明确返回不可比原因和
+空排名。可比时仍须显式选择固定指标和 `higher_is_better / lower_is_better` 方向；公共核心不从
+业务名称推断优劣。
 
 holdout 的正式事实随 Result 保存为 `plan → prepared → opened → terminal`；完整候选族另有
 `retired` 终态。`verify` 从这些事实独立复核冻结候选、样本范围、模式、打开顺序和结果绑定，

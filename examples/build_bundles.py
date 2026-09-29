@@ -53,6 +53,8 @@ def build_all(examples_root: Path, output_root: Path) -> dict[str, object]:
             registered_operator_specs=builtin.operator_specs,
             project_artifact_types=declaration.project_artifact_types,
             permissions=declaration.permissions,
+            parameter_preflight_module=declaration.parameter_preflight_module,
+            parameter_preflight_function=declaration.parameter_preflight_function,
         )
         definition = yaml.safe_load(
             (project / "verifier/definition.yaml").read_text(encoding="utf-8")
@@ -75,6 +77,13 @@ def build_all(examples_root: Path, output_root: Path) -> dict[str, object]:
             direction=definition["direction"],
             implementation_ref=f"{definition['metric_id']}.independent_value",
             implementation_digest=implementation_digest,
+            measurement_semantics={
+                "quantity": "independent_fixture_value",
+                "numerator": "verified_fixture_value",
+                "denominator": "not_applicable",
+                "observation_timing": "bounded_fixture_commit",
+                "aggregation": "single_value",
+            },
         )
         verifier_bundle = compile_project_verifier_bundle(
             source_root=verifier_source,
