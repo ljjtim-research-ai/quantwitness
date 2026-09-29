@@ -6,6 +6,8 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
+from research_pipeline.catalog.discovery import JsonArrayProjectionEvidence
+
 from ..admission import (
     MINUTE_AVAILABILITY_RULE,
     MINUTE_TIME_NORMALIZATION_VERSION,
@@ -17,6 +19,44 @@ from ..query_ir import DateRangeV1, FilterOperator, InstantRangeV2, source_local
 
 def quote_identifier(value: str) -> str:
     return '"' + value.replace('"', '""') + '"'
+
+
+def _quote_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def compile_json_array_projection_source(
+    evidence: JsonArrayProjectionEvidence,
+) -> str:
+    """把已冻结的单数组 VIEW 形状编译成低中间量的只读来源关系。"""
+
+    source = quote_identifier(evidence.source_object)
+    source_event = quote_identifier(evidence.source_event_column)
+    source_json = quote_identifier(evidence.source_json_column)
+    event_output = quote_identifier(evidence.event_output_column)
+    discriminator_output = quote_identifier(
+        evidence.discriminator_output_column
+    )
+    expanded_output = quote_identifier(evidence.expanded_output_column)
+    if not evidence.discriminator_values:
+        return (
+            "(SELECT TRY_CAST("
+            f"{source_event} AS DATE) AS {event_output}, "
+            f"CAST(NULL AS VARCHAR) AS {discriminator_output}, "
+            f"CAST(NULL AS VARCHAR) AS {expanded_output} "
+            f"FROM {source} WHERE FALSE) AS \"__json_array_projection\""
+        )
+    values = ", ".join(
+        f"({_quote_literal(value)})" for value in evidence.discriminator_values
+    )
+    return (
+        "(SELECT TRY_CAST("
+        f"{source_event} AS DATE) AS {event_output}, "
+        f"CAST(\"__json_kind\".\"value\" AS VARCHAR) AS {discriminator_output}, "
+        f"CAST(UNNEST(from_json({source_json}, '[\"VARCHAR\"]')) AS VARCHAR) "
+        f"AS {expanded_output} FROM {source} CROSS JOIN (VALUES {values}) "
+        "AS \"__json_kind\"(\"value\")) AS \"__json_array_projection\""
+    )
 
 
 def compile_duckdb_query(
@@ -445,5 +485,6 @@ def _duckdb_type(logical_type: str) -> str:
 __all__ = [
     "compile_duckdb_query",
     "compile_duckdb_scope_statistics",
+    "compile_json_array_projection_source",
     "quote_identifier",
 ]

@@ -6,6 +6,7 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -34,7 +35,7 @@ from research_pipeline.data_plane.snapshots import _sha256
 
 
 PROJECT_RUNTIME_IDENTITY_VERSION = "project-operator-runtime-identity-v1"
-PROJECT_WORKER_TASK_VERSION = "project-operator-worker-task-v4"
+PROJECT_WORKER_TASK_VERSION = "project-operator-worker-task-v5"
 _UNCOMMITTED_OUTPUT_CODES = frozenset({
     "project_commit_result_invalid",
     "project_output_count_invalid",
@@ -142,9 +143,26 @@ class ProjectRuntimeInput:
     source_root: Path | None = None
     files: Mapping[str, str] = field(default_factory=dict)
     request_tables: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
+    request_admissions: Mapping[str, Mapping[str, object]] = field(default_factory=dict)
     _verification_token: InitVar[object] = None
 
     def __post_init__(self, _verification_token: object) -> None:
+        if self.request_tables and self.request_admissions:
+            raise RuntimeIntegrityError("项目输入不能同时声明 request 表和 admission")
+        if self.request_admissions:
+            if (
+                _verification_token is not _SUPERVISOR_VERIFIED_INPUT
+                or self.source_root is not None
+                or self.files
+            ):
+                raise RuntimeIntegrityError(
+                    "项目 request admission 必须来自 Supervisor 已验证描述"
+                )
+            object.__setattr__(
+                self,
+                "request_admissions",
+                MappingProxyType(dict(sorted(self.request_admissions.items()))),
+            )
         if self.request_tables:
             if (
                 _verification_token is not _SUPERVISOR_VERIFIED_INPUT
@@ -187,6 +205,7 @@ class ProjectRuntimeInput:
         source_root: Path | None = None,
         files: Mapping[str, str] | None = None,
         request_tables: Mapping[str, Mapping[str, object]] | None = None,
+        request_admissions: Mapping[str, Mapping[str, object]] | None = None,
     ) -> "ProjectRuntimeInput":
         """只供 Supervisor 把已验证 Runtime 值转换为当前 Worker 输入。"""
 
@@ -197,6 +216,7 @@ class ProjectRuntimeInput:
             source_root,
             {} if files is None else files,
             {} if request_tables is None else request_tables,
+            {} if request_admissions is None else request_admissions,
             _verification_token=_SUPERVISOR_VERIFIED_INPUT,
         )
 
@@ -296,6 +316,7 @@ def execute_project_worker_attempt(
     fixed_clock: str,
     root_seed: int,
     budget: ResourceBudget,
+    process_slots: int | None = None,
     partition_key: str | None = None,
     dataset_roots: Mapping[str, str | Path] | None = None,
     verified_partition_id: str | None = None,
@@ -306,6 +327,10 @@ def execute_project_worker_attempt(
     token = registry.project_token_by_implementation(implementation_id)
     if not isinstance(token, ProjectOperatorImplementationToken):
         raise RuntimeIntegrityError("项目实现未被当前组合注册表准入")
+    if process_slots is not None and (
+        type(process_slots) is not int or process_slots < 2
+    ):
+        raise RuntimeIntegrityError("项目 Worker 进程槽必须至少容纳 Supervisor 和 Worker")
     spec = token.manifest.operator_spec
     normalized_parameters = validate_parameters(
         parameters,
@@ -376,6 +401,7 @@ def execute_project_worker_attempt(
         fixed_clock=fixed_clock,
         root_seed=root_seed,
         budget=budget,
+        process_slots=process_slots,
         partition_key=partition_key,
         dataset_roots=dataset_roots,
         verified_partition_id=verified_partition_id,
@@ -408,6 +434,7 @@ def _run_project_worker(
     fixed_clock: str,
     root_seed: int,
     budget: ResourceBudget,
+    process_slots: int | None,
     partition_key: str | None,
     dataset_roots: Mapping[str, str | Path] | None,
     verified_partition_id: str | None,
@@ -487,6 +514,33 @@ def _run_project_worker(
                         "schema_hash": str(descriptor["schema_hash"]),
                         **({"admission": dict(descriptor["admission"])} if "admission" in descriptor else {}),
                         "files": [dict(file) for file in descriptor["files"]],
+                    }
+                    for request_id, descriptor in sorted(selected.items())
+                ],
+            })
+        elif item.request_admissions:
+            declared_request_ids = _declared_request_ids(parameters)
+            selected = {
+                request_id: descriptor
+                for request_id, descriptor in item.request_admissions.items()
+                if request_id in declared_request_ids
+            }
+            if not selected:
+                raise RuntimeIntegrityError(
+                    "项目 admission 输入没有绑定节点参数中的 request_id"
+                )
+            input_contracts.append({
+                "input_kind": "request_admissions",
+                "invocation": invocation,
+                "port": item.artifact.name,
+                "artifact_type": item.artifact.artifact_type,
+                "source_identity": item.artifact.artifact_key,
+                "requests": [
+                    {
+                        "request_id": request_id,
+                        "source_identity": str(descriptor["source_identity"]),
+                        "schema_hash": str(descriptor["schema_hash"]),
+                        "admission": dict(descriptor["admission"]),
                     }
                     for request_id, descriptor in sorted(selected.items())
                 ],
@@ -605,12 +659,20 @@ def _run_project_worker(
             for child in children:
                 observed_descendants[child.pid] = child.create_time()
             rss = current.memory_info().rss + sum(child.memory_info().rss for child in children)
+            process_count = 2 + len(children)
         except (psutil.Error, OSError, RuntimeError):
             rss = None
+            process_count = None
             measurement_status = "measurement_unavailable"
-        size = sum(path.stat().st_size for path in attempt_root.rglob("*") if path.is_file())
+        size = _measure_attempt_tree_bytes(attempt_root)
         if elapsed > budget.wall_seconds:
             failure = "project_worker_timeout"
+        elif (
+            process_slots is not None
+            and process_count is not None
+            and process_count > process_slots
+        ):
+            failure = "project_worker_process_slots_exceeded"
         elif (rss is not None and rss > budget.memory_bytes) or size > budget.temp_bytes:
             failure = "project_worker_resource_exceeded"
         if failure:
@@ -642,10 +704,21 @@ def _run_project_worker(
                 failed = {}
             error_code = failed.get("error_code")
             if isinstance(error_code, str) and error_code:
+                exception_type = failed.get("exception_type")
+                message = failed.get("message")
                 raise RuntimeWorkerError(
-                    error_code,
+                    (
+                        message
+                        if isinstance(message, str) and message
+                        else error_code
+                    ),
                     error_code=error_code,
                     failure_payload=_project_worker_failure_payload(error_code),
+                    diagnostic_exception_type=(
+                        exception_type
+                        if isinstance(exception_type, str) and exception_type
+                        else None
+                    ),
                 )
         raise RuntimeWorkerError(
             "project_worker_failed",
@@ -742,6 +815,24 @@ def _run_project_worker(
         tuple(outputs), state, measurement_status, cleanup_status,
         causal_facts, request_traces,
     )
+
+
+def _measure_attempt_tree_bytes(root: Path) -> int:
+    """统计临时空间；Worker 正常删除临时路径时跳过已经消失的条目。"""
+
+    total = 0
+
+    def directory_error(error: OSError) -> None:
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    for directory, _, files in os.walk(root, onerror=directory_error):
+        for name in files:
+            try:
+                total += (Path(directory) / name).stat().st_size
+            except FileNotFoundError:
+                continue
+    return total
 
 
 def _staged_commit_path(attempt_root: Path, relative_path: str, *, directory: bool = False) -> Path:

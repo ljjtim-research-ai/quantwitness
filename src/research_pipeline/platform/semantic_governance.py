@@ -9,6 +9,7 @@ from typing import Iterable
 
 
 SEMANTIC_PROMOTION_VERSION = "research-semantic-promotion-v1"
+BUILTIN_SEMANTIC_REVISION_VERSION = "research-builtin-semantic-revision-v1"
 PUBLIC_SEMANTIC_KINDS = frozenset({
     "artifact_type",
     "metric",
@@ -99,7 +100,7 @@ APPROVED_BUILTIN_SEMANTIC_IDENTITIES = MappingProxyType({
         "default:financial.tradability:verifier.financial-tradability.v2",
         "default:label.split:verifier.label-split.v2",
         "default:search.holdout:verifier.search-holdout.v1",
-        "default:statistics:verifier.statistics.v1",
+        "default:statistics:verifier.statistics.v2",
         "minute:data.pit:verifier.minute-data-pit.v2",
         "minute:financial.tradability:verifier.minute-financial.v2",
         "minute:label.split:verifier.minute-label-split.v2",
@@ -118,6 +119,54 @@ class SemanticGovernanceError(ValueError):
 
 # 晋级记录只能经评审后显式加入；能力 baseline 和发现快照不能生成该授权。
 MAINLINE_SEMANTIC_PROMOTION_REVIEWS: tuple["SemanticPromotionReview", ...] = ()
+
+
+@dataclass(frozen=True)
+class BuiltinSemanticRevision:
+    semantic_kind: str
+    previous_identity: str
+    replacement_identity: str
+    reason: str
+    regression_test_ids: tuple[str, ...]
+    contract_version: str = BUILTIN_SEMANTIC_REVISION_VERSION
+
+    def __post_init__(self) -> None:
+        if self.semantic_kind not in PUBLIC_SEMANTIC_KINDS:
+            raise SemanticGovernanceError("内建公共语义修订类型无效")
+        for field in ("previous_identity", "replacement_identity"):
+            value = getattr(self, field)
+            if not isinstance(value, str) or not _ID.fullmatch(value):
+                raise SemanticGovernanceError(f"{field} 无效")
+        if self.previous_identity == self.replacement_identity:
+            raise SemanticGovernanceError("内建公共语义修订必须改变身份")
+        if not isinstance(self.reason, str) or not self.reason.strip():
+            raise SemanticGovernanceError("内建公共语义修订必须说明原因")
+        if (
+            tuple(sorted(self.regression_test_ids)) != self.regression_test_ids
+            or len(set(self.regression_test_ids)) != len(self.regression_test_ids)
+            or not self.regression_test_ids
+        ):
+            raise SemanticGovernanceError("内建公共语义修订测试必须非空、唯一并排序")
+        if self.contract_version != BUILTIN_SEMANTIC_REVISION_VERSION:
+            raise SemanticGovernanceError("内建公共语义修订合同版本不受支持")
+
+
+MAINLINE_BUILTIN_SEMANTIC_REVISIONS = (
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity=(
+            "default:financial.tradability:verifier.financial-tradability.v2"
+        ),
+        replacement_identity=(
+            "default:financial.tradability:verifier.financial-tradability.v3"
+        ),
+        reason="支持上一收盘到当前收盘的账户日收益，并保留输入可见性门禁",
+        regression_test_ids=(
+            "test_close_to_close_account_return_window_is_supported",
+            "test_verifier_recomputes_semantics_and_capacity_claim_ceiling",
+        ),
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -175,6 +224,7 @@ def validate_public_semantic_inventory(
     *,
     builtin_identities: Iterable[str],
     reviews: Iterable[SemanticPromotionReview] = (),
+    builtin_revisions: Iterable[BuiltinSemanticRevision] = (),
 ) -> None:
     """公共注册面只能包含固定内建身份或已批准晋级身份。"""
 
@@ -184,7 +234,30 @@ def validate_public_semantic_inventory(
     builtins = tuple(sorted(str(item) for item in builtin_identities))
     if len(builtins) != len(set(builtins)):
         raise SemanticGovernanceError("内建公共语义身份不得重复")
-    approved = APPROVED_BUILTIN_SEMANTIC_IDENTITIES[semantic_kind]
+    approved = set(APPROVED_BUILTIN_SEMANTIC_IDENTITIES[semantic_kind])
+    revisions = tuple(
+        item for item in builtin_revisions if item.semantic_kind == semantic_kind
+    )
+    previous_identities = [item.previous_identity for item in revisions]
+    replacement_identities = [item.replacement_identity for item in revisions]
+    if (
+        len(set(previous_identities)) != len(previous_identities)
+        or len(set(replacement_identities)) != len(replacement_identities)
+    ):
+        raise SemanticGovernanceError("内建公共语义修订身份重复")
+    for revision in revisions:
+        if revision.previous_identity not in approved:
+            raise SemanticGovernanceError(
+                f"内建公共语义修订来源未获批准: "
+                f"{semantic_kind}:{revision.previous_identity}"
+            )
+        if revision.replacement_identity in approved:
+            raise SemanticGovernanceError(
+                f"内建公共语义修订目标已存在: "
+                f"{semantic_kind}:{revision.replacement_identity}"
+            )
+        approved.remove(revision.previous_identity)
+        approved.add(revision.replacement_identity)
     unapproved = set(builtins) - approved
     if unapproved:
         raise SemanticGovernanceError(
@@ -227,6 +300,9 @@ def validate_public_semantic_inventory(
 
 __all__ = [
     "APPROVED_BUILTIN_SEMANTIC_IDENTITIES",
+    "BUILTIN_SEMANTIC_REVISION_VERSION",
+    "BuiltinSemanticRevision",
+    "MAINLINE_BUILTIN_SEMANTIC_REVISIONS",
     "PUBLIC_SEMANTIC_KINDS",
     "MAINLINE_SEMANTIC_PROMOTION_REVIEWS",
     "SEMANTIC_PROMOTION_VERSION",

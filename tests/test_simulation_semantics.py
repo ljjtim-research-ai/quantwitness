@@ -18,7 +18,6 @@ from research_pipeline.simulation import (
     SimulationInputAvailability,
     SimulationSemanticsV1,
     build_cn_daily_simulation_semantics,
-    stock_policy_from_rule,
 )
 from validity_facts_support import default_passing_validity_facts
 
@@ -96,6 +95,65 @@ def test_time_contract_cost_and_capacity_identity_are_hash_bound() -> None:
     serialized["signal_at"] = "2024-01-01T07:00:00+00:00"
     with pytest.raises(SimulationContractError, match="Asia/Shanghai"):
         SimulationSemanticsV1.from_dict(serialized)
+
+
+def test_close_to_close_account_return_window_is_supported() -> None:
+    semantics = _semantics()
+    close_to_close = replace(
+        semantics,
+        valuation_at=datetime(2024, 1, 2, 15, 0, tzinfo=TZ),
+        return_start_at=datetime(2024, 1, 1, 15, 0, tzinfo=TZ),
+        return_end_at=datetime(2024, 1, 2, 15, 0, tzinfo=TZ),
+    )
+    assert close_to_close.return_start_at == close_to_close.decision_at
+    assert close_to_close.return_end_at == close_to_close.valuation_at
+
+    facts = default_passing_validity_facts()
+    session = facts["financial_tradability"]["simulation_semantics"]["blocks"][0]["sessions"][0]
+    session.update({
+        "valuation_at": "2024-01-02T15:00:00+08:00",
+        "return_start_at": "2024-01-01T15:00:00+08:00",
+        "return_end_at": "2024-01-02T15:00:00+08:00",
+    })
+    body = {
+        key: value
+        for key, value in session.items()
+        if key not in {"session", "semantics_hash"}
+    }
+    session["semantics_hash"] = typed_canonical_hash(body)
+    gates = recompute_gate_results(facts, input_hashes=(HASH_A,))
+    assert next(
+        item for item in gates if item.gate_id == "financial.tradability"
+    ).status == "pass"
+
+
+def test_forward_holding_return_window_remains_supported() -> None:
+    semantics = _semantics()
+    forward_holding = replace(
+        semantics,
+        valuation_at=datetime(2024, 1, 2, 9, 30, tzinfo=TZ),
+        return_start_at=datetime(2024, 1, 2, 15, 0, tzinfo=TZ),
+        return_end_at=datetime(2024, 1, 3, 15, 0, tzinfo=TZ),
+    )
+    assert forward_holding.execution_at < forward_holding.return_start_at
+
+    facts = default_passing_validity_facts()
+    session = facts["financial_tradability"]["simulation_semantics"]["blocks"][0]["sessions"][0]
+    session.update({
+        "valuation_at": "2024-01-02T09:30:00+08:00",
+        "return_start_at": "2024-01-02T15:00:00+08:00",
+        "return_end_at": "2024-01-03T15:00:00+08:00",
+    })
+    body = {
+        key: value
+        for key, value in session.items()
+        if key not in {"session", "semantics_hash"}
+    }
+    session["semantics_hash"] = typed_canonical_hash(body)
+    gates = recompute_gate_results(facts, input_hashes=(HASH_A,))
+    assert next(
+        item for item in gates if item.gate_id == "financial.tradability"
+    ).status == "pass"
 
 
 def test_open_fill_cannot_use_same_day_total_volume() -> None:

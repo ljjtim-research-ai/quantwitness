@@ -122,6 +122,7 @@ def scaffold_project_operator(
             resource_profile={
                 "memory_bytes": 268_435_456,
                 "cpu_slots": 1,
+                "process_slots": 2,
                 "temp_bytes": 67_108_864,
                 "wall_seconds": 30,
             },

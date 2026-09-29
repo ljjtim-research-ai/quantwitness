@@ -33,6 +33,8 @@ from research_pipeline.research.semantics import ResearchSemantics
 from research_pipeline.results import ResultSpec
 from research_pipeline.runtime.graph import DagSpec
 from research_pipeline.runtime.operator_registry import (
+    NODE_IDENTITY_PROJECTION_CURRENT,
+    NODE_IDENTITY_PROJECTION_LEGACY,
     build_mainline_operator_registry,
     compile_operator_graph_dag,
 )
@@ -47,7 +49,8 @@ from research_pipeline.extensions import (
 PLAN_MANIFEST = "research-plan.json"
 QUERY_DIRECTORY = "queries"
 DAG_PLAN = "dag.json"
-OPERATOR_GRAPH_PLAN_VERSION = "research-cli-operator-graph-plan-v4"
+OPERATOR_GRAPH_PLAN_VERSION = "research-cli-operator-graph-plan-v5"
+_LEGACY_OPERATOR_GRAPH_PLAN_VERSION = "research-cli-operator-graph-plan-v4"
 OPERATOR_GRAPH_PLAN = "operator-graph-plan.json"
 PROJECT_BUNDLE_DIRECTORY = "extensions"
 VERIFIER_BUNDLE_DIRECTORY = "verifiers"
@@ -155,6 +158,7 @@ def publish_operator_graph_research_plan(
         "consumed_request_ids": list(consumed_request_ids),
         "input_claim_ceilings": input_claim_ceilings,
         "effective_claim_level": effective_claim_level,
+        "node_identity_projection": NODE_IDENTITY_PROJECTION_CURRENT,
     }
     if plan.research_semantics is not None:
         payload["research_semantics"] = plan.research_semantics.to_dict()
@@ -199,7 +203,13 @@ def publish_operator_graph_research_plan(
 
 def load_operator_graph_research_plan(
     *, target: str | Path,
-) -> tuple[dict[str, object], dict[str, AdmittedQueryPlan], DagSpec, object]:
+) -> tuple[
+    dict[str, object],
+    dict[str, AdmittedQueryPlan],
+    DagSpec,
+    OperatorGraphRecipe,
+    object,
+]:
     root = Path(target).resolve()
     manifest = json.loads((root / PLAN_MANIFEST).read_text(encoding="utf-8"))
     expected_base = {
@@ -213,6 +223,10 @@ def load_operator_graph_research_plan(
     if not isinstance(manifest, dict):
         raise ValueError("operator graph plan manifest schema 无效")
     version = manifest.get("contract_version")
+    if version == OPERATOR_GRAPH_PLAN_VERSION:
+        expected_base.add("node_identity_projection")
+    elif version != _LEGACY_OPERATOR_GRAPH_PLAN_VERSION:
+        raise ValueError("operator graph plan manifest hash 或版本无效")
     expected_v2 = {
         *expected_base,
         "metric_proofs", "result_spec",
@@ -228,8 +242,7 @@ def load_operator_graph_research_plan(
         raise ValueError("operator graph plan manifest schema 无效")
     manifest_hash = manifest.pop("manifest_hash")
     if (
-        version != OPERATOR_GRAPH_PLAN_VERSION
-        or manifest["plan_kind"] != "operator_graph_research_run_candidate"
+        manifest["plan_kind"] != "operator_graph_research_run_candidate"
         or manifest_hash != typed_canonical_hash(manifest)
     ):
         raise ValueError("operator graph plan manifest hash 或版本无效")
@@ -445,11 +458,17 @@ def load_operator_graph_research_plan(
             queries=tuple(
                 plans[str(item["request_id"])].query for item in graph_requests
             ),
+            request_ids=tuple(str(item["request_id"]) for item in graph_requests),
             metric_proofs=metric_proofs,
             result_spec=result_spec,
             research_semantics=research_semantics,
         ),
         registry,
+        identity_projection=(
+            str(manifest["node_identity_projection"])
+            if version == OPERATOR_GRAPH_PLAN_VERSION
+            else NODE_IDENTITY_PROJECTION_LEGACY
+        ),
     )
     if expected_dag.to_dict() != dag.to_dict():
         raise ValueError("operator graph DAG 不是可信 recipe 的唯一编译结果")
@@ -472,7 +491,7 @@ def load_operator_graph_research_plan(
     ):
         raise ValueError("operator graph research identity 合同 hash 不一致")
     _validate_admitted_query_facts(manifest, plans)
-    return manifest, plans, dag, registry
+    return manifest, plans, dag, recipe, registry
 
 
 def _validate_admitted_query_facts(manifest, admitted_plans) -> None:
@@ -668,6 +687,24 @@ def _verify_plan_verifier_bundle(*, root: Path, verifier_admission: object) -> N
         raise ValueError("Plan 内 Verifier bundle 与准入身份不一致")
 
 
+def resolve_plan_verifier_bundle(
+    target: str | Path,
+    verifier_admission: object,
+) -> Path | None:
+    """从已准入 Plan 中解析唯一、已复验的项目 Verifier bundle。"""
+
+    root = Path(target).resolve(strict=True)
+    _verify_plan_verifier_bundle(
+        root=root,
+        verifier_admission=verifier_admission,
+    )
+    if verifier_admission is None:
+        return None
+    if not isinstance(verifier_admission, Mapping):
+        raise ValueError("operator graph Verifier 准入 schema 无效")
+    return root / VERIFIER_BUNDLE_DIRECTORY / str(verifier_admission["bundle_hash"])
+
+
 def _load_plan_operator_registry(
     *,
     root: Path,
@@ -755,4 +792,5 @@ def _validate_research_identity(
 __all__ = [
     "PLAN_MANIFEST", "load_operator_graph_research_plan",
     "publish_operator_graph_research_plan",
+    "resolve_plan_verifier_bundle",
 ]

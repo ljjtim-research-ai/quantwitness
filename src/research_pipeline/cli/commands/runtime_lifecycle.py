@@ -3,17 +3,39 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
-import subprocess
 from typing import Mapping
 
-from research_pipeline.runtime import DagSpec, EventStore, RuntimeIntegrityError
+from research_pipeline.runtime import (
+    DagSpec,
+    EventStore,
+    ResourceGovernorConfig,
+    ResourceVector,
+    RuntimeIntegrityError,
+)
+from research_pipeline.runtime.liveness import (
+    process_identity_alive,
+    read_runtime_liveness,
+)
+from research_pipeline.runtime.resource_governor import read_resource_governor_state
 from research_pipeline.runtime.diagnostics import (
     read_finalize_status,
     safe_error_summary,
 )
 
 from ..result import execute_guarded
+from ..command_suggestion import render_powershell_command
+
+
+INSPECTION_CONTRACT_VERSION = "research-operator-dag-inspection-v3"
+
+
+class _SuggestedCommand(str):
+    def __new__(cls, argv: tuple[str, ...]):
+        value = str.__new__(cls, render_powershell_command(argv))
+        value.argv = argv
+        return value
 
 
 def execute(args) -> int:
@@ -80,13 +102,21 @@ def _inspect_not_started_run(root: Path) -> dict[str, object]:
         action, reason, next_command = _readmit_action(
             "当前 invocation 身份无效，不能开始或恢复 Runtime"
         )
+    liveness = read_runtime_liveness(root)
+    resource_pool = _resource_pool_projection(
+        root / "operator-dag-invocation.json",
+        run_id="",
+    )
     return {
-        "contract_version": "research-operator-dag-inspection-v2",
+        "contract_version": INSPECTION_CONTRACT_VERSION,
         "run_id": None,
         "run_status": "not_started",
         "node_statuses": {},
         "attempt_statuses": {},
         "nodes": {},
+        "runtime_phase": "not_started",
+        "liveness": _liveness_projection(liveness),
+        "resource_pool": resource_pool,
         "event_chain_head": None,
         "record_status": None,
         "finalize": read_finalize_status(root),
@@ -94,6 +124,10 @@ def _inspect_not_started_run(root: Path) -> dict[str, object]:
         "recommended_action": action,
         "recommendation_reason": reason,
         "next_command": next_command,
+        "next_command_argv": list(next_command.argv),
+        "required_inputs": (
+            _required_inputs(action, next_command)
+        ),
     }
 
 
@@ -161,6 +195,9 @@ def _inspect_started_run(
         for event in events
         if event.kind == "diagnostic" and event.node_id is not None
     }
+    liveness = read_runtime_liveness(root)
+    if liveness is not None and liveness.get("run_id") != projection.run_id:
+        raise RuntimeIntegrityError("Runtime 存活投影与事件 run identity 不一致")
     nodes = {}
     for node in dag.nodes:
         node_status = projection.node_statuses.get(node.node_id, "not_started")
@@ -182,14 +219,29 @@ def _inspect_started_run(
                     else {}
                 ),
             }
+        elif node_status == "waiting_for_resources":
+            last_error = {
+                "error_code": "runtime_resource_wait_interrupted",
+                "exception_type": "RuntimeInterruption",
+                "message": "节点最后一次 attempt 在等待资源时中断，可按当前 invocation 恢复",
+            }
         elif node_status == "running":
             last_error = {
                 "error_code": "runtime_attempt_interrupted",
                 "exception_type": "RuntimeInterruption",
                 "message": "节点最后一次 attempt 未形成终态，可按当前 invocation 恢复",
             }
+        runtime_diagnostics = _node_runtime_diagnostics(
+            node_id=node.node_id,
+            node_status=node_status,
+            dag=dag,
+            node_statuses=projection.node_statuses,
+            events=events,
+            liveness=liveness,
+        )
         nodes[node.node_id] = {
             "status": node_status,
+            **runtime_diagnostics,
             "attempts_used": attempts_used,
             "max_attempts": node.retry_policy.max_attempts,
             "attempts_remaining": max(
@@ -221,13 +273,25 @@ def _inspect_started_run(
             else _invocation_result_store(operator_invocation)
         ),
     )
+    resource_pool = _resource_pool_projection(
+        operator_invocation,
+        run_id=str(projection.run_id),
+    )
+    runtime_phase = _runtime_phase(
+        run_status=str(projection.run_status),
+        finalize=finalize,
+        nodes=nodes,
+    )
     return {
-        "contract_version": "research-operator-dag-inspection-v2",
+        "contract_version": INSPECTION_CONTRACT_VERSION,
         "run_id": projection.run_id,
         "run_status": projection.run_status,
         "node_statuses": dict(sorted(projection.node_statuses.items())),
         "attempt_statuses": dict(sorted(projection.attempt_statuses.items())),
         "nodes": dict(sorted(nodes.items())),
+        "runtime_phase": runtime_phase,
+        "liveness": _liveness_projection(liveness),
+        "resource_pool": resource_pool,
         "event_chain_head": projection.chain_head,
         "record_status": record.get("status"),
         "finalize": finalize,
@@ -235,6 +299,10 @@ def _inspect_started_run(
         "recommended_action": action,
         "recommendation_reason": reason,
         "next_command": next_command,
+        "next_command_argv": list(next_command.argv),
+        "required_inputs": (
+            _required_inputs(action, next_command)
+        ),
     }
 
 
@@ -397,14 +465,29 @@ def _verify_action(
     verification_output = _available_output_path(
         root / "verification-result.json", suffix_with_counter=True
     )
+    command_parts = [
+        "python", "-m", "research_pipeline", "verify",
+        "--result", result_directory, "--result-store", store,
+        "--output", str(verification_output),
+    ]
+    legacy_bundle = _legacy_verifier_bundle(
+        root=root,
+        result_directory=result_directory,
+        result_store=store,
+    )
+    if legacy_bundle is False:
+        return (
+            "verify",
+            f"{reason}；历史 Result 仍需操作者提供冻结身份一致的 Verifier bundle",
+            _command("python", "-m", "research_pipeline", "verify", "--help"),
+        )
+    if isinstance(legacy_bundle, Path):
+        command_parts.extend(("--verifier-bundle", str(legacy_bundle)))
+    command_parts.append("--json")
     return (
         "verify",
         reason,
-        _command(
-            "python", "-m", "research_pipeline", "verify",
-            "--result", result_directory, "--result-store", store,
-            "--output", str(verification_output), "--json",
-        ),
+        _command(*command_parts),
     )
 
 
@@ -417,6 +500,53 @@ def _readmit_action(reason: str) -> tuple[str, str, str]:
             "--help",
         ),
     )
+
+
+def _legacy_verifier_bundle(
+    *,
+    root: Path,
+    result_directory: str,
+    result_store: str,
+) -> Path | bool | None:
+    """返回历史 Result 的精确 Plan Verifier；False 表示确实需要外部选择。"""
+
+    from research_pipeline.results import ResultStore
+
+    if not Path(result_store).is_dir() or not Path(result_directory).is_dir():
+        return None
+    bundle = ResultStore(result_store, create=False).inspect_directory(
+        result_directory
+    )
+    verification = bundle.verification
+    if verification.verifier_identity is None:
+        return None
+    if verification.verifier_bundle_path is not None:
+        return None
+    invocation_path = root / "operator-dag-invocation.json"
+    try:
+        invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+        plan = invocation.get("plan") if isinstance(invocation, Mapping) else None
+        if not isinstance(plan, str) or not plan:
+            return False
+        from ..research_plan_store import resolve_plan_verifier_bundle
+
+        return resolve_plan_verifier_bundle(
+            plan,
+            verification.verifier_identity,
+        ) or False
+    except Exception:
+        return False
+
+
+def _required_inputs(
+    action: str,
+    next_command: _SuggestedCommand,
+) -> list[str]:
+    if action == "readmit-new-run":
+        return ["package_changes", "admission_inputs"]
+    if action == "verify" and next_command.argv[-1:] == ("--help",):
+        return ["verifier_bundle"]
+    return []
 
 
 def _invocation_result_store(path: Path) -> str | None:
@@ -444,8 +574,240 @@ def _available_output_path(path: Path, *, suffix_with_counter: bool = False) -> 
     raise RuntimeIntegrityError("无法为建议命令选择未占用输出路径")
 
 
-def _command(*parts: str) -> str:
-    return subprocess.list2cmdline(list(parts))
+def _command(*parts: str) -> _SuggestedCommand:
+    return _SuggestedCommand(tuple(parts))
+
+
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _node_runtime_diagnostics(
+    *,
+    node_id: str,
+    node_status: str,
+    dag: DagSpec,
+    node_statuses: Mapping[str, str],
+    events,
+    liveness: Mapping[str, object] | None,
+) -> dict[str, object]:
+    node_events = [event for event in events if event.node_id == node_id]
+    if node_status == "not_started":
+        dependencies = {
+            edge.source_node for edge in dag.edges if edge.target_node == node_id
+        }
+        phase = (
+            "ready"
+            if all(node_statuses.get(item) == "succeeded" for item in dependencies)
+            else "waiting_for_dependencies"
+        )
+        phase_event = None
+    elif node_status == "waiting_for_resources":
+        phase = "waiting_for_resources"
+        phase_event = next(
+            (
+                event for event in reversed(node_events)
+                if event.kind == "node_status_changed"
+                and event.payload.get("status") == "waiting_for_resources"
+            ),
+            None,
+        )
+    elif node_status == "running":
+        last_running_index = max(
+            (
+                index for index, event in enumerate(node_events)
+                if event.kind == "node_status_changed"
+                and event.payload.get("status") == "running"
+            ),
+            default=-1,
+        )
+        tail = node_events[last_running_index + 1 :]
+        completed = next(
+            (event for event in reversed(tail) if event.kind == "execution_completed"),
+            None,
+        )
+        phase = "checkpointing" if completed is not None else "executing"
+        phase_event = completed or (
+            node_events[last_running_index] if last_running_index >= 0 else None
+        )
+    else:
+        phase = node_status
+        phase_event = node_events[-1] if node_events else None
+    started_event = next(
+        (
+            event for event in node_events
+            if event.kind == "attempt_status_changed"
+            and event.payload.get("status") == "pending"
+        ),
+        None,
+    )
+    now = datetime.now(timezone.utc)
+    started_at = None if started_event is None else started_event.occurred_at
+    phase_started_at = None if phase_event is None else phase_event.occurred_at
+    terminal_time = (
+        _parse_time(node_events[-1].occurred_at)
+        if node_events and node_status not in {"waiting_for_resources", "running"}
+        else now
+    )
+    start_time = _parse_time(started_at)
+    duration = (
+        None
+        if start_time is None or terminal_time is None
+        else max(0.0, round((terminal_time - start_time).total_seconds(), 3))
+    )
+    node_liveness = None
+    if liveness is not None and liveness.get("node_id") == node_id:
+        node_liveness = _liveness_projection(liveness)
+        if node_liveness is not None and phase in {
+            "waiting_for_resources", "executing", "checkpointing"
+        }:
+            phase_started_at = str(liveness["phase_started_at"])
+    return {
+        "phase": phase,
+        "started_at": started_at,
+        "phase_started_at": phase_started_at,
+        "duration_seconds": duration,
+        "liveness": node_liveness,
+    }
+
+
+def _liveness_projection(
+    liveness: Mapping[str, object] | None,
+) -> dict[str, object] | None:
+    if liveness is None:
+        return None
+    heartbeat = _parse_time(liveness.get("heartbeat_at"))
+    age = (
+        None
+        if heartbeat is None
+        else max(
+            0.0,
+            round((datetime.now(timezone.utc) - heartbeat).total_seconds(), 3),
+        )
+    )
+    alive = process_identity_alive(
+        int(liveness["pid"]),
+        float(liveness["process_started_at"]),
+    )
+    healthy = alive and age is not None and age <= 10.0
+    return {
+        **dict(liveness),
+        "heartbeat_age_seconds": age,
+        "process_alive": alive,
+        "health": "healthy" if healthy else "stale",
+    }
+
+
+def _runtime_phase(
+    *,
+    run_status: str,
+    finalize: Mapping[str, object],
+    nodes: Mapping[str, Mapping[str, object]],
+) -> str:
+    if run_status == "succeeded" and finalize.get("status") in {"unknown", "pending"}:
+        return "finalizing"
+    active = next(
+        (
+            str(node["phase"])
+            for node in nodes.values()
+            if node.get("phase") in {
+                "waiting_for_resources", "executing", "checkpointing"
+            }
+        ),
+        None,
+    )
+    return active or run_status
+
+
+def _resource_pool_projection(
+    invocation_path: Path,
+    *,
+    run_id: str,
+) -> dict[str, object] | None:
+    if not invocation_path.is_file():
+        return None
+    try:
+        invocation = json.loads(invocation_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeIntegrityError("正式 invocation 无法读取资源治理身份") from exc
+    governance = invocation.get("resource_governance")
+    capacity = invocation.get("resource_capacity")
+    if governance is None:
+        return None
+    if not isinstance(governance, Mapping) or not isinstance(capacity, Mapping):
+        raise RuntimeIntegrityError("正式 invocation 资源治理身份无效")
+    config = ResourceGovernorConfig(
+        state_dir=Path(str(governance["state_dir"])),
+        capacity=ResourceVector(
+            memory_bytes=int(capacity["memory_bytes"]),
+            cpu_slots=int(capacity["cpu_slots"]),
+            scratch_bytes=int(capacity["temp_bytes"]),
+            process_slots=int(governance["process_slots"]),
+        ),
+        stale_after_seconds=float(governance["stale_seconds"]),
+    )
+    state = read_resource_governor_state(config)
+    if state is None:
+        return None
+    now_epoch = datetime.now(timezone.utc).timestamp()
+
+    def enrich(item: Mapping[str, object], *, request: bool) -> dict[str, object]:
+        owner = str(item.get("owner_id", ""))
+        parts = owner.split("/", 3)
+        alive = process_identity_alive(
+            int(item["pid"]),
+            float(item["process_started_at"]),
+        )
+        result = {
+            **dict(item),
+            "owner": {
+                "project_id": parts[0] if len(parts) > 0 else None,
+                "run_id": parts[1] if len(parts) > 1 else None,
+                "node_id": parts[2] if len(parts) > 2 else None,
+                "attempt_id": parts[3] if len(parts) > 3 else None,
+            },
+            "current_run": len(parts) > 1 and parts[1] == run_id,
+            "process_alive": alive,
+        }
+        if request:
+            created = _parse_time(item.get("created_at"))
+            result["queue_age_seconds"] = (
+                None
+                if created is None
+                else max(0.0, round((datetime.now(timezone.utc) - created).total_seconds(), 3))
+            )
+            result["health"] = "waiting" if alive else "stale"
+        else:
+            heartbeat_age = max(
+                0.0,
+                round(now_epoch - float(item.get("heartbeat_epoch", 0.0)), 3),
+            )
+            result["heartbeat_age_seconds"] = heartbeat_age
+            result["health"] = (
+                "healthy"
+                if alive and heartbeat_age <= config.stale_after_seconds
+                else "stale"
+            )
+        return result
+
+    return {
+        "contract_version": state["contract_version"],
+        "capacity": state["capacity"],
+        "requests": [enrich(item, request=True) for item in state["requests"]],
+        "leases": [
+            enrich(item, request=False)
+            for item in state["leases"]
+            if item.get("status") == "active"
+        ],
+    }
 
 
 __all__ = ["execute"]

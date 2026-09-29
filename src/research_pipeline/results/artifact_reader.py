@@ -19,7 +19,7 @@ from research_pipeline.platform import typed_canonical_hash
 from .errors import ResultContractError
 
 
-EXTERNAL_ARTIFACT_COMMIT_VERSION = "research-external-artifact-commit-v1"
+EXTERNAL_ARTIFACT_COMMIT_VERSION = "research-external-artifact-commit-v2"
 
 
 def _sha256(path: Path) -> str:
@@ -119,6 +119,14 @@ class ExternalArtifactSnapshot:
             str(payload["manifest_hash"]),
             str(payload["contract_version"]),
         )
+        if (
+            len(snapshot.commit_token) != 32
+            or any(
+                character not in "0123456789abcdef"
+                for character in snapshot.commit_token
+            )
+        ):
+            raise ResultContractError("外部工件 commit_token 无效")
         if snapshot.contract_version != EXTERNAL_ARTIFACT_COMMIT_VERSION:
             raise ResultContractError("外部工件版本不受支持")
         semantic_payload = {
@@ -131,12 +139,11 @@ class ExternalArtifactSnapshot:
         }
         if snapshot.semantic_hash != typed_canonical_hash(semantic_payload):
             raise ResultContractError("外部工件 semantic hash 不一致")
-        manifest_payload = {
+        manifest_identity = {
             **semantic_payload,
-            "commit_token": snapshot.commit_token,
             "semantic_hash": snapshot.semantic_hash,
         }
-        if snapshot.manifest_hash != typed_canonical_hash(manifest_payload):
+        if snapshot.manifest_hash != typed_canonical_hash(manifest_identity):
             raise ResultContractError("外部工件 manifest hash 不一致")
         return snapshot
 

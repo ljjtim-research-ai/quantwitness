@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import math
 import os
 from pathlib import Path
@@ -22,7 +23,7 @@ from .errors import RuntimeAdmissionError, RuntimeIntegrityError
 
 
 RESOURCE_GOVERNOR_VERSION = "research-resource-governor-v2"
-RESOURCE_OBSERVATION_VERSION = "research-resource-observation-v3"
+RESOURCE_OBSERVATION_VERSION = "research-resource-observation-v4"
 RESOURCE_CALIBRATION_VERSION = "research-resource-calibration-v2"
 
 _DATA_SCALE_COMPONENTS = (
@@ -226,7 +227,7 @@ class ResourceObservation:
 
 
 class ResourceUsageSampler:
-    """独立采样当前进程树和 attempt scratch，不信任算子自报峰值。"""
+    """独立采样 attempt 进程树和 scratch，不信任算子自报峰值。"""
 
     def __init__(self, scratch_root: str | Path, *, interval_seconds: float = 0.05) -> None:
         if interval_seconds <= 0:
@@ -241,6 +242,7 @@ class ResourceUsageSampler:
         self._started = 0.0
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._baseline_descendants: frozenset[tuple[int, float]] | None = None
 
     def __enter__(self) -> "ResourceUsageSampler":
         self._started = time.monotonic()
@@ -263,7 +265,21 @@ class ResourceUsageSampler:
     def _sample(self) -> None:
         try:
             root = psutil.Process(os.getpid())
-            processes = [root, *root.children(recursive=True)]
+            descendants = root.children(recursive=True)
+            identities = {
+                (item.pid, item.create_time()): item
+                for item in descendants
+            }
+            if self._baseline_descendants is None:
+                self._baseline_descendants = frozenset(identities)
+            processes = [
+                root,
+                *(
+                    item
+                    for identity, item in identities.items()
+                    if identity not in self._baseline_descendants
+                ),
+            ]
             rss = sum(item.memory_info().rss for item in processes if item.is_running())
             self.peak_rss_bytes = max(self.peak_rss_bytes, rss)
             self.max_processes = max(self.max_processes, len(processes))
@@ -313,6 +329,79 @@ class _ProcessFileLock:
             import fcntl
             fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
         self.handle.close()
+
+
+def read_resource_governor_state(
+    config: ResourceGovernorConfig,
+) -> dict[str, object] | None:
+    """只读共享资源池状态，不加写锁、不清理租约、也不写回文件。"""
+
+    state_path = config.state_dir / "resource-governor.json"
+    if not state_path.is_file():
+        return None
+    try:
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeIntegrityError("资源治理状态损坏；请保留目录并人工检查") from exc
+    expected = {
+        "contract_version", "governor_config_hash", "governor_config_payload",
+        "capacity", "next_sequence", "requests", "leases", "observations",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected:
+        raise RuntimeIntegrityError("资源治理状态 schema 无效；准入已关闭")
+    config_payload = payload.get("governor_config_payload")
+    if (
+        payload.get("contract_version") != RESOURCE_GOVERNOR_VERSION
+        or not isinstance(config_payload, Mapping)
+        or config_payload != config.identity_payload
+        or payload.get("governor_config_hash") != config.identity_hash
+        or typed_canonical_hash(config_payload) != config.identity_hash
+    ):
+        raise RuntimeIntegrityError("资源治理配置身份与现有状态不一致；准入已关闭")
+    capacity = payload.get("capacity")
+    if not isinstance(capacity, Mapping) or ResourceVector.from_dict(capacity) != config.capacity:
+        raise RuntimeIntegrityError("资源治理容量与现有状态不一致")
+    requests = payload.get("requests")
+    leases = payload.get("leases")
+    observations = payload.get("observations")
+    if (
+        type(payload.get("next_sequence")) is not int
+        or payload["next_sequence"] < 1
+        or not isinstance(requests, dict)
+        or not isinstance(leases, dict)
+        or not isinstance(observations, list)
+    ):
+        raise RuntimeIntegrityError("资源治理集合状态损坏")
+    ResourceGovernor._validate_observations(observations)
+    for collection_name, collection in (("申请", requests), ("租约", leases)):
+        for identity, item in collection.items():
+            if not isinstance(identity, str) or not isinstance(item, Mapping):
+                raise RuntimeIntegrityError(f"资源治理{collection_name}状态损坏")
+            vector = item.get("vector")
+            if not isinstance(vector, Mapping):
+                raise RuntimeIntegrityError(f"资源治理{collection_name}向量损坏")
+            ResourceVector.from_dict(vector)
+            if (
+                type(item.get("sequence")) is not int
+                or type(item.get("pid")) is not int
+                or not isinstance(item.get("process_started_at"), (int, float))
+            ):
+                raise RuntimeIntegrityError(f"资源治理{collection_name}身份损坏")
+    return {
+        "contract_version": payload["contract_version"],
+        "governor_config_hash": payload["governor_config_hash"],
+        "governor_config_payload": dict(config_payload),
+        "capacity": dict(capacity),
+        "next_sequence": payload["next_sequence"],
+        "requests": [
+            dict(item)
+            for item in sorted(requests.values(), key=lambda value: value["sequence"])
+        ],
+        "leases": [
+            dict(item)
+            for item in sorted(leases.values(), key=lambda value: value["sequence"])
+        ],
+    }
 
 
 class ResourceGovernor:
@@ -838,5 +927,6 @@ __all__ = [
     "ResourceObservation",
     "ResourceUsageSampler",
     "ResourceVector",
+    "read_resource_governor_state",
     "resource_data_bucket",
 ]

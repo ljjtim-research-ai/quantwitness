@@ -69,7 +69,7 @@ def build_lint_report(
         "query_count": len(plan.queries),
         "checks": checks,
         "missing_requirements": sorted(missing),
-        "next_command": _next_admit_command(package),
+        "required_inputs": sorted(missing),
         "contract_version": LINT_REPORT_VERSION,
     }
     return {**values, "lint_hash": typed_canonical_hash(values)}
@@ -112,17 +112,6 @@ def _check_catalog_fields(
         "catalog_hash": catalog.catalog_hash,
         "requests": checked,
     }
-
-
-def _next_admit_command(
-    package: ResearchPackage,
-) -> str:
-    return (
-        "python -m research_pipeline package admit "
-        f"--package <{package.package_id}-目录> "
-        "--catalog-lock <Catalog-Lock> --data-db <只读DuckDB> "
-        "--output <新的已准入计划目录> --json"
-    )
 
 
 __all__ = ["LINT_REPORT_VERSION", "build_lint_report"]

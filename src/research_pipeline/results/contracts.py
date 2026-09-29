@@ -1,4 +1,4 @@
-"""`research-result-v2` 的纯数据合同与身份规则。"""
+"""`research-result-v3` 的纯数据合同与身份规则。"""
 
 from __future__ import annotations
 
@@ -15,11 +15,14 @@ from .errors import ResultContractError
 
 
 RESULT_SPEC_VERSION = "research-result-spec-v1"
-RESULT_BUNDLE_VERSION = "research-result-v2"
+RESULT_BUNDLE_VERSION = "research-result-v3"
 RESULT_TABLE_MANIFEST_VERSION = "research-result-table-manifest-v2"
 RESULT_SUPPORT_FILE_VERSION = "research-result-support-file-v2"
-RESULT_RUN_SUMMARY_VERSION = "research-result-run-summary-v1"
-RESULT_VERIFICATION_CLOSURE_VERSION = "research-result-verification-closure-v1"
+RESULT_RUN_SUMMARY_VERSION = "research-result-run-summary-v2"
+RESULT_VERIFICATION_CLOSURE_VERSION = "research-result-verification-closure-v2"
+RESULT_EMBEDDED_VERIFIER_CLOSURE_VERSION = (
+    "research-result-verification-closure-v3"
+)
 RESULT_INPUT_REVISION_VERSION = "research-result-input-revision-v1"
 RESULT_REF_VERSION = "research-result-ref-v1"
 
@@ -410,7 +413,7 @@ class ResultSupportFile:
 
 @dataclass(frozen=True)
 class ResultRunSummary:
-    """进入 Result 身份的终态运行摘要，普通消费者不再依赖 run-root。"""
+    """进入 Result 身份的稳定终态摘要，普通消费者不再依赖 run-root。"""
 
     project_id: str
     run_id: str
@@ -419,13 +422,12 @@ class ResultRunSummary:
     status: str
     mode: str
     fixed_clock: str
-    event_chain_head: str
     node_statuses: Mapping[str, str]
     contract_version: str = RESULT_RUN_SUMMARY_VERSION
 
     def __post_init__(self) -> None:
         _require_id(self.project_id, "result run project_id")
-        for field in ("run_id", "dag_id", "event_chain_head"):
+        for field in ("run_id", "dag_id"):
             _require_hash(getattr(self, field), f"result run {field}")
         if self.parent_run_id is not None:
             _require_hash(self.parent_run_id, "result run parent_run_id")
@@ -461,7 +463,6 @@ class ResultRunSummary:
             "status": self.status,
             "mode": self.mode,
             "fixed_clock": self.fixed_clock,
-            "event_chain_head": self.event_chain_head,
             "node_statuses": dict(self.node_statuses),
             "contract_version": self.contract_version,
         }
@@ -470,7 +471,7 @@ class ResultRunSummary:
     def from_dict(cls, payload: Mapping[str, object]) -> "ResultRunSummary":
         expected = {
             "project_id", "run_id", "parent_run_id", "dag_id", "status", "mode",
-            "fixed_clock", "event_chain_head", "node_statuses", "contract_version",
+            "fixed_clock", "node_statuses", "contract_version",
         }
         _require_exact(payload, expected, "ResultRunSummary")
         if not isinstance(payload["node_statuses"], Mapping):
@@ -484,7 +485,6 @@ class ResultRunSummary:
             status=str(payload["status"]),
             mode=str(payload["mode"]),
             fixed_clock=str(payload["fixed_clock"]),
-            event_chain_head=str(payload["event_chain_head"]),
             node_statuses={str(key): str(value) for key, value in payload["node_statuses"].items()},
             contract_version=str(payload["contract_version"]),
         )
@@ -501,6 +501,7 @@ class ResultVerificationClosure:
     validity_producer_hash: str
     run: ResultRunSummary
     verifier_identity: Mapping[str, object] | None = None
+    verifier_bundle_path: str | None = None
     contract_version: str = RESULT_VERIFICATION_CLOSURE_VERSION
 
     def __post_init__(self) -> None:
@@ -512,7 +513,10 @@ class ResultVerificationClosure:
         object.__setattr__(
             self, "validity_source_path", _safe_prefix(self.validity_source_path)
         )
-        if self.contract_version != RESULT_VERIFICATION_CLOSURE_VERSION:
+        if self.contract_version not in {
+            RESULT_VERIFICATION_CLOSURE_VERSION,
+            RESULT_EMBEDDED_VERIFIER_CLOSURE_VERSION,
+        }:
             raise ResultContractError("ResultVerificationClosure 版本不受支持")
         if self.verifier_identity is not None:
             if not isinstance(self.verifier_identity, Mapping):
@@ -525,6 +529,16 @@ class ResultVerificationClosure:
             if set(self.verifier_identity) != required:
                 raise ResultContractError("ResultVerifier identity schema 无效")
             object.__setattr__(self, "verifier_identity", dict(self.verifier_identity))
+        if self.contract_version == RESULT_VERIFICATION_CLOSURE_VERSION:
+            if self.verifier_bundle_path is not None:
+                raise ResultContractError("旧 Result 验证闭包不得声明内嵌 Verifier")
+        else:
+            if self.verifier_identity is None:
+                raise ResultContractError("内嵌 Verifier 闭包缺少身份")
+            bundle_hash = str(self.verifier_identity["bundle_hash"])
+            expected_path = f"verifiers/{bundle_hash}"
+            if self.verifier_bundle_path != expected_path:
+                raise ResultContractError("内嵌 Verifier 路径与冻结身份不一致")
 
     def to_dict(self) -> dict[str, object]:
         payload = {
@@ -538,6 +552,8 @@ class ResultVerificationClosure:
         }
         if self.verifier_identity is not None:
             payload["verifier_identity"] = dict(self.verifier_identity)
+        if self.verifier_bundle_path is not None:
+            payload["verifier_bundle_path"] = self.verifier_bundle_path
         return payload
 
     @classmethod
@@ -549,6 +565,8 @@ class ResultVerificationClosure:
         }
         if "verifier_identity" in payload:
             expected.add("verifier_identity")
+        if "verifier_bundle_path" in payload:
+            expected.add("verifier_bundle_path")
         _require_exact(payload, expected, "ResultVerificationClosure")
         if not isinstance(payload["run"], Mapping):
             raise ResultContractError("ResultVerificationClosure run 必须是映射")
@@ -563,6 +581,11 @@ class ResultVerificationClosure:
                 None
                 if "verifier_identity" not in payload
                 else dict(payload["verifier_identity"])
+            ),
+            verifier_bundle_path=(
+                None
+                if "verifier_bundle_path" not in payload
+                else str(payload["verifier_bundle_path"])
             ),
             contract_version=str(payload["contract_version"]),
         )
@@ -889,6 +912,7 @@ class ResultReference:
 __all__ = [
     "BAR_TCA_SCHEMA_IDS", "CANONICAL_SIMULATION_SCHEMA_IDS",
     "MINUTE_FINANCIAL_CONTEXT_SCHEMA_IDS", "RESULT_BUNDLE_VERSION",
+    "RESULT_EMBEDDED_VERIFIER_CLOSURE_VERSION",
     "RESULT_INPUT_REVISION_VERSION", "RESULT_REF_VERSION",
     "RESULT_SPEC_VERSION", "RESULT_SUPPORT_FILE_VERSION", "RESULT_TABLE_MANIFEST_VERSION", "ResultBundle",
     "ResultInputRevision", "ResultReference", "ResultSpec", "ResultTableManifest",

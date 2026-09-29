@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
+from ..command_suggestion import command_suggestion
+from ..report_output import write_verification_report
 from ..result import execute_guarded
 
 
@@ -16,7 +18,24 @@ def _execute(args) -> dict[str, object]:
         from research_pipeline.packages import initialize_research_package
 
         path = initialize_research_package(args.destination)
-        return {"package_path": str(path), "next_action": "填写来源、本土化和研究规格后运行 package lint。"}
+        return {
+            "package_path": str(path),
+            "next_action": "填写来源、本土化和研究规格后运行 package lint。",
+            **command_suggestion(
+                "python", "-m", "research_pipeline", "package", "lint",
+                "--package", str(path), "--json",
+            ),
+        }
+    if args.package_command == "expand-variants":
+        from research_pipeline.packages.variants import (
+            expand_research_package_variants,
+        )
+
+        return expand_research_package_variants(
+            base_root=args.base,
+            manifest_path=args.manifest,
+            output_root=args.output_root,
+        )
     if args.package_command == "source-import":
         from research_pipeline.packages import ingest_source_snapshot
 
@@ -30,7 +49,16 @@ def _execute(args) -> dict[str, object]:
             importer_id=args.importer_id,
             imported_at=args.imported_at,
         )
-        return {**result, "next_action": "运行 package lint --source-archive-root 重新核验归档正文。"}
+        return {
+            **result,
+            "next_action": "运行 package lint --source-archive-root 重新核验归档正文。",
+            **command_suggestion(
+                "python", "-m", "research_pipeline", "package", "lint",
+                "--package", args.package,
+                "--source-archive-root", args.archive_root,
+                "--json",
+            ),
+        }
     if args.package_command == "admit":
         from .research_plan import admit_package
 
@@ -71,6 +99,8 @@ def _execute(args) -> dict[str, object]:
             })
         if args.package_command == "export-result":
             roles["export_result_output"] = args.output
+        elif args.package_command == "report" and args.output is not None:
+            roles["report_output"] = args.output
         if getattr(args, "source_archive_root", None):
             roles["source_archive_input"] = args.source_archive_root
         PathRolePolicy().validate(
@@ -101,6 +131,7 @@ def _execute(args) -> dict[str, object]:
         return report
     plan = _compile_trusted_context(package, args)
     from research_pipeline.evidence import (
+        build_verification_report,
         load_verified_result_context,
         render_verification_report,
         export_verified_result,
@@ -149,9 +180,27 @@ def _execute(args) -> dict[str, object]:
             result_store=args.result_store,
         )
         _validate_package_result(package, plan, context)
+        markdown = f"# {package.display_name}\n\n{render_verification_report(context)}"
+        if args.output is not None:
+            output = write_verification_report(
+                args.output,
+                output_format=args.format,
+                markdown=markdown,
+                report={
+                    "package": base,
+                    "verification": asdict(build_verification_report(context)),
+                },
+            )
+            return {
+                **base,
+                "output": str(output),
+                "format": args.format,
+                "result_id": context.snapshot.bundle.result_id,
+                "verification_hash": context.verification.verification_hash,
+            }
         return {
             **base,
-            "report": f"# {package.display_name}\n\n{render_verification_report(context)}",
+            "report": markdown,
         }
     context = load_verified_result_context(
         args.verification_result,
@@ -232,6 +281,9 @@ def _declared_resource_summary(plan, registry) -> dict[str, object]:
             "max_memory_bytes": max(int(item["memory_bytes"]) for item in profiles),
             "total_temp_bytes": sum(int(item["temp_bytes"]) for item in profiles),
             "max_cpu_slots": max(int(item["cpu_slots"]) for item in profiles),
+            "max_process_slots": max(
+                int(item["process_slots"]) for item in profiles
+            ),
             "max_wall_seconds": max(int(item["wall_seconds"]) for item in profiles),
         },
         "changed_research_semantics": False,

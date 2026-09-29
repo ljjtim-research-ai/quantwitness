@@ -9,15 +9,21 @@ import importlib
 import json
 from pathlib import Path
 import shutil
+import time
 from typing import Mapping
 
 from research_pipeline.extensions import (
     AdmittedProjectOperatorRegistry,
     ProjectOperatorImplementationToken,
-    verify_project_operator_bundle,
 )
 from research_pipeline.platform import canonical_json, typed_canonical_hash
-from research_pipeline.data_plane import ArtifactResolver, DatasetArtifactRef
+from research_pipeline.data_plane import (
+    ArtifactResolver,
+    DatasetArtifactRef,
+    PartitionedDatasetRef,
+    QueryIRInvalidError,
+    resolve_as_of_cutoff,
+)
 from research_pipeline.data_plane.verification_lifecycle import (
     RunScopedArtifactVerification,
     activate_artifact_verification,
@@ -26,8 +32,8 @@ from research_pipeline.data_plane.verification_lifecycle import (
 from .artifacts import CheckpointExpectation
 from .checkpoint import CheckpointStore
 from .contracts import ArtifactRef, DeterminismContext, NodeSpec, ResourceBudget
-from .diagnostics import safe_error_summary
-from .errors import RuntimeIntegrityError, RuntimeWorkerError
+from .diagnostics import read_finalize_status, safe_error_summary
+from .errors import RuntimeAdmissionError, RuntimeIntegrityError, RuntimeWorkerError
 from .events import RuntimeEvent
 from .external_artifact import ExternalArtifactStore
 from .graph import DagSpec
@@ -53,9 +59,12 @@ from .operator_runtime import (
 from .project_operator_runtime import (
     ProjectRuntimeInput,
     ProjectWorkerState,
+    _declared_request_ids,
     execute_project_worker_attempt,
     project_runtime_identity,
 )
+from .operator_registry import NODE_IDENTITY_PROJECTION_CURRENT
+from .liveness import RuntimeLiveness
 from .partition_checkpoint import (
     PartitionCheckpoint,
     PartitionCheckpointExpectation,
@@ -95,6 +104,9 @@ class RuntimeExecutionService:
         resource_timeout_seconds: float | None = None,
         project_registry: AdmittedProjectOperatorRegistry | None = None,
         project_parameters_by_node: Mapping[str, Mapping[str, object]] | None = None,
+        result_table_requirements_by_node: Mapping[
+            str, tuple[Mapping[str, str], ...]
+        ] | None = None,
     ) -> None:
         self.audit_environment = audit_environment
         self.numerical_backend_names = numerical_backend_names
@@ -109,6 +121,12 @@ class RuntimeExecutionService:
         self.project_parameters_by_node = {
             key: dict(value)
             for key, value in (project_parameters_by_node or {}).items()
+        }
+        self.result_table_requirements_by_node = {
+            node_id: tuple(dict(item) for item in requirements)
+            for node_id, requirements in (
+                result_table_requirements_by_node or {}
+            ).items()
         }
         self._definitions = {
             item.implementation_ref.implementation_id: item
@@ -295,6 +313,8 @@ class RuntimeExecutionService:
         parent_run_id: str | None = None,
         rerun_from_node: str | None = None,
         recovery_plan_hash: str | None = None,
+        reuse_run_roots: tuple[str | Path, ...] = (),
+        node_identity_projection: str = NODE_IDENTITY_PROJECTION_CURRENT,
     ) -> dict[str, object]:
         root = Path(run_root).resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -316,7 +336,7 @@ class RuntimeExecutionService:
         }
         reservation_budgets = {
             node.node_id: _reservation_budget(
-                effective_budgets[node.node_id],
+                node.resource_budget,
                 process_slots=process_slots.get(node.node_id, 1),
             )
             for node in dag.nodes
@@ -370,6 +390,19 @@ class RuntimeExecutionService:
             "reused_nodes": [],
             "outputs": {},
         }
+        if node_identity_projection == NODE_IDENTITY_PROJECTION_CURRENT:
+            base_record["node_identity_projection"] = node_identity_projection
+        elif reuse_run_roots:
+            raise RuntimeIntegrityError("旧节点身份投影不能启用跨运行复用")
+        reuse_sources = self._open_reuse_sources(
+            reuse_run_roots,
+            target_root=root,
+            node_identity_projection=node_identity_projection,
+        )
+        if reuse_sources:
+            base_record["reuse_source_run_ids"] = [
+                source[1] for source in reuse_sources
+            ]
         if self.resource_capacity is not None:
             base_record.update(
                 {
@@ -417,6 +450,10 @@ class RuntimeExecutionService:
                     "resource_governance",
                     "resource_governance_hash",
                 )
+            if node_identity_projection == NODE_IDENTITY_PROJECTION_CURRENT:
+                immutable += ("node_identity_projection",)
+            if reuse_sources:
+                immutable += ("reuse_source_run_ids",)
             if any(existing.get(key) != base_record[key] for key in immutable):
                 raise RuntimeIntegrityError("operator DAG run record 与当前输入不一致")
         else:
@@ -472,9 +509,41 @@ class RuntimeExecutionService:
                     events, run_id, node_id, expectation.node_execution_id
                 )
                 continue
+            reused_from = None
+            if node.cacheable and node.pure:
+                reused_from = self._reuse_cross_run_checkpoint(
+                    node=node,
+                    expectation=expectation,
+                    identity=identity,
+                    sources=reuse_sources,
+                    target_checkpoints=checkpoints,
+                    target_external=external,
+                    root_seed=root_seed,
+                    fixed_clock=fixed_clock,
+                )
+            if reused_from is not None:
+                source_run_id, source_manifest, node_outputs = reused_from
+                outputs[node_id] = node_outputs
+                reused.append(node_id)
+                events.append(
+                    run_id,
+                    "diagnostic",
+                    {
+                        "diagnostic_type": "cross_run_checkpoint_reused",
+                        "node_execution_id": expectation.node_execution_id,
+                        "reused_from_run_id": source_run_id,
+                        "source_checkpoint_manifest_hash": source_manifest.manifest_hash,
+                    },
+                    command_id=f"{node_id}:cross-run-reused:{source_run_id}",
+                    node_id=node_id,
+                )
+                self._reconcile_success(
+                    events, run_id, node_id, expectation.node_execution_id
+                )
+                continue
             current = events.replay().node_statuses.get(node_id)
             recovered_interruption = False
-            if current == "running":
+            if current in {"waiting_for_resources", "running"}:
                 recovered_interruption = self._recover_interrupted_attempt(
                     events,
                     run_id,
@@ -534,17 +603,9 @@ class RuntimeExecutionService:
                 raise RuntimeIntegrityError(
                     f"节点 {node_id} 当前状态不可执行: {current}"
                 )
-            self._status(
-                events,
-                run_id,
-                "node",
-                "running",
-                command_id=f"{node_id}:running:{transition_suffix}",
-                node_id=node_id,
-            )
             attempt_number = attempts_used + 1
             attempt_id = f"{node_id}-attempt-{attempt_number}"
-            for status in ("pending", "admitted", "ready", "running"):
+            for status in ("pending", "admitted", "ready"):
                 self._status(
                     events,
                     run_id,
@@ -554,13 +615,42 @@ class RuntimeExecutionService:
                     node_id=node_id,
                     attempt_id=attempt_id,
                 )
+            reservation_vector = ResourceVector.from_budget(
+                reservation_budgets[node_id],
+                process_slots=process_slots.get(node_id, 1),
+            )
+            queued_at = datetime.now().astimezone().isoformat()
+            queue_started = time.monotonic()
+            waiting_payload = {
+                "queued_at": queued_at,
+                "requested_resources": reservation_vector.to_dict(),
+            }
+            self._status(
+                events,
+                run_id,
+                "node",
+                "waiting_for_resources",
+                command_id=f"{node_id}:waiting:{transition_suffix}",
+                node_id=node_id,
+                details=waiting_payload,
+            )
+            self._status(
+                events,
+                run_id,
+                "attempt",
+                "waiting_for_resources",
+                command_id=f"{attempt_id}:waiting",
+                node_id=node_id,
+                attempt_id=attempt_id,
+                details=waiting_payload,
+            )
             work_dir = root / "work" / attempt_id
-            work_dir.mkdir(parents=True, exist_ok=False)
             lease: ResourceLease | None = None
             local_reservation: ReadyCandidate | None = None
             sampler = None
             sampled = False
             checkpoint_committed = False
+            liveness: RuntimeLiveness | None = None
             estimate_components = {
                 "scan_bytes": None,
                 "intermediate_bytes": node.resource_budget.memory_bytes,
@@ -570,6 +660,14 @@ class RuntimeExecutionService:
                 "wall_seconds": node.resource_budget.wall_seconds,
             }
             try:
+                liveness = RuntimeLiveness(
+                    root,
+                    run_id=run_id,
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    phase="waiting_for_resources",
+                    requested_resources=reservation_vector.to_dict(),
+                ).start()
                 if resource_ledger is not None:
                     local_reservation = ReadyCandidate(
                         topological_level,
@@ -581,12 +679,45 @@ class RuntimeExecutionService:
                 if self.resource_governor is not None:
                     lease = self.resource_governor.acquire(
                         owner_id=f"{project_id}/{run_id}/{node_id}/{attempt_id}",
-                        vector=ResourceVector.from_budget(
-                            reservation_budgets[node_id],
-                            process_slots=process_slots.get(node_id, 1),
-                        ),
+                        vector=reservation_vector,
                         timeout_seconds=float(self.resource_timeout_seconds),
                     )
+                acquired_at = datetime.now().astimezone().isoformat()
+                wait_milliseconds = max(
+                    0,
+                    round((time.monotonic() - queue_started) * 1000),
+                )
+                running_payload = {
+                    "acquired_at": acquired_at,
+                    "queued_at": queued_at,
+                    "requested_resources": reservation_vector.to_dict(),
+                    "wait_milliseconds": wait_milliseconds,
+                }
+                self._status(
+                    events,
+                    run_id,
+                    "node",
+                    "running",
+                    command_id=f"{node_id}:running:{transition_suffix}",
+                    node_id=node_id,
+                    details=running_payload,
+                )
+                liveness.update(
+                    "executing",
+                    reserved_resources=reservation_vector.to_dict(),
+                )
+                self._status(
+                    events,
+                    run_id,
+                    "attempt",
+                    "running",
+                    command_id=f"{attempt_id}:running",
+                    node_id=node_id,
+                    attempt_id=attempt_id,
+                    details=running_payload,
+                )
+                work_dir.mkdir(parents=True, exist_ok=False)
+                attempt_deadline = time.monotonic() + node.resource_budget.wall_seconds
 
                 def phase_hook(phase: str) -> None:
                     if phase == "checkpoint_prepared":
@@ -626,6 +757,8 @@ class RuntimeExecutionService:
                         effective_resource_budget=effective_budgets[node_id],
                         resource_governor=self.resource_governor,
                         resource_lease=lease,
+                        attempt_deadline_monotonic=attempt_deadline,
+                        process_slots=process_slots.get(node_id, 1),
                     )
                     definition = self._definitions.get(node.implementation_id)
                     if definition is not None:
@@ -658,8 +791,10 @@ class RuntimeExecutionService:
                                 node_execution_id=expectation.node_execution_id,
                                 environment=environment,
                             )
+                    node_context.remaining_resource_budget()
                     node_outputs = self._coerce_outputs(node, raw_outputs)
                     self._validate_outputs(node, node_outputs)
+                    liveness.update("checkpointing")
                     events.append(
                         run_id,
                         "execution_completed",
@@ -808,6 +943,8 @@ class RuntimeExecutionService:
                     ),
                 ) from exc
             finally:
+                if liveness is not None:
+                    liveness.stop()
                 if lease is not None:
                     self.resource_governor.release(lease)
                 if local_reservation is not None:
@@ -854,6 +991,125 @@ class RuntimeExecutionService:
         }
         self._write_record(record_path, result)
         return result
+
+    @staticmethod
+    def _open_reuse_sources(
+        roots: tuple[str | Path, ...],
+        *,
+        target_root: Path,
+        node_identity_projection: str,
+    ) -> tuple[tuple[Path, str, CheckpointStore, ExternalArtifactStore], ...]:
+        if not roots:
+            return ()
+        if node_identity_projection != NODE_IDENTITY_PROJECTION_CURRENT:
+            raise RuntimeIntegrityError("跨运行复用只接受现行节点局部身份计划")
+        sources = []
+        seen: set[Path] = set()
+        for raw_root in roots:
+            source_root = Path(raw_root).resolve(strict=True)
+            if source_root in seen:
+                raise RuntimeIntegrityError("跨运行复用来源不得重复")
+            seen.add(source_root)
+            if (
+                source_root == target_root
+                or source_root in target_root.parents
+                or target_root in source_root.parents
+            ):
+                raise RuntimeIntegrityError("跨运行复用来源与目标 run 不得相同或相互包含")
+            projection = EventStore(source_root).replay()
+            try:
+                record = json.loads(
+                    (source_root / "operator-dag-run.json").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise RuntimeIntegrityError("跨运行复用来源 run record 无法读取") from exc
+            finalize = read_finalize_status(source_root)
+            if (
+                record.get("contract_version") != OPERATOR_DAG_RUN_VERSION
+                or record.get("status") != "succeeded"
+                or record.get("node_identity_projection")
+                != NODE_IDENTITY_PROJECTION_CURRENT
+                or projection.run_status != "succeeded"
+                or projection.run_id != record.get("run_id")
+                or projection.chain_head != record.get("event_chain_head")
+                or finalize.get("status") != "succeeded"
+                or finalize.get("result_published") is not True
+            ):
+                raise RuntimeIntegrityError("跨运行复用来源不是现行身份下已发布 Result 的成功 run")
+            run_id = record.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                raise RuntimeIntegrityError("跨运行复用来源 run_id 无效")
+            sources.append(
+                (
+                    source_root,
+                    run_id,
+                    CheckpointStore(source_root, create=False),
+                    ExternalArtifactStore(
+                        source_root / "external-artifacts", create=False
+                    ),
+                )
+            )
+        return tuple(sources)
+
+    def _reuse_cross_run_checkpoint(
+        self,
+        *,
+        node: NodeSpec,
+        expectation: CheckpointExpectation,
+        identity: ExecutionIdentity,
+        sources: tuple[
+            tuple[Path, str, CheckpointStore, ExternalArtifactStore], ...
+        ],
+        target_checkpoints: CheckpointStore,
+        target_external: ExternalArtifactStore,
+        root_seed: int,
+        fixed_clock: str,
+    ):
+        for _source_root, source_run_id, source_checkpoints, source_external in sources:
+            checkpoint_path = (
+                source_checkpoints.checkpoints_root / expectation.node_execution_id
+            )
+            if not checkpoint_path.exists():
+                continue
+            manifest = source_checkpoints.verify(expectation)
+            source_outputs = self._decode_outputs(
+                (checkpoint_path / manifest.content_path).read_bytes(),
+                source_external,
+            )
+            self._validate_outputs(node, source_outputs)
+            if dict(manifest.outputs) != dict(source_outputs.artifact_refs):
+                raise RuntimeIntegrityError(
+                    f"节点 {node.node_id} 跨运行 checkpoint outputs 与内容引用不一致"
+                )
+            imported_values = {}
+            for port, value in source_outputs.values.items():
+                if value.external_commit is None:
+                    imported_values[port] = value
+                    continue
+                imported_values[port] = RuntimeNodeValue.external(
+                    target_external.import_verified(
+                        source_external,
+                        value.external_commit,
+                    )
+                )
+            imported_outputs = RuntimeNodeOutputs(
+                imported_values,
+                completion_metadata=source_outputs.completion_metadata,
+            )
+            target_checkpoints.commit_bytes(
+                expectation=expectation,
+                attempt_id=(
+                    f"reuse-{expectation.node_execution_id[:16]}-{source_run_id[:12]}"
+                ),
+                content=imported_outputs.checkpoint_bytes(),
+                outputs=imported_outputs.artifact_refs,
+                audit_environment_digest=self.audit_environment.manifest_digest,
+                execution_identity_digest=identity.identity_digest,
+                root_seed=root_seed,
+                fixed_clock=fixed_clock,
+            )
+            return source_run_id, manifest, imported_outputs
+        return None
 
     def retry_node(self, **kwargs) -> dict[str, object]:
         node_id = kwargs.pop("node_id")
@@ -1055,10 +1311,14 @@ class RuntimeExecutionService:
                 self, node_context=node_context, run_id=run_id,
                 attempt_id=attempt_id, environment=environment,
             )
+        project_parameters = self.project_parameters_by_node.get(node.node_id, {})
+        declared_request_ids = _declared_request_ids(project_parameters)
         project_inputs = tuple(
             self._project_input(
                 port, value, node_context.external_store,
                 admitted_plans=getattr(environment, "admitted_plans", {}),
+                declared_request_ids=declared_request_ids,
+                fixed_clock=node_context.fixed_clock,
             )
             for port, value in sorted(node_context.inputs.items())
         )
@@ -1081,14 +1341,15 @@ class RuntimeExecutionService:
             attempt_id=attempt_id,
             attempt_root=node_context.work_dir,
             inputs=project_inputs,
-            parameters=self.project_parameters_by_node.get(node.node_id, {}),
+            parameters=project_parameters,
             fixed_clock=node_context.fixed_clock,
             root_seed=node_context.root_seed,
-            budget=node.resource_budget,
+            budget=node_context.remaining_resource_budget(),
+            process_slots=node_context.process_slots,
         )
         self._verify_project_request_consumption(
             project_inputs, result.request_traces,
-            self.project_parameters_by_node.get(node.node_id, {}),
+            project_parameters,
         )
         values = {}
         for output in result.outputs:
@@ -1197,7 +1458,8 @@ class RuntimeExecutionService:
                 parameters=parameters,
                 fixed_clock=node_context.fixed_clock,
                 root_seed=node_context.root_seed,
-                budget=node.resource_budget,
+                budget=node_context.remaining_resource_budget(),
+                process_slots=node_context.process_slots,
                 partition_key=partition.partition_key,
                 dataset_roots=roots,
                 verified_partition_id=typed_canonical_hash(
@@ -1291,7 +1553,10 @@ class RuntimeExecutionService:
     def _commit_project_worker_output(external, output):
         staging = external.prepare()
         if output.path.is_dir():
-            shutil.copytree(output.path, staging / output.port)
+            if output.commit.get("publish_at_artifact_root", False):
+                shutil.copytree(output.path, staging, dirs_exist_ok=True)
+            else:
+                shutil.copytree(output.path, staging / output.port)
             return external.commit(
                 staging,
                 artifact_name=output.port,
@@ -1406,6 +1671,8 @@ class RuntimeExecutionService:
         external: ExternalArtifactStore,
         *,
         admitted_plans: Mapping[str, object] | None = None,
+        declared_request_ids: frozenset[str] = frozenset(),
+        fixed_clock: str | None = None,
     ) -> ProjectRuntimeInput:
         if value.inline_content is not None:
             artifact = ArtifactRef(
@@ -1422,6 +1689,36 @@ class RuntimeExecutionService:
         commit = value.external_commit
         if commit is None or external.verify(commit.semantic_hash) != commit:
             raise RuntimeIntegrityError("项目算子 external 输入引用漂移")
+        if commit.artifact_type == "data.minute-bars.1m.v1":
+            relative_path = "result.json"
+            content_hash = commit.files.get(relative_path)
+            if content_hash is None:
+                raise RuntimeIntegrityError("项目分钟输入缺少 result.json")
+            content = (
+                external.objects_root / commit.semantic_hash / relative_path
+            ).read_bytes()
+            schema_hash = typed_canonical_hash({"artifact_type": commit.artifact_type})
+            artifact = ArtifactRef(
+                port,
+                commit.artifact_type,
+                commit.semantic_hash,
+                content_hash,
+            )
+            request_admissions = RuntimeExecutionService._minute_request_admissions(
+                content,
+                artifact=artifact,
+                schema_hash=schema_hash,
+                admitted_plans=admitted_plans,
+                declared_request_ids=declared_request_ids,
+                fixed_clock=fixed_clock,
+            )
+            if request_admissions:
+                return ProjectRuntimeInput.from_verified(
+                    artifact,
+                    content,
+                    schema_hash,
+                    request_admissions=request_admissions,
+                )
         if commit.artifact_type == "data.minute-bars.v1":
             relative_path = "result.json"
             content_hash = commit.files.get(relative_path)
@@ -1448,6 +1745,8 @@ class RuntimeExecutionService:
                 source_root
             )
             if admitted_plans is not None:
+                if fixed_clock is None:
+                    raise RuntimeIntegrityError("项目 request admission 缺少固定时钟")
                 for request_id, descriptor in request_tables.items():
                     plan = admitted_plans.get(request_id)
                     if plan is None or plan.plan_hash != descriptor["admitted_plan_hash"]:
@@ -1455,7 +1754,9 @@ class RuntimeExecutionService:
                             f"项目 request 与正式准入计划不一致: {request_id}"
                         )
                     descriptor["admission"] = RuntimeExecutionService._project_request_admission(
-                        plan, descriptor
+                        plan,
+                        descriptor,
+                        fixed_clock=fixed_clock,
                     )
             artifact = ArtifactRef(
                 port,
@@ -1490,6 +1791,70 @@ class RuntimeExecutionService:
             source_root=external.objects_root / commit.semantic_hash,
             files=commit.files,
         )
+
+    @staticmethod
+    def _minute_request_admissions(
+        content: bytes,
+        *,
+        artifact: ArtifactRef,
+        schema_hash: str,
+        admitted_plans: Mapping[str, object] | None,
+        declared_request_ids: frozenset[str],
+        fixed_clock: str | None,
+    ) -> dict[str, Mapping[str, object]]:
+        """从已验证分钟工件投影显式绑定 request 的只读准入事实。"""
+
+        if not declared_request_ids:
+            return {}
+        try:
+            payload = json.loads(content.decode("utf-8"))
+            request_id = payload.get("request_id")
+            raw_dataset = payload.get("partitioned_dataset")
+            if not isinstance(request_id, str) or not request_id:
+                raise ValueError
+            if request_id not in declared_request_ids:
+                return {}
+            if not isinstance(raw_dataset, Mapping):
+                raise ValueError
+            dataset = PartitionedDatasetRef.from_dict(raw_dataset)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeIntegrityError("项目分钟输入缺少有效 request lineage") from exc
+        lineage = dataset.lineage
+        plan_hash = lineage.get("admitted_plan_hash")
+        source_revision_hash = lineage.get("source_revision_hash")
+        if admitted_plans is None:
+            raise RuntimeIntegrityError("项目分钟 admission 缺少正式准入计划")
+        if fixed_clock is None:
+            raise RuntimeIntegrityError("项目分钟 admission 缺少固定时钟")
+        plan = admitted_plans.get(request_id)
+        if (
+            plan is None
+            or plan.plan_hash != plan_hash
+            or not isinstance(source_revision_hash, str)
+            or len(source_revision_hash) != 64
+        ):
+            raise RuntimeIntegrityError(
+                f"项目分钟 request 与正式准入计划不一致: {request_id}"
+            )
+        source_snapshot_hash = payload.get("source_snapshot_hash")
+        if (
+            not isinstance(source_snapshot_hash, str)
+            or len(source_snapshot_hash) != 64
+            or any(char not in "0123456789abcdef" for char in source_snapshot_hash)
+        ):
+            raise RuntimeIntegrityError("项目分钟输入缺少有效 source snapshot")
+        descriptor = {
+            "source_identity": artifact.artifact_key,
+            "schema_hash": schema_hash,
+            "source_revision_hash": source_revision_hash,
+            "physical_snapshot_id": source_snapshot_hash,
+        }
+        descriptor["admission"] = RuntimeExecutionService._project_request_admission(
+            plan,
+            descriptor,
+            fixed_clock=fixed_clock,
+        )
+        return {request_id: descriptor}
 
     @staticmethod
     def _request_tables_from_data_bundle(
@@ -1550,9 +1915,23 @@ class RuntimeExecutionService:
         return result
 
     @staticmethod
-    def _project_request_admission(plan, descriptor) -> dict[str, object]:
+    def _project_request_admission(
+        plan,
+        descriptor,
+        *,
+        fixed_clock: str,
+    ) -> dict[str, object]:
         """将真实计划与已验证工件投影为项目只读事实。"""
         query = plan.query
+        try:
+            reference_clock = datetime.fromisoformat(fixed_clock)
+            as_of_cutoff = resolve_as_of_cutoff(
+                query.as_of,
+                reference_clock=reference_clock,
+                field="QueryIR as_of",
+            )
+        except (QueryIRInvalidError, ValueError) as exc:
+            raise RuntimeIntegrityError("项目 request as_of 无法按固定时钟解释") from exc
         return {
             "plan_hash": plan.plan_hash,
             "dataset_id": query.dataset_id,
@@ -1567,6 +1946,7 @@ class RuntimeExecutionService:
                 "snapshot_id": query.universe.snapshot_id,
             },
             "as_of": str(query.as_of),
+            "as_of_cutoff": as_of_cutoff.isoformat(),
             "object_name": plan.object_name,
             "source_profile": plan.source_profile,
             "input_claim_ceiling": plan.input_claim_ceiling,
@@ -1583,16 +1963,28 @@ class RuntimeExecutionService:
 
     @staticmethod
     def _verify_project_request_consumption(inputs, traces, parameters) -> None:
-        from .project_operator_runtime import _declared_request_ids
-
-        bound = {item.artifact.name: item for item in inputs if item.request_tables}
+        bound = {
+            item.artifact.name: item
+            for item in inputs
+            if (
+                getattr(item, "request_tables", {})
+                or getattr(item, "request_admissions", {})
+            )
+        }
         if not bound:
             return
         if not isinstance(traces, Mapping) or set(traces) != set(bound):
             raise RuntimeIntegrityError("项目 request 消费轨迹缺失")
         declared = _declared_request_ids(parameters)
         for port, item in bound.items():
-            selected = {key: value for key, value in item.request_tables.items() if key in declared}
+            request_tables = getattr(item, "request_tables", {})
+            request_admissions = getattr(item, "request_admissions", {})
+            requests = request_tables or request_admissions
+            selected = {
+                key: value
+                for key, value in requests.items()
+                if key in declared
+            }
             trace = traces[port]
             if not isinstance(trace, Mapping) or set(trace) != set(selected):
                 raise RuntimeIntegrityError("项目 request 消费集合不闭合")
@@ -1610,6 +2002,8 @@ class RuntimeExecutionService:
                     }:
                         raise RuntimeIntegrityError("项目 request 元数据消费轨迹无效")
                     continue
+                if request_admissions:
+                    raise RuntimeIntegrityError("项目 admission 输入不得报告数据行消费")
                 if (
                     set(row) != {
                         "source_identity", "schema_hash", "columns", "row_count",
@@ -1727,8 +2121,11 @@ class RuntimeExecutionService:
             return RuntimeNodeOutputs.single(value)
         raise RuntimeIntegrityError(f"节点 {node.node_id} 未返回按端口索引的 typed outputs")
 
-    @staticmethod
-    def _validate_outputs(node: NodeSpec, outputs: RuntimeNodeOutputs) -> None:
+    def _validate_outputs(
+        self,
+        node: NodeSpec,
+        outputs: RuntimeNodeOutputs,
+    ) -> None:
         expected = dict(node.output_types)
         actual = {
             port: value.artifact_ref.artifact_type
@@ -1737,6 +2134,33 @@ class RuntimeExecutionService:
         if actual != expected:
             raise RuntimeIntegrityError(
                 f"节点 {node.node_id} 输出端口或 artifact type 不匹配"
+            )
+        for requirement in self.result_table_requirements_by_node.get(
+            node.node_id, ()
+        ):
+            port = requirement["source_port"]
+            value = outputs.values.get(port)
+            if value is None or value.external_commit is None:
+                raise RuntimeIntegrityError(
+                    f"ResultSpec 表 {requirement['table_id']} 要求外部 Parquet 输出: "
+                    f"{node.node_id}/{port}"
+                )
+            prefix = f"{requirement['path_prefix'].strip('/')}/"
+            matched = tuple(
+                path
+                for path in value.external_commit.files
+                if path.startswith(prefix) and path.endswith(".parquet")
+            )
+            if matched:
+                continue
+            available = tuple(
+                path
+                for path in value.external_commit.files
+                if path.endswith(".parquet")
+            )
+            raise RuntimeIntegrityError(
+                f"ResultSpec 表 {requirement['table_id']} 未匹配正式 Parquet 前缀 "
+                f"{requirement['path_prefix']!r}; 可用 Parquet: {list(available[:20])}"
             )
 
     @staticmethod
@@ -1749,11 +2173,15 @@ class RuntimeExecutionService:
         command_id: str,
         node_id: str | None = None,
         attempt_id: str | None = None,
+        details: Mapping[str, object] | None = None,
     ) -> RuntimeEvent:
+        payload = {"status": status}
+        if details:
+            payload.update(details)
         return store.append(
             run_id,
             f"{scope}_status_changed",
-            {"status": status},
+            payload,
             command_id=command_id,
             node_id=node_id,
             attempt_id=attempt_id,
@@ -1806,6 +2234,14 @@ class RuntimeExecutionService:
                 events,
                 run_id,
                 "node",
+                "waiting_for_resources",
+                command_id=f"{node_id}:recovered-waiting",
+                node_id=node_id,
+            )
+            cls._status(
+                events,
+                run_id,
+                "node",
                 "running",
                 command_id=f"{node_id}:recovered-running",
                 node_id=node_id,
@@ -1823,11 +2259,27 @@ class RuntimeExecutionService:
                 events,
                 run_id,
                 "node",
+                "waiting_for_resources",
+                command_id=f"{node_id}:recovered-waiting",
+                node_id=node_id,
+            )
+            cls._status(
+                events,
+                run_id,
+                "node",
                 "running",
                 command_id=f"{node_id}:recovered-running",
                 node_id=node_id,
             )
         elif current == "ready":
+            cls._status(
+                events,
+                run_id,
+                "node",
+                "waiting_for_resources",
+                command_id=f"{node_id}:recovered-waiting",
+                node_id=node_id,
+            )
             cls._status(
                 events,
                 run_id,
@@ -1850,6 +2302,14 @@ class RuntimeExecutionService:
                 events,
                 run_id,
                 "node",
+                "waiting_for_resources",
+                command_id=f"{node_id}:recovered-waiting:{suffix}",
+                node_id=node_id,
+            )
+            cls._status(
+                events,
+                run_id,
+                "node",
                 "running",
                 command_id=f"{node_id}:recovered-running:{suffix}",
                 node_id=node_id,
@@ -1858,7 +2318,12 @@ class RuntimeExecutionService:
             raise RuntimeIntegrityError(
                 f"节点 {node_id} 不能从当前状态复用 checkpoint: {current}"
             )
-        if active_status in {"pending", "admitted", "ready"}:
+        if active_status in {
+            "pending",
+            "admitted",
+            "ready",
+            "waiting_for_resources",
+        }:
             raise RuntimeIntegrityError(
                 f"节点 {node_id} 的 checkpoint 与 attempt 状态冲突"
             )
@@ -1904,7 +2369,8 @@ class RuntimeExecutionService:
     ) -> bool:
         """把上次进程遗留的非终态 attempt 收敛为可恢复节点。"""
         projection = events.replay()
-        if projection.node_statuses.get(node_id) != "running":
+        node_status = projection.node_statuses.get(node_id)
+        if node_status not in {"waiting_for_resources", "running"}:
             return False
         attempt_id = next(
             (
@@ -1918,7 +2384,12 @@ class RuntimeExecutionService:
             attempt_status = projection.attempt_statuses.get(attempt_id)
             if attempt_status == "running":
                 terminal_status = "lost"
-            elif attempt_status in {"pending", "admitted", "ready"}:
+            elif attempt_status in {
+                "pending",
+                "admitted",
+                "ready",
+                "waiting_for_resources",
+            }:
                 terminal_status = "cancelled"
             else:
                 raise RuntimeIntegrityError(
@@ -1977,15 +2448,11 @@ def _reservation_budget(
     *,
     process_slots: int,
 ) -> ResourceBudget:
-    """把内部 worker 的实际 CPU 需求并入节点的进程内 reservation。"""
+    """保持节点声明的 CPU/内存/scratch 包络；进程槽单独治理。"""
 
-    internal_workers = 1 if process_slots == 1 else process_slots - 1
-    return ResourceBudget(
-        budget.memory_bytes,
-        max(budget.cpu_slots, internal_workers),
-        budget.temp_bytes,
-        budget.wall_seconds,
-    )
+    if type(process_slots) is not int or process_slots <= 0:
+        raise RuntimeIntegrityError("节点进程槽声明无效")
+    return budget
 
 
 def _effective_resource_budget(
@@ -1993,16 +2460,17 @@ def _effective_resource_budget(
     *,
     capacity: ResourceCapacity | None,
 ) -> ResourceBudget:
-    """把节点声明的最低需求与本次运行可用上限分开。"""
+    """验证节点声明可被本次运行容量承载，并保持声明上限。"""
 
     if capacity is None:
         return budget
-    return ResourceBudget(
-        capacity.memory_bytes,
-        capacity.cpu_slots,
-        capacity.temp_bytes,
-        budget.wall_seconds,
-    )
+    if (
+        budget.memory_bytes > capacity.memory_bytes
+        or budget.cpu_slots > capacity.cpu_slots
+        or budget.temp_bytes > capacity.temp_bytes
+    ):
+        raise RuntimeAdmissionError("节点声明预算超过运行总容量")
+    return budget
 
 
 __all__ = [

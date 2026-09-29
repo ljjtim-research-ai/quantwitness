@@ -45,6 +45,11 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "research_pipeline" = ["capabilities.json", "gate_ia_protocol.json"]
+"research_pipeline.catalog" = [
+  "definitions/*.yaml",
+  "default_lock/CURRENT",
+  "default_lock/*/*.json",
+]
 "research_pipeline.packages" = [
   "templates/*.yaml",
   "templates/sources/*.yaml",

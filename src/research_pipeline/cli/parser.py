@@ -10,7 +10,7 @@ from research_pipeline import __version__
 DESCRIPTION = "QuantWitness 量化研究主链；数据源只读，研究产物写入显式目录。"
 FINAL_COMMANDS = (
     "catalog", "package", "run", "resume", "retry-node", "inspect",
-    "rerun-from", "verify", "report", "compare", "export-result", "doctor", "gc",
+    "rerun-from", "verify", "report", "compare", "analysis", "export-result", "doctor", "gc",
     "capabilities",
     "operator", "artifact", "recipe",
     "workspace",
@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run(commands)
     _add_runtime(commands)
     _add_evidence(commands)
+    _add_analysis(commands)
     _add_operations(commands)
     _add_capabilities(commands)
     _add_machine_discovery(commands)
@@ -87,6 +88,14 @@ def _add_package(commands: argparse._SubParsersAction) -> None:
     init = subcommands.add_parser("init", help="从安装包模板初始化")
     init.add_argument("destination")
     init.add_argument("--json", action="store_true")
+    variants = subcommands.add_parser(
+        "expand-variants",
+        help="从基包和受限参数清单原子生成多个完整 ResearchPackage",
+    )
+    variants.add_argument("--base", required=True)
+    variants.add_argument("--manifest", required=True)
+    variants.add_argument("--output-root", required=True)
+    variants.add_argument("--json", action="store_true")
     source_import = subcommands.add_parser("source-import", help="从本地文件离线归档来源正文")
     source_import.add_argument("--package", required=True)
     source_import.add_argument("--source-id", required=True)
@@ -121,6 +130,11 @@ def _add_package(commands: argparse._SubParsersAction) -> None:
         command.add_argument("--verifier-bundle", help="显式项目 Verifier bundle")
         if name == "export-result":
             command.add_argument("--output", required=True)
+        else:
+            command.add_argument("--output")
+            command.add_argument(
+                "--format", choices=("markdown", "json"), default="markdown"
+            )
         command.add_argument("--json", action="store_true")
     compare = subcommands.add_parser("compare", help="按同一合同比较可信证据")
     compare.add_argument("--package", required=True)
@@ -177,6 +191,29 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
     run.add_argument("--artifact-root", required=True)
     run.add_argument("--handoff-out", required=True, help="数据平面 handoff 输出")
     run.add_argument("--run-root", required=True)
+    run.add_argument(
+        "--reuse-run-root",
+        action="append",
+        default=[],
+        help="显式复用已成功发布 Result 的完成态 run，可重复提供并按顺序尝试",
+    )
+    run.add_argument(
+        "--require-reused-node",
+        action="append",
+        default=[],
+        metavar="NODE_ID",
+        help=(
+            "要求指定节点必须从 --reuse-run-root 复用；可重复提供。"
+            "Runtime 会在任何节点启动前预检，缺少一个就拒绝运行"
+        ),
+    )
+    run.add_argument(
+        "--reuse-failed-run-root",
+        help=(
+            "显式复用一个终态失败 run 中已成功且完整复验通过的 checkpoint；"
+            "要求新旧 DAG、节点局部身份、clock 和 seed 完全一致"
+        ),
+    )
     run.add_argument("--result-store", required=True, help="自包含 ResultStore")
     run.add_argument("--mode", choices=("deterministic_serial", "bounded_parallel", "partitioned_batch"), default="deterministic_serial")
     _add_runtime_resource_arguments(run)
@@ -281,12 +318,65 @@ def _add_evidence(commands: argparse._SubParsersAction) -> None:
         command.add_argument("--result-store", required=True)
         if name == "export-result":
             command.add_argument("--output", required=True)
+        else:
+            command.add_argument("--output")
+            command.add_argument(
+                "--format", choices=("markdown", "json"), default="markdown"
+            )
         command.add_argument("--json", action="store_true")
     compare = commands.add_parser("compare", help="比较两份结构化 VerificationResult")
     compare.add_argument("--left-verification-result", required=True)
     compare.add_argument("--right-verification-result", required=True)
     compare.add_argument("--left-result-store", required=True)
     compare.add_argument("--right-result-store", required=True)
+    compare.add_argument("--json", action="store_true")
+
+
+def _add_analysis(commands: argparse._SubParsersAction) -> None:
+    analysis = commands.add_parser(
+        "analysis",
+        help="只读分析已验证 Result 的显式时间序列",
+    )
+    subcommands = analysis.add_subparsers(dest="analysis_command", required=True)
+    run = subcommands.add_parser("run", help="生成独立 AnalysisResult")
+    run.add_argument("--verification-result", required=True)
+    run.add_argument("--result-store", required=True)
+    run.add_argument("--request", required=True, help="显式 AnalysisRequest YAML/JSON")
+    run.add_argument("--output", required=True, help="必须不存在的 AnalysisResult JSON")
+    run.add_argument(
+        "--analysis-memory-bytes",
+        type=int,
+        default=8 * 1024 * 1024,
+        help="日期和值两个投影列的批次预算；默认 8 MiB",
+    )
+    run.add_argument("--json", action="store_true")
+
+    compare = subcommands.add_parser(
+        "compare",
+        help="比较两份或多份同口径 AnalysisResult",
+    )
+    compare.add_argument("--analysis-result", action="append", required=True)
+    compare.add_argument(
+        "--measure",
+        choices=(
+            "overall.mean",
+            "overall.absolute_change",
+            "overall.compounded_return",
+            "overall.geometric_annualized_return",
+            "overall.max_drawdown",
+        ),
+        required=True,
+    )
+    compare.add_argument(
+        "--direction",
+        choices=("higher_is_better", "lower_is_better"),
+        required=True,
+    )
+    compare.add_argument(
+        "--output",
+        required=True,
+        help="必须不存在的 AnalysisComparison JSON",
+    )
     compare.add_argument("--json", action="store_true")
 
 

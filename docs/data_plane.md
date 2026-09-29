@@ -70,6 +70,7 @@ provider 都执行同一计划事实。缺少供应商时段来源、期货开�
 - `QueryIR.budget.max_rows/max_bytes` 只约束最终输出，不能反推 DuckDB、Arrow 或 Python 的总 RSS。
 - admit 从真实数据节点 `ResourceBudget` 编译 provider 分配：DuckDB memory、单批 batch/writer 开销、进程余量、CPU 和 temp。当前进程余量为 `max(96 MiB, memory/8)`；这是代表查询校准后的分配策略，不是逐 allocator 的伪精确计数。
 - 当前正式支持包络要求数据节点至少批准 256 MiB。低于下限会在对象统计或 provider 打开前拒绝；变长列没有 Catalog 上界、不支持的 VIEW/SQL 形状或窗口工作集无法落入 memory/temp 时也会在扫描前拒绝。
+- 对“单个 JSON 字符串数组 + 有限分类关系”的受支持 VIEW，admit 会从只读对象定义冻结原始表、日期列、JSON 列、输出列和本次分类值。DuckDB provider 按该证据使用 `UNNEST(from_json(...))` 的投影展开，避免执行 `json_each` 横向连接产生与正式输出无关的巨大中间结果；无法完整识别的形状仍在准入阶段拒绝，不猜测改写。
 - DuckDB 与 Parquet provider 都按批准分配设置 DuckDB memory/temp、Arrow batch 和 CPU，不会为通过而缩短日期、删列、抽样或改变研究输入。Runtime 继续用现有 ResourceObservation 记录整个进程树 RSS 和 scratch 峰值，不新增资源 proof。
 - 贴身回归为定宽 20 万行、256 字节变长字符串 16 万行、排序/窗口 30 万行；每类由 pytest 启动全新进程，走真实临时 DuckDB/Parquet/Arrow，并同时观察子进程及后代 RSS、Arrow 读取量、进程 I/O 与 temp/spill。
 - `VerifiedDataset.parquet_uncompressed_bytes()` 只读取已验证当前绑定的 Parquet footer，为确需完整 pandas 矩阵的消费者提供数据页前下界；它只负责明显超界早拒绝，实际批次和 pandas 保留量仍由 `PandasFrameBudget` 逐步记账。

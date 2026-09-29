@@ -17,7 +17,7 @@ from ..execution_budget import (
 )
 from ..execution_estimate import ExecutionEstimate
 from ..stream import ColumnarStream
-from .sql import compile_duckdb_query
+from .sql import compile_duckdb_query, compile_json_array_projection_source
 
 
 class DuckDBColumnarProvider:
@@ -106,8 +106,16 @@ class DuckDBColumnarProvider:
                     "SET max_temp_directory_size = "
                     f"'{allocation.temp_bytes:d}B'"
                 )
+            source_expression = (
+                None
+                if execution_estimate.json_array_projection is None
+                else compile_json_array_projection_source(
+                    execution_estimate.json_array_projection
+                )
+            )
             sql, params = compile_duckdb_query(
                 plan,
+                source_expression=source_expression,
                 preserve_temporal_facts=preserve_temporal_facts,
             )
             reader = connection.execute(sql, params).to_arrow_reader(

@@ -47,6 +47,87 @@ class PhysicalInventory:
 
 
 @dataclass(frozen=True)
+class JsonArrayProjectionEvidence:
+    """可将单个 JSON 字符串数组直接展开为列的只读执行证据。"""
+
+    source_object: str
+    source_event_column: str
+    source_json_column: str
+    event_output_column: str
+    discriminator_output_column: str
+    expanded_output_column: str
+    discriminator_values: tuple[str, ...]
+    method: str = "duckdb_json_array_projection_v1"
+
+    def __post_init__(self) -> None:
+        identifiers = (
+            self.source_object,
+            self.source_event_column,
+            self.source_json_column,
+            self.event_output_column,
+            self.discriminator_output_column,
+            self.expanded_output_column,
+        )
+        if any(
+            re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value) is None
+            for value in identifiers
+        ):
+            raise CatalogDriftError("JSON 数组投影证据包含非法标识符")
+        if len(
+            {
+                self.event_output_column.casefold(),
+                self.discriminator_output_column.casefold(),
+                self.expanded_output_column.casefold(),
+            }
+        ) != 3:
+            raise CatalogDriftError("JSON 数组投影输出列必须互不相同")
+        if self.discriminator_values != tuple(
+            sorted(set(self.discriminator_values))
+        ):
+            raise CatalogDriftError("JSON 数组投影分类值必须唯一并稳定排序")
+        if self.method != "duckdb_json_array_projection_v1":
+            raise CatalogDriftError("JSON 数组投影方法不受支持")
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source_object": self.source_object,
+            "source_event_column": self.source_event_column,
+            "source_json_column": self.source_json_column,
+            "event_output_column": self.event_output_column,
+            "discriminator_output_column": self.discriminator_output_column,
+            "expanded_output_column": self.expanded_output_column,
+            "discriminator_values": list(self.discriminator_values),
+            "method": self.method,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, object]) -> "JsonArrayProjectionEvidence":
+        expected = {
+            "source_object",
+            "source_event_column",
+            "source_json_column",
+            "event_output_column",
+            "discriminator_output_column",
+            "expanded_output_column",
+            "discriminator_values",
+            "method",
+        }
+        raw_values = value.get("discriminator_values")
+        if set(value) != expected or not isinstance(raw_values, (list, tuple)):
+            raise CatalogDriftError("JSON 数组投影证据 schema 无效")
+        return cls(
+            source_object=str(value["source_object"]),
+            source_event_column=str(value["source_event_column"]),
+            source_json_column=str(value["source_json_column"]),
+            event_output_column=str(value["event_output_column"]),
+            discriminator_output_column=str(value["discriminator_output_column"]),
+            expanded_output_column=str(value["expanded_output_column"]),
+            discriminator_values=tuple(str(item) for item in raw_values),
+            method=str(value["method"]),
+        )
+
+
+@dataclass(frozen=True)
 class ObjectExecutionEvidence:
     """与本次数据库 revision 和查询范围绑定的只读对象形状证据。"""
 
@@ -68,6 +149,7 @@ class ObjectExecutionEvidence:
     partition_uncompressed_bytes_upper: int | None = None
     partition_key: str | None = None
     partition_bound_method: str | None = None
+    json_array_projection: JsonArrayProjectionEvidence | None = None
     method: str = "duckdb_catalog_read_only_v1"
 
     def __post_init__(self) -> None:
@@ -138,6 +220,11 @@ class ObjectExecutionEvidence:
             or not self.partition_key
         ):
             raise CatalogDriftError("分区执行证据不完整")
+        if self.json_array_projection is not None:
+            if not self.has_json_expansion:
+                raise CatalogDriftError("JSON 数组投影证据不能用于非展开对象")
+            if self.json_array_projection.source_object not in self.dependency_chain:
+                raise CatalogDriftError("JSON 数组投影来源不在对象依赖链中")
 
     @property
     def evidence_hash(self) -> str:
@@ -163,6 +250,11 @@ class ObjectExecutionEvidence:
             "partition_uncompressed_bytes_upper": self.partition_uncompressed_bytes_upper,
             "partition_key": self.partition_key,
             "partition_bound_method": self.partition_bound_method,
+            "json_array_projection": (
+                None
+                if self.json_array_projection is None
+                else self.json_array_projection.to_dict()
+            ),
             "method": self.method,
         }
 
@@ -211,7 +303,8 @@ _MINUTE_PARQUET_PARTITION = re.compile(
 _JSON_SOURCE = re.compile(
     r"\bfrom\s+(?:(?:\"?main\"?)\.)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?"
     r"\s+(?:as\s+)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*,\s*"
-    r"json_each\s*\(\s*\"?\2\"?\.\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*\)",
+    r"json_each\s*\(\s*\"?\2\"?\.\"?([A-Za-z_][A-Za-z0-9_]*)\"?\s*\)"
+    r"\s+(?:as\s+)?\"?([A-Za-z_][A-Za-z0-9_]*)\"?",
     re.IGNORECASE | re.DOTALL,
 )
 _FINITE_VALUES = re.compile(
@@ -235,6 +328,13 @@ _FINITE_VALUE_ALIAS = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 _STRING_LITERAL = re.compile(r"'((?:''|[^'])*)'")
+_JSON_STRING_ELEMENT_PROJECTION = re.compile(
+    r"(?:cast\s*\(\s*)?json_extract_string\s*\(\s*"
+    r"\"?([A-Za-z_][A-Za-z0-9_]*)\"?\.\"?value\"?\s*,\s*'\$'\s*\)"
+    r"(?:\s+as\s+varchar\s*\))?\s+as\s+"
+    r"\"?([A-Za-z_][A-Za-z0-9_]*)\"?",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -544,15 +644,24 @@ def _observe_json_expansion_scope(
     scope_filters: tuple[tuple[str, str, tuple[object, ...]], ...],
     projected_columns: dict[str, str],
     variable_fields: tuple[str, ...],
-) -> tuple[int, int, tuple[tuple[str, int], ...]]:
+) -> tuple[
+    int,
+    int,
+    tuple[tuple[str, int], ...],
+    JsonArrayProjectionEvidence,
+]:
     """从原始 JSON 行做行内统计，不执行 set-returning VIEW。"""
 
     source = _JSON_SOURCE.search(definition)
     finite = _FINITE_VALUES.search(definition)
     finite_alias = _FINITE_VALUE_ALIAS.search(definition)
-    if source is None or finite is None or finite_alias is None:
+    element = _JSON_STRING_ELEMENT_PROJECTION.search(definition)
+    if source is None or finite is None or finite_alias is None or element is None:
         raise CatalogDriftError("JSON 展开 VIEW 不属于受支持的单数组有限分类形状")
-    source_object, source_alias, json_column = source.groups()
+    source_object, source_alias, json_column, element_alias = source.groups()
+    element_source_alias, expanded_output_column = element.groups()
+    if element_source_alias.casefold() != element_alias.casefold():
+        raise CatalogDriftError("JSON 展开 VIEW 的元素投影来源不一致")
     value_text = finite.group(1)
     value_alias, value_column = finite_alias.groups()
     values = tuple(
@@ -577,11 +686,23 @@ def _observe_json_expansion_scope(
     discriminator_match = discriminator_pattern.search(definition)
     if event_match is None or discriminator_match is None:
         raise CatalogDriftError("JSON 展开 VIEW 的日期或有限分类投影无法识别")
+    event_output_column = event_column
     discriminator_column = discriminator_match.group(1)
+    supported_outputs = {
+        event_output_column.casefold(),
+        discriminator_column.casefold(),
+        expanded_output_column.casefold(),
+    }
+    if any(
+        output_column.casefold() not in supported_outputs
+        for output_column in projected_columns.values()
+    ):
+        raise CatalogDriftError("JSON 展开 VIEW 包含无法直接投影的输出列")
     selected = _scope_filter_values(scope_filters, discriminator_column)
     selected_values = values if selected is None else tuple(
         value for value in values if value in selected
     )
+    selected_values = tuple(sorted(selected_values))
     multiplier = len(selected_values)
     quoted_source = _quote_identifier(source_object)
     quoted_date = _quote_identifier(event_match.group(1))
@@ -635,7 +756,20 @@ def _observe_json_expansion_scope(
         else:
             width = element_width
         widths.append((field_id, width))
-    return source_rows, expanded_rows, tuple(sorted(widths))
+    return (
+        source_rows,
+        expanded_rows,
+        tuple(sorted(widths)),
+        JsonArrayProjectionEvidence(
+            source_object=source_object,
+            source_event_column=event_match.group(1),
+            source_json_column=json_column,
+            event_output_column=event_output_column,
+            discriminator_output_column=discriminator_column,
+            expanded_output_column=expanded_output_column,
+            discriminator_values=selected_values,
+        ),
+    )
 
 
 def _coerce_stat_time(value: object) -> date | datetime:
@@ -943,6 +1077,7 @@ class DuckDBSourceInspector:
             partition_uncompressed_bytes = None
             partition_key = None
             partition_bound_method = None
+            json_array_projection = None
             # JSON/UNNEST 的中间倍率未知时，禁止为了取得统计而真实展开 VIEW。
             if shape.has_json_expansion:
                 definitions = tuple(
@@ -959,7 +1094,12 @@ class DuckDBSourceInspector:
                 ):
                     raise CatalogDriftError("JSON 展开缺少查询范围统计输入")
                 definition = definitions[0]
-                source_rows, expanded_rows, observed_widths = (
+                (
+                    source_rows,
+                    expanded_rows,
+                    observed_widths,
+                    json_array_projection,
+                ) = (
                     _observe_json_expansion_scope(
                         connection,
                         definition=definition,
@@ -1058,6 +1198,7 @@ class DuckDBSourceInspector:
             partition_uncompressed_bytes_upper=partition_uncompressed_bytes,
             partition_key=partition_key,
             partition_bound_method=partition_bound_method,
+            json_array_projection=json_array_projection,
         )
 
 

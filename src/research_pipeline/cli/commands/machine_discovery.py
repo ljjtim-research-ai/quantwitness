@@ -76,6 +76,9 @@ def _project_operator_bundle(args) -> dict[str, object]:
             registered_operator_specs=registered_operator_specs,
             project_artifact_types=declaration.project_artifact_types,
             permissions=declaration.permissions,
+            reuse_scope=declaration.reuse_scope,
+            parameter_preflight_module=declaration.parameter_preflight_module,
+            parameter_preflight_function=declaration.parameter_preflight_function,
         )
 
     if args.operator_command == "validate":

@@ -44,6 +44,18 @@ class OperatorGraphAdmission(Protocol):
         """返回带 output_ports 的受信算子合同。"""
 
 
+@runtime_checkable
+class ParameterPreflightAdmission(Protocol):
+    def preflight_parameters(
+        self,
+        recipe: OperatorGraphRecipe,
+        *,
+        fixed_clock: str,
+        root_seed: int,
+    ) -> None:
+        """使用已准入实现闭包预检真实冻结参数。"""
+
+
 def compile_operator_graph_package(
     package: ResearchPackage,
     *,
@@ -143,6 +155,12 @@ def compile_operator_graph_package(
             admission=admission,
             fixed_clock=run_clock,
         )
+        if isinstance(admission, ParameterPreflightAdmission):
+            admission.preflight_parameters(
+                recipe,
+                fixed_clock=fixed_clock,
+                root_seed=root_seed,
+            )
         _validate_research_semantic_graph(
             recipe,
             admission=admission,
@@ -166,12 +184,16 @@ def compile_operator_graph_package(
         operator = admission.require_operator(node.operator_id, node.operator_version)
         for output in operator.output_ports:
             producers.append((node.node_id, output.port, output.artifact_type))
-    project_metrics = (
+    verifier_metrics = (
         () if verifier_admission is None
         else verifier_admission.manifest.metric_definitions
     )
-    if project_metrics and {item.metric_ref for item in project_metrics} - set(package.metric_contract.metrics):
-        raise ResearchPackageError("项目 Verifier Metric 定义未被当前 Package 声明")
+    package_metric_refs = frozenset(package.metric_contract.metrics)
+    project_metrics = tuple(
+        definition
+        for definition in verifier_metrics
+        if definition.metric_ref in package_metric_refs
+    )
     metric_proofs = compose_metric_registry(project_metrics).prove(
         package.metric_contract.metrics,
         producers,

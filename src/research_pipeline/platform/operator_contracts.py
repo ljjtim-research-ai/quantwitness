@@ -33,7 +33,7 @@ _FORBIDDEN_EXECUTABLE_KEYS = {
 
 
 def operator_dag_runtime_hash(record: Mapping[str, object]) -> str:
-    """从 v2 终态记录生成 Result 与 Evidence 共用的 Runtime 身份。"""
+    """从终态记录生成不受调度时序影响的 Runtime 结果身份。"""
 
     outputs = record.get("outputs")
     if not isinstance(outputs, Mapping):
@@ -62,13 +62,11 @@ def operator_dag_runtime_hash(record: Mapping[str, object]) -> str:
                     return typed_canonical_hash({
                         "run_id": record.get("run_id"),
                         "dag_id": record.get("dag_id"),
-                        "event_chain_head": record.get("event_chain_head"),
                         "final_outputs": dict(sorted(terminal_outputs.items())),
                     })
     return typed_canonical_hash({
         "run_id": record.get("run_id"),
         "dag_id": record.get("dag_id"),
-        "event_chain_head": record.get("event_chain_head"),
         "outputs": dict(sorted(outputs.items())),
     })
 
@@ -413,11 +411,17 @@ class OperatorSpec:
         role_values = tuple(item.value for item in self.strategy_roles)
         if role_values != tuple(sorted(role_values)) or len(role_values) != len(set(role_values)):
             raise OperatorContractError("operator.strategy_roles 必须唯一并规范排序")
-        expected_resources = {"memory_bytes", "cpu_slots", "temp_bytes", "wall_seconds"}
+        expected_resources = {
+            "memory_bytes",
+            "cpu_slots",
+            "temp_bytes",
+            "process_slots",
+            "wall_seconds",
+        }
         if set(self.resource_profile) != expected_resources or any(
             type(value) is not int or value <= 0 for value in self.resource_profile.values()
         ):
-            raise OperatorContractError("operator.resource_profile 必须包含四个正整数")
+            raise OperatorContractError("operator.resource_profile 必须包含五个正整数")
         object.__setattr__(self, "resource_profile", MappingProxyType(dict(self.resource_profile)))
         if self.determinism_mode not in {"deterministic", "seeded"}:
             raise OperatorContractError("operator.determinism_mode 不受支持")
@@ -508,6 +512,8 @@ class OperatorSpec:
         code_hash: str,
         pit_capabilities: tuple[str, ...] = (),
     ) -> "OperatorSpec":
+        normalized_resource_profile = dict(resource_profile)
+        normalized_resource_profile.setdefault("process_slots", 1)
         values = {
             "operator_id": operator_id,
             "operator_version": operator_version,
@@ -515,7 +521,7 @@ class OperatorSpec:
             "output_ports": tuple(sorted(output_ports, key=lambda item: item.port)),
             "parameters": tuple(sorted(parameters, key=lambda item: item.name)),
             "strategy_roles": tuple(sorted(strategy_roles, key=lambda item: item.value)),
-            "resource_profile": dict(resource_profile),
+            "resource_profile": normalized_resource_profile,
             "determinism_mode": determinism_mode,
             "seed_policy": seed_policy,
             "code_hash": code_hash,
@@ -528,7 +534,7 @@ class OperatorSpec:
             "output_ports": [item.to_dict() for item in values["output_ports"]],
             "parameters": [item.to_dict() for item in values["parameters"]],
             "strategy_roles": [item.value for item in values["strategy_roles"]],
-            "resource_profile": dict(resource_profile),
+            "resource_profile": normalized_resource_profile,
             "determinism_mode": determinism_mode,
             "seed_policy": seed_policy,
             "code_hash": code_hash,

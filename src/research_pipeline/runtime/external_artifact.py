@@ -29,7 +29,7 @@ from .contracts import ArtifactRef
 from .errors import RuntimeIntegrityError
 
 
-EXTERNAL_ARTIFACT_COMMIT_VERSION = "research-external-artifact-commit-v1"
+EXTERNAL_ARTIFACT_COMMIT_VERSION = "research-external-artifact-commit-v2"
 
 _FORMAL_CAUSAL_ARTIFACT_COLUMNS = {
     "research.feature-set.v1": frozenset(CORE_FEATURE_TIME_COLUMNS),
@@ -44,6 +44,14 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _require_commit_token(value: str) -> None:
+    if (
+        len(value) != 32
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeIntegrityError("ExternalArtifactCommit commit_token 无效")
 
 
 
@@ -79,6 +87,7 @@ class ExternalArtifactCommit:
     def __post_init__(self) -> None:
         if not self.artifact_name or not self.artifact_type or not self.commit_token:
             raise RuntimeIntegrityError("ExternalArtifactCommit 身份字段不完整")
+        _require_commit_token(self.commit_token)
         if self.contract_version != EXTERNAL_ARTIFACT_COMMIT_VERSION:
             raise RuntimeIntegrityError("ExternalArtifactCommit 版本不受支持")
         object.__setattr__(self, "files", _digest_mapping(self.files, "files"))
@@ -97,7 +106,7 @@ class ExternalArtifactCommit:
         object.__setattr__(self, "row_counts", MappingProxyType(dict(sorted(rows.items()))))
         if self.semantic_hash != typed_canonical_hash(self.semantic_payload()):
             raise RuntimeIntegrityError("ExternalArtifactCommit semantic hash 不一致")
-        if self.manifest_hash != typed_canonical_hash(self.payload()):
+        if self.manifest_hash != typed_canonical_hash(self.identity_payload()):
             raise RuntimeIntegrityError("ExternalArtifactCommit manifest hash 不一致")
 
     def semantic_payload(self) -> dict[str, object]:
@@ -114,6 +123,14 @@ class ExternalArtifactCommit:
         return {
             **self.semantic_payload(),
             "commit_token": self.commit_token,
+            "semantic_hash": self.semantic_hash,
+        }
+
+    def identity_payload(self) -> dict[str, object]:
+        """返回稳定内容身份；随机发布事务令牌不参与下游缓存身份。"""
+
+        return {
+            **self.semantic_payload(),
             "semantic_hash": self.semantic_hash,
         }
 
@@ -149,7 +166,7 @@ class ExternalArtifactCommit:
             "contract_version": EXTERNAL_ARTIFACT_COMMIT_VERSION,
         }
         semantic_hash = typed_canonical_hash(semantic)
-        payload = {**semantic, "commit_token": commit_token, "semantic_hash": semantic_hash}
+        identity = {**semantic, "semantic_hash": semantic_hash}
         return cls(
             artifact_name,
             artifact_type,
@@ -158,7 +175,7 @@ class ExternalArtifactCommit:
             schema_hashes,
             row_counts,
             semantic_hash,
-            typed_canonical_hash(payload),
+            typed_canonical_hash(identity),
         )
 
     @classmethod

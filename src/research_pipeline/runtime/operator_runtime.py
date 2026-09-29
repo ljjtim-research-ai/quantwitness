@@ -5,14 +5,16 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 import hashlib
+import math
 from pathlib import Path
+import time
 from types import MappingProxyType
 from typing import Callable, Mapping
 
 from research_pipeline.platform import canonical_json, typed_canonical_hash
 
 from .contracts import ArtifactRef, NodeSpec, ResourceBudget
-from .errors import RuntimeIntegrityError
+from .errors import RuntimeIntegrityError, RuntimeWorkerError
 from .external_artifact import ExternalArtifactCommit, ExternalArtifactStore
 from .resource_governor import ResourceGovernor, ResourceLease
 
@@ -256,6 +258,33 @@ class RuntimeNodeContext:
     effective_resource_budget: ResourceBudget
     resource_governor: ResourceGovernor | None
     resource_lease: ResourceLease | None
+    attempt_deadline_monotonic: float | None = None
+    process_slots: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.process_slots is not None and (
+            type(self.process_slots) is not int or self.process_slots <= 0
+        ):
+            raise RuntimeIntegrityError("节点进程槽声明无效")
+
+    def remaining_resource_budget(self) -> ResourceBudget:
+        """返回当前节点 attempt 剩余的统一资源上限。"""
+
+        if self.attempt_deadline_monotonic is None:
+            return self.effective_resource_budget
+        remaining = self.attempt_deadline_monotonic - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeWorkerError(
+                "节点执行超过 wall_seconds",
+                error_code="heartbeat_timeout",
+            )
+        budget = self.effective_resource_budget
+        return ResourceBudget(
+            budget.memory_bytes,
+            budget.cpu_slots,
+            budget.temp_bytes,
+            max(1, math.ceil(remaining)),
+        )
 
 
 @dataclass(frozen=True)

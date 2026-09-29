@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Mapping
 
-from research_pipeline.catalog.discovery import ObjectExecutionEvidence
+from research_pipeline.catalog.discovery import (
+    JsonArrayProjectionEvidence,
+    ObjectExecutionEvidence,
+)
+from research_pipeline.catalog.errors import CatalogDriftError
 from research_pipeline.platform.canonical import typed_canonical_hash
 
 from .admission import AdmittedQueryPlan
@@ -16,7 +20,7 @@ from .execution_budget import (
 )
 
 
-EXECUTION_ESTIMATE_VERSION = "data-plane-execution-estimate-v3"
+EXECUTION_ESTIMATE_VERSION = "data-plane-execution-estimate-v4"
 _EXPANSION_BOUND_METHODS = frozenset(
     {
         "catalog_hard_upper_v1",
@@ -66,6 +70,7 @@ class ExecutionEstimate:
     partition_uncompressed_bytes_upper: int | None = None
     partition_key: str | None = None
     partition_bound_method: str | None = None
+    json_array_projection: JsonArrayProjectionEvidence | None = None
     method: str = "provider_allocation_envelope_v1"
     contract_version: str = EXECUTION_ESTIMATE_VERSION
 
@@ -127,6 +132,8 @@ class ExecutionEstimate:
             raise ProviderExecutionError("JSON 展开缺少生产数值上界")
         if not self.has_json_expansion and self.expansion_bound_method is not None:
             raise ProviderExecutionError("非展开对象不得声明展开倍率依据")
+        if self.json_array_projection is not None and not self.has_json_expansion:
+            raise ProviderExecutionError("JSON 数组投影计划不能用于非展开对象")
         if self.variable_width_upper != tuple(sorted(self.variable_width_upper)):
             raise ProviderExecutionError("变长字段上界必须稳定排序")
         if self.dependency_edges != tuple(sorted(set(self.dependency_edges))):
@@ -239,6 +246,11 @@ class ExecutionEstimate:
             "partition_uncompressed_bytes_upper": self.partition_uncompressed_bytes_upper,
             "partition_key": self.partition_key,
             "partition_bound_method": self.partition_bound_method,
+            "json_array_projection": (
+                None
+                if self.json_array_projection is None
+                else self.json_array_projection.to_dict()
+            ),
             "method": self.method,
         }
 
@@ -276,6 +288,7 @@ class ExecutionEstimate:
             "partition_uncompressed_bytes_upper",
             "partition_key",
             "partition_bound_method",
+            "json_array_projection",
             "method",
         }
         if set(value) != expected:
@@ -285,6 +298,7 @@ class ExecutionEstimate:
         raw_widths = value["variable_width_upper"]
         raw_chain = value["dependency_chain"]
         raw_edges = value["dependency_edges"]
+        raw_json_projection = value["json_array_projection"]
         if (
             not isinstance(raw_budget, Mapping)
             or set(raw_budget) != {"memory_bytes", "temp_bytes", "cpu_slots"}
@@ -303,8 +317,20 @@ class ExecutionEstimate:
                 not isinstance(edge, (list, tuple)) or len(edge) != 2
                 for edge in raw_edges
             )
+            or (
+                raw_json_projection is not None
+                and not isinstance(raw_json_projection, Mapping)
+            )
         ):
             raise ProviderExecutionError("ExecutionEstimate 复合字段无效")
+        json_array_projection = None
+        if raw_json_projection is not None:
+            try:
+                json_array_projection = JsonArrayProjectionEvidence.from_dict(
+                    dict(raw_json_projection)
+                )
+            except CatalogDriftError as exc:
+                raise ProviderExecutionError("ExecutionEstimate JSON 数组投影无效") from exc
         return cls(
             object_name=str(value["object_name"]),
             object_kind=str(value["object_kind"]),
@@ -371,6 +397,7 @@ class ExecutionEstimate:
                 if value["partition_bound_method"] is None
                 else str(value["partition_bound_method"])
             ),
+            json_array_projection=json_array_projection,
             method=str(value["method"]),
             contract_version=str(value["contract_version"]),
         )
@@ -506,6 +533,7 @@ def build_execution_estimate(
         partition_uncompressed_bytes_upper=evidence.partition_uncompressed_bytes_upper,
         partition_key=evidence.partition_key,
         partition_bound_method=evidence.partition_bound_method,
+        json_array_projection=evidence.json_array_projection,
     )
 
 

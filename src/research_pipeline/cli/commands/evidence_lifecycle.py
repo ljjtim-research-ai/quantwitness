@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from pathlib import Path
 
 from research_pipeline.data_plane import PathRolePolicy
 from research_pipeline.evidence import (
+    build_verification_report,
     FinancialOracleBudget,
     compare_verification_results,
     load_verified_result_context,
@@ -15,6 +17,8 @@ from research_pipeline.evidence import (
 )
 
 from ..result import execute_guarded
+from ..command_suggestion import command_suggestion
+from ..report_output import write_verification_report
 
 
 def execute(args) -> int:
@@ -57,6 +61,14 @@ def _execute(args) -> dict[str, object]:
             "metric_count": len(context.metrics),
             "output": args.output,
             "next_action": "可使用 report、compare 或 export-result 消费该 VerificationResult。",
+            **command_suggestion(
+                "python", "-m", "research_pipeline", "report",
+                "--verification-result", args.output,
+                "--result-store", args.result_store,
+                "--output", str(_available_report_output(args.output)),
+                "--format", "markdown",
+                "--json",
+            ),
         }
     if args.command == "compare":
         PathRolePolicy().validate(
@@ -96,6 +108,8 @@ def _execute(args) -> dict[str, object]:
     }
     if args.command == "export-result":
         roles["export_result_output"] = args.output
+    elif args.command == "report" and args.output is not None:
+        roles["report_output"] = args.output
     PathRolePolicy().validate(
         roles,
         read_only_roles=("verification_input", "result_store_input"),
@@ -105,8 +119,34 @@ def _execute(args) -> dict[str, object]:
         result_store=args.result_store,
     )
     if args.command == "report":
-        return {"report": render_verification_report(context)}
+        markdown = render_verification_report(context)
+        if args.output is None:
+            return {"report": markdown}
+        output = write_verification_report(
+            args.output,
+            output_format=args.format,
+            markdown=markdown,
+            report=asdict(build_verification_report(context)),
+        )
+        return {
+            "output": str(output),
+            "format": args.format,
+            "result_id": context.snapshot.bundle.result_id,
+            "verification_hash": context.verification.verification_hash,
+        }
     return {"output": str(export_verified_result(context, args.output))}
+
+
+def _available_report_output(verification_result: str | Path) -> Path:
+    source = Path(verification_result).resolve()
+    candidate = source.with_name(f"{source.stem}-report.md")
+    if not candidate.exists():
+        return candidate
+    for index in range(2, 10_000):
+        candidate = source.with_name(f"{source.stem}-report-{index}.md")
+        if not candidate.exists():
+            return candidate
+    raise ValueError("无法为验证报告选择未占用输出路径")
 
 
 __all__ = ["execute"]

@@ -57,7 +57,6 @@ class PlanRequirementsMissingError(MainlineError):
         self,
         message: str,
         *missing_requirements: str,
-        next_command: str | None = None,
     ) -> None:
         super().__init__(message)
         normalized = tuple(sorted(set(missing_requirements)))
@@ -67,11 +66,7 @@ class PlanRequirementsMissingError(MainlineError):
             "contract_version": PLAN_FAILURE_VERSION,
             "code": self.error_code,
             "missing_requirements": list(normalized),
-            "next_command": next_command or (
-                "python -m research_pipeline package admit --package <package> "
-                "--catalog-lock <Catalog-Lock> --data-db <只读DuckDB> "
-                "--output <新的已准入计划目录> --json"
-            ),
+            "required_inputs": list(normalized),
         }
 
 
@@ -100,7 +95,6 @@ def admit_package(
         raise PlanRequirementsMissingError(
             "正式 plan 缺少必需输入",
             *missing,
-            next_command=_next_plan_command(package),
         )
     roles = {
         "package_input": args.package,
@@ -323,7 +317,6 @@ def _auto_admit_queries(
             raise PlanRequirementsMissingError(
                 f"Catalog Lock 无法从显式只读数据源唯一解析 binding: {query.dataset_id}",
                 f"source_profile:{query.dataset_id}",
-                next_command=_next_plan_command(package),
             )
         key, binding = candidates[0]
         binding_id = str(binding["binding_id"])
@@ -359,7 +352,6 @@ def _auto_admit_queries(
                 raise PlanRequirementsMissingError(
                     "同一研究计划不能混用不同因子publication",
                     "factor_publication_consistency",
-                    next_command=_next_plan_command(package),
                 )
             factor_publication_id = factor_publication.publication_id
             require_factor_query_covered(
@@ -493,14 +485,6 @@ def _source_database_map(*, data_db, source_db) -> dict[str, Path]:
 def _database_fingerprint(path: Path) -> dict[str, int]:
     stat = path.stat()
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-
-
-def _next_plan_command(package) -> str:
-    return (
-        "python -m research_pipeline package admit --package <package> "
-        "--catalog-lock <Catalog-Lock> --data-db <只读DuckDB> "
-        "--output <新的已准入计划目录> --json"
-    )
 
 
 __all__ = ["admit_package"]
