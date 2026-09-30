@@ -25,6 +25,11 @@ BUILD_SUPPORT_FILES = (
     "tools/release_metadata.py",
     "tools/release_evidence_binding.py",
     "tools/wheel_source_inventory.py",
+    "tools/run_release_gate_tests.py",
+    "tools/run_release_workflows.py",
+    "tools/build_gate_c_evidence.py",
+    "release/gate-test-protocol.json",
+    "release/gate-a-protocol.json",
 )
 UNIT_CORE_TEST_FILES = (
     "tests/test_project_operator_bundle.py",
@@ -117,6 +122,18 @@ PUBLIC_TEST_FILES = (
     "tests/test_cli_failure_details.py",
     "tests/test_dependency_distribution_identity.py",
     "tests/test_dependency_identity_recovery.py",
+    "tests/test_release_envelope.py",
+    "tests/test_release_gate_runner.py",
+    "tests/test_capability_release_evidence.py",
+    "tests/test_release_workflows.py",
+    "tests/test_gate_c_evidence.py",
+    "tests/test_generic_lifecycle.py",
+    "tests/test_result_bundle.py",
+    "tests/test_financial_checkpoint_recovery.py",
+    "tests/test_financial_values.py",
+    "tests/test_cn_stock_simulation.py",
+    "tests/test_cn_etf_simulation.py",
+    "tests/test_cn_futures_simulation.py",
 )
 PUBLIC_TOOL_FILES = (
     *BUILD_SUPPORT_FILES,
@@ -340,6 +357,7 @@ def build_input_paths(project: Path, dependency_lock: Path) -> tuple[str, ...]:
     required = (
         *source_archive_paths(root),
         *BUILD_SUPPORT_FILES,
+        *public_source_paths(root),
         dependency_relative,
     )
     missing = [path for path in required if not (root / path).is_file()]

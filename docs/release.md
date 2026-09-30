@@ -64,10 +64,36 @@ v1 的原始 METADATA/RECORD 摘要与 v2 不兼容；验证器拒绝 v1 锁，�
 
 公开 CI 运行于 Ubuntu。Windows venv 的 Verifier 启动器可能增加进程层级，独立验证可显式传入 `--verification-process-slots 3`；省略时默认仍为 2，详见 [Workspace 合成研究入门](workspace-quickstart.md) 和[资源预算](project_resource_budgets.md)。
 
-公开 `ci` 保留 Python 3.10 与 3.13 矩阵，检查公开源码清单、框架边界、公共 Operator 的内建身份和未经批准的晋级，以及首次公开时能力不得自称 `sealed`。每个矩阵环境都从正式 allowlist 构建 wheel，在独立虚拟环境安装，从仓库外检查导入位置，并在临时合成 DuckDB 上运行四个示例的 `lint → admit → run → Result → verify → VerificationResult → report` 闭环。完整整改基线依赖父仓库材料，不进入公开候选；公开 CI 的能力状态限制以独立仓库可执行的门禁为准。
+公开 `ci` 保留 Python 3.10 与 3.13 矩阵，检查公开源码清单、框架边界、公共 Operator 的内建身份和未经批准的晋级，以及 `sealed` 声明必须具备当前候选的独立发布证据。每个矩阵环境都从正式 allowlist 构建 wheel，在独立虚拟环境安装，从仓库外检查导入位置，并在临时合成 DuckDB 上运行四个示例的 `lint → admit → run → Result → verify → VerificationResult → report` 闭环。完整整改基线依赖父仓库材料，不进入公开候选；公开 CI 的能力状态限制以独立仓库可执行的门禁为准。
 
 公开仓库中的 `python tools/public_source_inventory.py --project . --check` 要在独立 Git 仓库根运行：它比较 Git 已跟踪文件与公开允许清单，拒绝额外提交或未纳入 Git 的允许文件，并要求正式治理文件 `.github/CODEOWNERS` 已跟踪。父仓库内的 `research_pipeline/` 仍用该工具的导出命令生成独立候选，不以嵌套目录的 `--check` 代替公开仓库检查。
 
 四个示例的项目 Worker 固定依赖 `pyarrow 21.0.0`；CI 的源码测试环境和隔离 wheel 环境均安装此版本、执行 `pip check`，再核对隔离环境的版本和 wheel 来源。该固定版本只约束示例验收，不收窄 `pyproject.toml` 面向用户的依赖范围。CI 的 wheel 路径来自本次构建回执，不扫描历史 `dist/`。
 
 工作流检查通过不代表 GitHub ruleset 或 required checks 已生效；首次公开前需在平台按批准的治理方案配置并验证。四项目闭环只证明合成研究，不证明交易费用、保证金或真实市场表现。
+
+
+## 当前候选的本地发布验收
+
+ReleaseEnvelope 汇总同一干净候选的六类验收，`profile=local` 只说明该次本地平台、依赖和输入范围。它不授予全部能力 `sealed` 状态，也不表示已在 GitHub 或包索引发布。四个公开示例的证据范围为合成工程验收，不是历史真实市场收益或完整交易执行验收。
+
+| Gate | 当前验收内容 |
+| --- | --- |
+| A | 安装态股票研究、checkpoint 后中断恢复、恢复结果与正常运行一致、篡改结果被拒绝 |
+| C | 四个研究、至少三类 DAG；完整 Result v3、匹配且通过的独立 VerificationResult、独立 Verifier 源码和显式数据窗口 |
+| D | checkpoint 提交和恢复、内容损坏拒绝、金融状态恢复不重复成交与费用 |
+| F | 合成输入下股票/ETF/期货、资金精度、交易语义与 DSR 数学合同 |
+| I/B | 确定性公共 CLI 发现、草稿诊断和四个研究完整执行，不作为真人或陌生 AI 试用证明 |
+| L | 自包含 Result 与 VerificationResult 消费、项目身份隔离、指标或结果篡改拒绝 |
+
+在完整公开源码目录准备好当前构建产物、BuildManifest 和不继承系统包的安装态 Python 后，使用 `tools/run_release_workflows.py --help`、`tools/build_gate_c_evidence.py --help` 和 `tools/run_release_gate_tests.py --help` 查看完整参数。所有验收输出使用不存在的仓库外目录；工作流生产器会在该目录创建合成数据库，执行前取得所在环境要求的写入批准。运行与验证阶段只读访问这些数据库。
+
+Gate D/F/L 使用候选内的 `release/gate-test-protocol.json`，测试源码和协议均进入 BuildManifest。执行时关闭源码导入配置，从仓库外使用安装态 runtime；有失败、跳过或零测试均不生成通过收据。Gate L 的前置 Gate C 必须属于相同候选，不能沿用其他批次的通过记录。
+
+`tools/build_release_envelope.py` 接受六个 `--gate-evidence gate-id=path`，校验候选、BuildManifest 和 Gate 类型，并把原始证据、能力清单、依赖锁与 BuildManifest 一起封存。能力清单和依赖锁必须与构建输入一致。工具中的 `verify_release_envelope_files` 可在搬移目录后复验封套及封存内容；执行日志、测试报告和研究工件另随验收目录保留。
+
+## 能力声明与晋级
+
+当前能力状态由 `src/research_pipeline/capabilities.json` 声明。公开门禁允许已有 `local_only` 能力；任何 `sealed` 声明必须同时给出授权的能力基线、当前候选发布封套、正式执行、负例和独立验证三类可核验记录。证据须覆盖该能力公开承诺的全部范围，不能把四个合成示例外推为分钟交易、费用真实性或任意规模资源保证。
+
+独立公开仓库可通过 `QUANTWITNESS_CAPABILITY_BASELINE`、`QUANTWITNESS_RELEASE_EVIDENCE_ROOT` 和 `QUANTWITNESS_RELEASE_CANDIDATE_ID` 显式提供晋级材料。没有这些材料时，`sealed` 声明会失败；材料存在但候选、源码、测试结果或授权上限不匹配时同样失败。历史证据保留原身份，不自动迁移。

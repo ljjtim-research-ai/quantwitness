@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import subprocess
@@ -9,6 +10,11 @@ import sys
 from typing import Mapping
 
 from research_pipeline.cli.parser import FINAL_COMMANDS, build_parser
+from research_pipeline.operations.capabilities import (
+    CapabilityDiscoveryError, load_capability_manifest,
+    validate_capability_claims, validate_capability_release_evidence,
+)
+from research_pipeline.platform import typed_canonical_hash
 from research_pipeline.operations.capability_containment import (
     CONTAINMENT_GATE_VERSION,
     EVIDENCE_CHECKLIST_VERSION,
@@ -152,20 +158,93 @@ def refresh_remediation_baseline(
     )
 
 
+def evaluate_public_capability_release(
+    *,
+    project_root: str | Path,
+    baseline: Mapping[str, object] | None = None,
+    manifest: Mapping[str, object] | None = None,
+    release_evidence_root: str | Path | None = None,
+    release_candidate_id: str | None = None,
+    as_of: str | None = None,
+) -> dict[str, object]:
+    """公开源码直接消费显式晋级声明，不依赖私有基线的位置。"""
+
+    current = load_capability_manifest() if manifest is None else manifest
+    issues: list[dict[str, object]] = []
+    try:
+        sealed = validate_capability_claims(current)
+    except CapabilityDiscoveryError as exc:
+        return {"status": "fail", "issues": [{"code": "capability_claim_invalid", "message": str(exc)}]}
+    if baseline is not None:
+        build_evidence_checklist(baseline)
+        ranks = {"planned": 0, "local_only": 1, "sealed": 2}
+        descriptors = {item["id"]: item for item in current["capabilities"]}
+        for rule in baseline["containment"]:
+            descriptor = descriptors.get(rule["capability_id"])
+            if descriptor is None or ranks[descriptor["state"]] > ranks[rule["maximum_state"]]:
+                issues.append({"code": "capability_state_exceeds_containment", "capability_id": rule["capability_id"]})
+    if sealed:
+        if baseline is None:
+            issues.append({"code": "promotion_authorization_missing", "capability_ids": sealed})
+        else:
+            rules = {item["capability_id"]: item for item in baseline["containment"]}
+            for identity in sealed:
+                if identity not in rules:
+                    issues.append({"code": "promotion_authorization_missing", "capability_id": identity})
+            if baseline["snapshot"]["capability_manifest"]["payload_hash"] != typed_canonical_hash(current):
+                issues.append({"code": "capability_manifest_drift"})
+        if release_evidence_root is None or not release_candidate_id:
+            issues.append({"code": "promotion_release_evidence_missing"})
+        if not issues:
+            try:
+                validate_capability_release_evidence(
+                    project_root=Path(project_root).resolve(),
+                    evidence_root=Path(release_evidence_root).resolve(),
+                    manifest=current, rules=baseline["containment"],
+                    release_candidate_id=release_candidate_id,
+                    as_of=as_of or datetime.now(timezone.utc).isoformat(),
+                )
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                issues.append({"code": "promotion_release_evidence_invalid", "message": str(exc)})
+    return {"status": "fail" if issues else "pass", "sealed_capabilities": sealed, "issues": issues}
+
+
 def evaluate_capability_containment(
     *,
     repository_root: str | Path,
     baseline: Mapping[str, object],
     manifest: Mapping[str, object] | None = None,
+    release_evidence_root: str | Path | None = None,
+    release_candidate_id: str | None = None,
+    as_of: str | None = None,
 ) -> dict[str, object]:
-    """以当前源码快照执行能力止血门禁。"""
+    """保留源码快照门禁，并要求 sealed 能力消费实际发布证据。"""
 
-    return _evaluate_capability_containment(
+    result = _evaluate_capability_containment(
         repository_root=repository_root,
         baseline=baseline,
         current_snapshot=build_current_snapshot(repository_root),
         manifest=manifest,
     )
+    if result["status"] == "fail" and release_evidence_root is None:
+        return result
+    public = evaluate_public_capability_release(
+        project_root=Path(repository_root) / "research_pipeline", baseline=baseline,
+        manifest=manifest, release_evidence_root=release_evidence_root,
+        release_candidate_id=release_candidate_id, as_of=as_of,
+    )
+    issues = result["issues"]
+    if release_evidence_root is not None:
+        # 独立目录的 v2 收据由实际证据消费者复验，源码和状态上限门禁照常保留。
+        issues = [item for item in issues if not (
+            item["code"].startswith("promotion_evidence_")
+            or item["code"] == "independent_trust_domain_not_distinct"
+        )]
+    if public["issues"]:
+        issues = [*issues, *public["issues"]]
+    body = {key: value for key, value in result.items() if key != "gate_hash"}
+    body.update(status="fail" if issues else "pass", issues=issues)
+    return {**body, "gate_hash": typed_canonical_hash(body)}
 
 
 __all__ = [
@@ -178,6 +257,7 @@ __all__ = [
     "build_current_snapshot",
     "build_evidence_checklist",
     "evaluate_capability_containment",
+    "evaluate_public_capability_release",
     "load_remediation_baseline",
     "refresh_remediation_baseline",
 ]
