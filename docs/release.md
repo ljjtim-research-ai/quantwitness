@@ -74,11 +74,19 @@ v1 的原始 METADATA/RECORD 摘要与 v2 不兼容；验证器拒绝 v1 锁，�
 
 ## PyPI 正式发布
 
-`.github/workflows/publish.yml` 只在推送 `v*` Tag 时运行。Tag 必须是带注释的 Tag，与 `pyproject.toml` 版本完全一致，并指向 `main` 历史中的提交。工作流重新检查公开源码、发布合同和隔离 wheel，只使用本次正式构建 JSON 回执中的 wheel 与 sdist；源码 zip 作为 GitHub Release 附件保留，不上传 PyPI。
+`.github/workflows/publish.yml` 在 GitHub Release 正式发布时运行；草稿、预发布和单独推送 Tag 不上传 PyPI。Tag 使用 `v<版本>`，与 `pyproject.toml` 版本完全一致，并指向 `main` 历史中的提交。支持网页创建的轻量 Tag 和带注释的 Tag，构建固定使用该次 Release 事件的提交。工作流重新检查公开源码、发布合同和隔离 wheel，只使用本次正式构建 JSON 回执中的 wheel 与 sdist；源码 zip 作为 GitHub Release 附件保留，不上传 PyPI。
 
 PyPI 使用 Trusted Publishing。PyPI 项目绑定 GitHub owner `ljjtim`、仓库 `QuantWitness`、工作流 `publish.yml` 和 Environment `pypi`；GitHub 的 `pypi` Environment 负责正式上传前的审批。发布任务只授予 `contents: read` 和 `id-token: write`，仓库不保存 PyPI API Token。上传失败不得使用 `skip-existing` 绕过；已经发布的版本不能用不同文件覆盖，修复后发布新版本。
 
-正式顺序为：合并发布改动，基于最终 `main` 重新生成并复验发布证据，创建并推送 `v<版本>`，批准 `pypi` Environment，等待 PyPI 上传和干净安装验证通过，再使用同一构建产物创建 GitHub Release。GitHub Release 使用 `--verify-tag`，避免在错误提交上隐式创建 Tag。
+网页版发布不需要在本机切换 GitHub 账号或配置 PyPI Token：
+
+1. 合并发布改动，记录最终 `main` 提交及其验收结果；受改动影响的发布证据需重新生成并复验。
+2. 在仓库 **Releases → Draft a new release**，选择 **Choose a tag**，输入 `v1.1.0` 并创建 Tag，**Target** 选择 `main`，确认其当前提交与验收记录一致。标题填写 `QuantWitness 1.1.0`，说明本版本变化，不勾选 **Set as a pre-release**，不手工上传其他批次的发行包。
+3. 点击 **Publish release**，在 **Actions → publish** 查看构建结果。保存草稿不会触发上传。
+4. 构建通过后，由 `pypi` Environment 的指定审批人在 **Review deployments** 中批准上传。
+5. 工作流上传 PyPI，在全新 Python 3.10 环境从正式 PyPI 安装该版本并检查版本、导入位置、依赖和 CLI，再把同一次构建的 wheel、sdist 和源码 zip 自动附到现有 Release。
+
+第 2 步的版本号和标题适用于当前 `1.1.0`；后续版本以 `pyproject.toml` 为准。GitHub Release 页面建立后，PyPI 上传和安装核验可能仍在进行；以 `publish` 工作流三个任务全部通过为发布完成标准。PyPI 上传失败时附件任务不会执行；安装核验或附件上传失败时，PyPI 版本可能已经存在，先查看失败任务，仅重跑失败任务，不重复上传已成功的版本。附件上传不覆盖同名文件。
 
 
 ## 当前候选的本地发布验收
