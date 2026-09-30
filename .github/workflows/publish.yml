@@ -1,9 +1,8 @@
 name: publish
 
 "on":
-  push:
-    tags:
-      - "v*"
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -15,11 +14,17 @@ concurrency:
 jobs:
   build:
     name: Build and verify release
+    if: ${{ !github.event.release.prerelease }}
     runs-on: ubuntu-latest
+    outputs:
+      wheel_name: ${{ steps.release.outputs.wheel_name }}
+      sdist_name: ${{ steps.release.outputs.sdist_name }}
+      source_archive_name: ${{ steps.release.outputs.source_archive_name }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
@@ -44,9 +49,9 @@ jobs:
           if tag != f"v{version}":
               raise SystemExit(f"Tag {tag!r} 与项目版本 {version!r} 不一致")
           PY
-          test "$(git cat-file -t "$GITHUB_REF")" = "tag"
+          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"
           git fetch --no-tags origin main
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          git merge-base --is-ancestor HEAD origin/main
       - name: Check public source inventory
         run: python tools/public_source_inventory.py --project . --check
       - name: Run release contract tests
@@ -81,6 +86,7 @@ jobs:
           with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
               for name, path in paths.items():
                   print(f"{name}={path}", file=output)
+                  print(f"{name}_name={path.name}", file=output)
           PY
       - name: Verify isolated wheel
         shell: bash
@@ -129,3 +135,56 @@ jobs:
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
         with:
           packages-dir: dist
+
+  finalize-release:
+    name: Verify PyPI installation and attach release assets
+    needs: [build, publish-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Set up minimum supported Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.10"
+      - name: Verify clean PyPI installation
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python -m venv "$RUNNER_TEMP/quantwitness-pypi-env"
+          python_bin="$RUNNER_TEMP/quantwitness-pypi-env/bin/python"
+          "$python_bin" -m pip install --no-cache-dir --index-url https://pypi.org/simple "quantwitness==${RELEASE_TAG#v}"
+          "$python_bin" -m pip check
+          cd "$RUNNER_TEMP"
+          "$python_bin" - <<'PY'
+          import importlib.metadata
+          import os
+          from pathlib import Path
+          import sys
+          import research_pipeline
+
+          assert importlib.metadata.version("quantwitness") == os.environ["RELEASE_TAG"][1:]
+          assert Path(research_pipeline.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
+          PY
+          "$RUNNER_TEMP/quantwitness-pypi-env/bin/quantwitness" --help
+      - name: Download Python distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: python-distributions
+          path: dist
+      - name: Download source archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: source-archive
+          path: dist
+      - name: Attach verified release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          WHEEL_PATH: dist/${{ needs.build.outputs.wheel_name }}
+          SDIST_PATH: dist/${{ needs.build.outputs.sdist_name }}
+          SOURCE_ARCHIVE_PATH: dist/${{ needs.build.outputs.source_archive_name }}
+        run: gh release upload "$RELEASE_TAG" "$WHEEL_PATH" "$SDIST_PATH" "$SOURCE_ARCHIVE_PATH"
