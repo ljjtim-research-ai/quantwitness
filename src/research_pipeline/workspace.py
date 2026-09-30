@@ -95,10 +95,22 @@ def initialize_workspace(
     *,
     workspace_id: str | None = None,
     allow_existing: bool = False,
+    from_package: str | Path | None = None,
 ) -> WorkspaceConfig:
     """在仓库外初始化工作区，不触碰数据库或数据文件。"""
 
     target = Path(root).expanduser().absolute()
+    source_package = None
+    if from_package is not None:
+        from .packages.store import load_research_package, validate_research_package_layout
+
+        if target.exists():
+            raise WorkspaceError("复制研究包时工作区目标必须不存在")
+        source_package = Path(from_package).resolve()
+        if target.resolve().is_relative_to(source_package):
+            raise WorkspaceError("工作区目标不能位于来源研究包内")
+        validate_research_package_layout(source_package)
+        load_research_package(source_package)
     if target.exists():
         if not target.is_dir():
             raise WorkspaceError("工作区根路径必须是目录")
@@ -122,7 +134,15 @@ def initialize_workspace(
             ".research/dashboard",
         ):
             (target / relative).mkdir(parents=True, exist_ok=False)
-        initialize_research_package(package_root)
+        if source_package is None:
+            initialize_research_package(package_root)
+        else:
+            from .packages.store import PACKAGE_FILES as DECLARATION_FILES
+
+            for relative in DECLARATION_FILES:
+                destination = package_root / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source_package / relative, destination)
         _write_text_exclusive(
             target / WORKSPACE_FILE,
             _yaml_text({
@@ -432,8 +452,12 @@ def export_dashboard_manifest(root: str | Path) -> dict[str, Any]:
         if context.verification.status != "pass":
             continue
         reference = context.verification.result_reference
+        recorded_run_ids = {
+            item[key] for key in ("run_id", "runtime_run_id")
+            if item.get(key) is not None
+        }
         if (
-            reference.run_id != item.get("run_id")
+            recorded_run_ids != {reference.run_id}
             or reference.result_id != item.get("result_id")
         ):
             continue

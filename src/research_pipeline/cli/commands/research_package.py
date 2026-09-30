@@ -112,6 +112,11 @@ def _execute(args) -> dict[str, object]:
         verify_package_source_provenance,
     )
 
+    if args.package_command == "lint":
+        from research_pipeline.packages.lint import validate_lint_declarations
+
+        validate_lint_declarations(args.package)
+
     package = load_research_package(args.package)
     source_verification = verify_package_source_provenance(
         package,
@@ -253,6 +258,10 @@ def _declared_resource_summary(plan, registry) -> dict[str, object]:
     """只汇总 OperatorDefinition 已声明预算，不猜运行规模或修改研究语义。"""
     if registry is None:
         raise ValueError("package lint 缺少算子注册表")
+    from research_pipeline.extensions.project_admission import ProjectOperatorImplementationToken
+    from research_pipeline.runtime.operator_definitions import build_mainline_operator_manifest
+
+    manifest = build_mainline_operator_manifest()
     specifications = {
         (item.operator_id, item.operator_version): item
         for item in registry.operator_specs
@@ -264,11 +273,19 @@ def _declared_resource_summary(plan, registry) -> dict[str, object]:
             raise ValueError(
                 f"package lint 缺少算子资源声明: {node.operator_id}@{node.operator_version}"
             )
+        binding = registry.binding(node.operator_id, node.operator_version)
+        if isinstance(binding.implementation_token, ProjectOperatorImplementationToken):
+            implementation_scope = "project"
+        else:
+            implementation_scope = manifest.require_operator(
+                node.operator_id, node.operator_version,
+            ).implementation_ref.implementation_scope
         nodes.append(
             {
                 "node_id": node.node_id,
                 "operator_id": node.operator_id,
                 "operator_version": node.operator_version,
+                "implementation_scope": implementation_scope,
                 "resource_profile": dict(specification.resource_profile),
             }
         )

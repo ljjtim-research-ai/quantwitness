@@ -49,6 +49,7 @@ PUBLIC_ROOT_FILES = (
     "pyproject.toml",
 )
 PUBLIC_DOC_FILES = (
+    "docs/framework-contracts.md",
     "docs/ai_workflow.md",
     "docs/architecture.md",
     "docs/catalog.md",
@@ -56,6 +57,7 @@ PUBLIC_DOC_FILES = (
     "docs/data_plane.md",
     "docs/evidence.md",
     "docs/getting-started.md",
+    "docs/workspace-quickstart.md",
     "docs/index.md",
     "docs/minute_rule_provenance.md",
     "docs/operations.md",
@@ -105,6 +107,16 @@ PUBLIC_TEST_FILES = (
     "tests/test_public_release_gates.py",
     "tests/test_public_source_inventory.py",
     "tests/test_release_metadata_ssot.py",
+    "tests/test_workspace.py",
+    "tests/test_workspace_flow.py",
+    "tests/test_package_diagnostics.py",
+    "tests/test_cli_summary.py",
+    "tests/test_process_budget_advice.py",
+    "tests/test_verifier_resource_diagnostics.py",
+    "tests/test_dsr_formula.py",
+    "tests/test_cli_failure_details.py",
+    "tests/test_dependency_distribution_identity.py",
+    "tests/test_dependency_identity_recovery.py",
 )
 PUBLIC_TOOL_FILES = (
     *BUILD_SUPPORT_FILES,
@@ -358,7 +370,7 @@ def file_digests(project: Path, paths: Iterable[str]) -> dict[str, str]:
     }
 
 
-def _is_current_package_path(path: str, *, current_lock: str) -> bool:
+def _is_current_package_path(path: str, *, current_lock: str | None) -> bool:
     normalized = _validate_relative(path)
     relative = PurePosixPath(normalized)
     if relative.parts[:2] == ("src", "factor_contracts"):
@@ -377,7 +389,8 @@ def _is_current_package_path(path: str, *, current_lock: str) -> bool:
 def _tracked_package_paths(project: Path) -> set[str]:
     """返回 Git 已跟踪的当前包文件，包含工作区中已删除的文件。"""
 
-    current = current_catalog_lock_name(project)
+    current_file = project / "src/research_pipeline/catalog/default_lock/CURRENT"
+    current = current_catalog_lock_name(project) if current_file.is_file() else None
     completed = subprocess.run(
         [
             "git", "-C", str(project), "ls-files", "-z", "--",

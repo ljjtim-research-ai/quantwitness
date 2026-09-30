@@ -1,5 +1,7 @@
 # 示例目录
 
+推荐从 `equity_cross_section/` 开始，按 [Workspace 合成研究入门](../docs/workspace-quickstart.md) 完成第一次报告和样本变体比较。其余三个项目展示不同研究类型的扩展方式。这里的可执行文件随完整公开源码提供，wheel 不包含示例源码。
+
 这里放四个可以独立分发的合成研究项目：
 
 - `equity_cross_section/`：股票横截面排序与事后收益差；
@@ -11,7 +13,7 @@
 
 这些项目各自提供已填写的 ResearchPackage，不从 `package init` 草稿继承研究身份、数据请求或图节点。
 
-四个示例的项目节点统一声明 1 GiB 内存，覆盖 Supervisor、Worker 及其后代，并为 Python 和数值库的启动开销预留空间；其他额度为 1 CPU、3 个进程槽、64 MiB 临时空间和 60 秒。该预算仍由 Runtime 强制检查，超额时停止执行并返回实测值与限额。
+四个示例的项目节点统一声明 1 GiB 内存，覆盖 Supervisor、Worker 及其后代，并为 Python 和数值库的启动开销预留空间；其他额度为 1 CPU、4 个进程槽、64 MiB 临时空间和 60 秒。4 个进程槽覆盖 Supervisor、Windows venv 启动器、实际 Worker，以及环境身份采集可能短暂启动的系统版本查询进程。该预算仍由 Runtime 强制检查，超额时停止执行并返回实测值与限额。
 
 合成数据和项目源码随 QuantWitness 以 Apache-2.0 发布，不代表真实市场，不提供投资建议。四个项目已在一次性合成 DuckDB 与临时 Catalog Lock 上完成 `package lint → admit → run → Result → verify → VerificationResult → report` 验收；验收会写临时环境和结果工件，但准入与运行不会修改合成数据库。它不替代真实市场、费用或实盘验收。
 

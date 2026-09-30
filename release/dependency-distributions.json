@@ -1,37 +1,37 @@
 {
-  "contract_version": "research-dependency-distribution-lock-v1",
+  "contract_version": "research-dependency-distribution-lock-v2",
   "platform": "windows",
   "python_cache_tag": "cpython-310",
   "distributions": [
     {
       "name": "pandas",
       "version": "2.3.1",
-      "distribution_digest": "52325aeab3c396937b10cbcd95ec1ad9a6cfeee80d77ffa89734f96c6a97dbaf"
+      "distribution_digest": "1a41f2b80f603f9c18670dfdabc28fef59641e92c8f91d3d631e64adc7a762d9"
     },
     {
       "name": "numpy",
       "version": "2.2.6",
-      "distribution_digest": "c0dfebe1b5b8fd369305ae627b9fcaaba8c686e94c77310c236d3a8c20e8eeed"
+      "distribution_digest": "4d31c6897ed3220bf0ed44353a82ab54539894d8926be4962163ad5a78d3048a"
     },
     {
       "name": "duckdb",
       "version": "1.5.5",
-      "distribution_digest": "474b594c4fb1d1526d16a8d4b6068d8b364101cdc385bceb1803d3a2d42549d2"
+      "distribution_digest": "568e3642f6a41d093ab741e80ef270db973186908e1824b371f0fe83ff4932e3"
     },
     {
       "name": "PyYAML",
       "version": "6.0.3",
-      "distribution_digest": "d8dd9d6a48776e5ba2655ef2f142254f616525c9c66d24626b3ebd7176e0805a"
+      "distribution_digest": "881525fb72fd97986d9e4001d8dcf10738d86c5952cb21b3ba70a8dd3a9e0e14"
     },
     {
       "name": "psutil",
       "version": "7.0.0",
-      "distribution_digest": "fc48f9650d82ec68e95f33058fe0e99994d1ac0b22e295caa6dddd3b2001dcb0"
+      "distribution_digest": "867e06dda13af7be6564dd087770ec69d63896a43c17545b7855b3090b0cd26a"
     },
     {
       "name": "pyarrow",
       "version": "21.0.0",
-      "distribution_digest": "5d3a0ac921947eae4afc39db2e729bb3f66355fd8b6471e9363152978c27764d"
+      "distribution_digest": "911d589606fe739df39020fd0758332f38a83d865ee48e856fd49b33d5b3f797"
     }
   ]
 }

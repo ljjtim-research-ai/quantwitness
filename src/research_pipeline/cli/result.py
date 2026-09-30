@@ -10,6 +10,7 @@ from typing import Any
 from research_pipeline.platform import error_code_for_exception
 
 from .command_suggestion import command_suggestion
+from .summary import build_summary, render_summary_text, summary_payload
 
 
 CLI_RESULT_VERSION = "research-cli-result-v1"
@@ -101,23 +102,37 @@ def emit(
     error_code: str | None = None,
     message: str | None = None,
 ) -> int:
+    summary = build_summary(
+        args, status=status, data=data, error_code=error_code,
+    )
     payload = {
         "contract_version": CLI_RESULT_VERSION,
         "status": status,
         "error_code": error_code,
         "message": message,
         "data": data,
+        "summary": summary,
     }
     if getattr(args, "json", False):
         write_machine_json(payload)
+    elif getattr(args, "summary", False):
+        write_machine_json(summary_payload(
+            contract_version=CLI_RESULT_VERSION, summary=summary, data=data,
+            error_code=error_code, message=message,
+        ))
     else:
-        print(f"status: {status}")
-        if error_code:
-            print(f"error_code: {error_code}")
-        if message:
-            print(f"message: {message}")
-        if data is not None:
-            print(json.dumps(data, ensure_ascii=False, sort_keys=True))
+        print(render_summary_text(summary, data=data, error_code=error_code, message=message))
+        command = getattr(args, "command", None)
+        action = getattr(args, "workspace_command", None) if command == "workspace" else command
+        concise = action in {"run", "resume", "retry-node", "rerun-from", "verify"}
+        concise = concise or command == "inspect"
+        concise = concise or (command == "workspace" and action == "execute")
+        # 发现和文档命令的正文就是请求结果，不能只保留状态。
+        if not concise and data is not None:
+            if command == "report" and isinstance(data, dict) and "report" in data:
+                print(data["report"])
+            else:
+                print(json.dumps(data, ensure_ascii=False, sort_keys=True, indent=2))
     return code
 
 

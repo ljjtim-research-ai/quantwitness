@@ -27,13 +27,13 @@ python tools/build_release_artifacts.py --project . --output <不存在的仓库
 
 人工发布只使用本次命令 JSON 回执中的 `wheel`、`sdist` 和 `source_archive` 绝对路径，并记录候选提交及库存验收结果。确认新目录恰好包含这三件文件；混入第二个 wheel 不得发布。历史 `dist/` 文件不属于本次候选，不能按通配符选择，更不能以旧文件代替当前源码构建。
 
-干净 wheel 验收需要调用方显式提供一个持久 Catalog Lock，供安装后资源读取测试使用；它不是发行包资源。验收还检查公共 Recipe 为空、`package init` 可用；新建中性草稿的 `lint` 必须返回 exit=1，且 JSON 中 `status=fail`、`error_code=research_package_invalid` 并明确指出 sources 为空。意外成功、其他错误或无效 JSON 都使验收失败：
+干净 wheel 验收创建不继承系统包的 venv。调用方须显式提供离线 wheelhouse，包含 `release/dependency-distributions.json` 中锁定版本的 Windows/Python 3.10 wheel 及其传递依赖；脚本先安装这些依赖，再安装本次 wheel，执行 `pip check` 和锁定版本、字节核验。依赖缺失或不匹配会失败，不能由系统环境补齐。还需显式提供一个持久 Catalog Lock，供安装后资源读取测试使用；它不是发行包资源。验收还检查公共 Recipe 为空、`package init` 可用；新建中性草稿的 `lint` 必须返回 exit=1，且 JSON 中 `status=fail`、`error_code=research_package_invalid` 并明确指出 sources 为空。意外成功、其他错误或无效 JSON 都使验收失败：
 
 ```powershell
-./scripts/verify_clean_wheel.ps1 -Wheel <wheel路径> -ReceiptOut <仓库外新收据路径> -CatalogLock <持久Catalog-Lock目录>
+./scripts/verify_clean_wheel.ps1 -Wheel <wheel路径> -ReceiptOut <仓库外新收据路径> -CatalogLock <持久Catalog-Lock目录> -Wheelhouse <离线wheelhouse目录>
 ```
 
-直接在完整工作树运行标准构建不承担正式 allowlist 筛选；正式交付使用上面的 staging 工具。历史 release 证据不随当前构建覆盖，工作树未提交时也不能把测试构建称为干净发布候选。
+直接在完整工作树运行标准构建不承担正式 allowlist 筛选；正式交付使用上面的 staging 工具。历史 release 证据不随当前构建覆盖，工作树未提交时也不能把测试构建称为干净发布候选。BuildManifest 的源码检查支持不含私有 Catalog 的独立公开仓库，并继续拒绝未提交的包文件删除或修改。收据复验器从显式传入的 wheel METADATA 读取版本，与安装后的 CLI 版本精确比较；中性草稿 lint 记录必须为预期失败且 exit=1。
 
 ## 最低版本验收
 
@@ -48,9 +48,21 @@ $env:RP_RELEASE_WHEELHOUSE = "<包含运行、test、dev 和 build 依赖的 whe
 python -m pytest tests/test_release_metadata_ssot.py -q
 ```
 
-测试解释器也需安装 test extras。缺少最低版本解释器或离线依赖时验收失败，不能跳过。发布依赖锁仍按其记录的实际 distribution 版本和字节核验；干净环境安装 pyproject 所允许的新版本不等于满足某份历史发布锁。
+测试解释器也需安装 test extras。缺少最低版本解释器或离线依赖时验收失败，不能跳过。干净环境安装 pyproject 所允许的新版本不等于满足当前发布锁。
+
+## 依赖分发身份
+
+当前依赖锁使用 `research-dependency-distribution-lock-v2`。身份绑定 distribution 名称、版本、METADATA、入口声明及排序后的分发内容 RECORD，包含源码、二进制扩展、包数据与分发自带的有摘要字节码。它不绑定安装器生成的 INSTALLER、REQUESTED、direct_url.json、自身 RECORD 条目和没有摘要/大小的安装字节码。
+
+入口包装器只有同时满足两个条件才不进入身份：属于 console_scripts/gui_scripts 的已声明入口，且安装在当前解释器的 scripts 目录。包内同名程序、未声明的脚本和其他文件仍参与身份。这样同一分发包安装到不同路径时身份保持一致，分发内容记录或入口声明变化仍改变身份。该检查使用安装分发清单，不逐次重新扫描所有依赖文件；手工改动已安装文件而不更新其分发记录，不属于依赖锁能独立发现的变化。
+
+v1 的原始 METADATA/RECORD 摘要与 v2 不兼容；验证器拒绝 v1 锁，不能只改合同版本字段或把旧摘要填进新锁。升级时按可信的同版本分发包重新安装并建立 v2 锁，再执行干净 wheel 脚本和收据复验。旧 BuildManifest、Result 和 VerificationResult 保留原字节，恢复与跨运行复用边界见 [Runtime](runtime.md)。
 
 ## 公开仓库 CI
+
+`tests/test_workspace.py`、`tests/test_cli_failure_details.py` 及依赖身份、恢复边界回归随公开源码分发。公开 CI 在源码环境及隔离 wheel 环境均执行两者，覆盖 Workspace 布局、运行与恢复委托、复用参数转发、无效组合拒绝和 Verifier 进程槽参数转发。
+
+公开 CI 运行于 Ubuntu。Windows venv 的 Verifier 启动器可能增加进程层级，独立验证可显式传入 `--verification-process-slots 3`；省略时默认仍为 2，详见 [Workspace 合成研究入门](workspace-quickstart.md) 和[资源预算](project_resource_budgets.md)。
 
 公开 `ci` 保留 Python 3.10 与 3.13 矩阵，检查公开源码清单、框架边界、公共 Operator 的内建身份和未经批准的晋级，以及首次公开时能力不得自称 `sealed`。每个矩阵环境都从正式 allowlist 构建 wheel，在独立虚拟环境安装，从仓库外检查导入位置，并在临时合成 DuckDB 上运行四个示例的 `lint → admit → run → Result → verify → VerificationResult → report` 闭环。完整整改基线依赖父仓库材料，不进入公开候选；公开 CI 的能力状态限制以独立仓库可执行的门禁为准。
 
