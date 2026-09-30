@@ -40,7 +40,7 @@ python -m research_pipeline --help
 - 当前没有公共 Recipe；完整研究由项目声明，已有算法可复用，缺少的算法按[项目扩展合同](project_extensions/README.md)提供可信本地代码。扩展执行环境不是安全沙箱。
 - 研究数据库始终只读。财报、成分、行业、ST、停牌、复权和市场规则必须按当时可见的日期对齐；盘中研究只使用已完成的 bar。
 - 运行成功不等于研究结论可信，需要读取独立 VerificationResult 的状态；金融口径、准确性与验证边界见[结果与独立验证](docs/evidence.md)。框架不是交易执行平台，不承诺策略盈利或实盘可交易。
-- 能力适用范围以机器清单和[分钟参考规则](docs/minute_rule_provenance.md)为准。`planned` 只能发现，`local_only` 不代表已通过独立发布验收；不承诺全历史、全品种覆盖。
+- 能力适用范围以机器清单和[分钟参考规则](docs/minute_rule_provenance.md)为准。发布验收与逐项晋级条件见[安装与发布构建](docs/release.md)。`planned` 只能发现，`local_only` 不代表已通过独立发布验收；不承诺全历史、全品种覆盖。
 
 ### 能力状态
 

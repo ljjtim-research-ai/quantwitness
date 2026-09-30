@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import subprocess
 from pathlib import Path, PurePosixPath
 from zipfile import BadZipFile, ZipFile
 
@@ -160,6 +161,46 @@ def verify_wheel_source_inventory(*, project: Path, wheel: Path) -> dict[str, ob
         "inventory_sha256": _digest(expected),
     }
 
+
+
+def verify_installed_source_inventory(*, python: Path, project: Path, cwd: Path) -> dict[str, object]:
+    """在指定解释器核对安装包实际字节与候选，拒绝同版本旧安装。"""
+
+    program = """
+import hashlib, importlib.metadata as m, json, pathlib, sys
+import research_pipeline
+from research_pipeline.platform import verify_dependency_distribution_lock
+root = pathlib.Path(research_pipeline.__file__).resolve()
+prefix = pathlib.Path(sys.prefix).resolve()
+assert sys.prefix != sys.base_prefix and root.is_relative_to(prefix)
+distribution = m.distribution('quantwitness')
+direct = json.loads(distribution.read_text('direct_url.json') or '{}')
+assert not direct.get('dir_info', {}).get('editable', False)
+files = {}
+for relative in distribution.files:
+    name = relative.as_posix()
+    if name.split('/')[0] not in ('research_pipeline', 'factor_contracts'):
+        continue
+    if name.endswith('.pyc') or '__pycache__' in name.split('/'):
+        continue
+    files[name] = hashlib.sha256(distribution.locate_file(relative).read_bytes()).hexdigest()
+verify_dependency_distribution_lock(sys.argv[1])
+print(json.dumps({'files':files, 'module':str(root), 'prefix':str(prefix)}))
+"""
+    result = subprocess.run(
+        [str(python), "-I", "-c", program, str(project / "release/dependency-distributions.json")],
+        cwd=cwd, capture_output=True, text=True, encoding="utf-8", check=False,
+    )
+    if result.returncode:
+        raise ValueError(f"安装态包或依赖身份无法确认: {result.stderr}")
+    payload = json.loads(result.stdout)
+    expected = _source_package_files(project)
+    if payload["files"] != expected:
+        raise ValueError("安装态包内容与当前候选不一致")
+    if Path(payload["module"]).is_relative_to(project / "src"):
+        raise ValueError("安装态导入来源错误")
+    return {"status": "pass", "module": payload["module"], "prefix": payload["prefix"],
+            "inventory_sha256": _digest(expected), "package_file_count": len(expected)}
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="核对 wheel 与源码代码/package data 清单")

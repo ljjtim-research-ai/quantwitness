@@ -1,0 +1,27 @@
+{
+  "contract_version": "research-gate-a-protocol-v2",
+  "protocol_id": "gate-a.installed-synthetic-lifecycle.v2",
+  "reference": "equity_cross_section",
+  "data_scope": "synthetic",
+  "producer": "tools/run_release_workflows.py",
+  "required_stages": [
+    "runtime_is_installed_wheel",
+    "package_linted",
+    "package_admitted",
+    "killed_after_committed_checkpoint",
+    "required_checkpoints_reused",
+    "runtime_succeeded",
+    "one_formal_result_bundle",
+    "independent_verifier_passed",
+    "result_tables_match_uninterrupted_run",
+    "tampered_result_rejected",
+    "database_unchanged"
+  ],
+  "checkpoint_cases": {
+    "admission": "platform.catalog.admission",
+    "data_plane": "data_plane",
+    "feature": "project_analysis"
+  },
+  "result_comparison": "exact_arrow_tables",
+  "maximum_command_wall_seconds": 300
+}

@@ -47,6 +47,11 @@ jobs:
           tests/test_framework_intrusion_gate.py
           tests/test_public_operator_governance.py
           tests/test_public_release_gates.py
+          tests/test_release_envelope.py
+          tests/test_release_gate_runner.py
+          tests/test_capability_release_evidence.py
+          tests/test_release_workflows.py
+          tests/test_gate_c_evidence.py
           tests/test_workspace.py
           tests/test_workspace_flow.py
           tests/test_package_diagnostics.py

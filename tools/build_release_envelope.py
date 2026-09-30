@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import shutil
 from pathlib import Path
 import sys
 
@@ -37,6 +38,9 @@ def _load_pass_evidence(
     *,
     release_candidate_id: str,
     build_manifest_hash: str,
+    gate_id: str | None = None,
+    protocol: dict[str, object] | None = None,
+    protocol_hash: str | None = None,
 ) -> str:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -51,6 +55,42 @@ def _load_pass_evidence(
         or payload.get("build_manifest_hash") != build_manifest_hash
     ):
         raise ValueError(f"Gate evidence 未绑定当前 clean RC 或未明确通过: {path}")
+    if gate_id is not None and payload.get("gate_id") != gate_id:
+        raise ValueError("Gate evidence 类型与收据不一致")
+    if gate_id is not None:
+        versions = {
+            "gate-a": "research-release-workflow-evidence-v1",
+            "gate-i-b": "research-release-workflow-evidence-v1",
+            "gate-c": "research-gate-c-evidence-v2",
+            "gate-d": "research-release-gate-test-evidence-v2",
+            "gate-f": "research-release-gate-test-evidence-v2",
+            "gate-l": "research-release-gate-test-evidence-v2",
+        }
+        if payload.get("contract_version") != versions[gate_id]:
+            raise ValueError("Gate evidence 协议版本不受支持")
+        if gate_id in {"gate-d", "gate-f", "gate-l"}:
+            counts = payload.get("pytest", {})
+            if (type(counts.get("tests")) is not int or counts["tests"] <= 0
+                    or any(counts.get(key) != 0 for key in ("failures", "errors", "skipped"))):
+                raise ValueError("Gate 测试必须实际执行且没有失败或跳过")
+            if protocol is not None and (
+                payload.get("selectors") != protocol["gates"][gate_id]["selectors"]
+                or payload.get("protocol_hash") != protocol_hash
+            ):
+                raise ValueError("Gate 测试选择器未绑定冻结协议")
+        elif gate_id in {"gate-a", "gate-i-b"}:
+            checks = payload.get("checks")
+            required = {"installed_origin", "installed_candidate_content", "discovery_and_neutral_draft",
+                        "checkpoint_recovery", "result_tamper_rejected", "database_unchanged"}
+            required.update("workflow:" + name for name in (
+                "equity_cross_section", "etf_time_series", "event_study", "futures_term_structure"))
+            if (not isinstance(checks, dict) or not required <= checks.keys()
+                    or any(not isinstance(item, dict) or item.get("status") != "pass" for item in checks.values())):
+                raise ValueError("Gate 工作流检查缺失或失败")
+        elif (payload.get("reference_count") != 4 or payload.get("independent_oracle_count") != 4
+              or payload.get("dag_family_count", 0) < 3
+              or not payload.get("each_successful_run_has_one_result_bundle")):
+            raise ValueError("Gate C 四研究与独立验证不完整")
     return _sha256(path)
 
 
@@ -92,6 +132,16 @@ def build_release_envelope_files(
     if dict(manifest.dependency_distribution_digests) != dict(verified_dependencies):
         raise ValueError("BuildManifest 与当前依赖 distribution lock 不一致")
 
+    if manifest.input_digests.get("src/research_pipeline/capabilities.json") != _sha256(capabilities_path):
+        raise ValueError("能力清单未绑定当前 BuildManifest")
+    if manifest.input_digests.get("release/dependency-distributions.json") != _sha256(dependency_lock_path):
+        raise ValueError("依赖锁未绑定当前 BuildManifest")
+
+    protocol_path = PROJECT_ROOT / "release/gate-test-protocol.json"
+    protocol_hash = _sha256(protocol_path)
+    if manifest.input_digests.get("release/gate-test-protocol.json") != protocol_hash:
+        raise ValueError("冻结测试协议未绑定当前 BuildManifest")
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
     receipts = tuple(
         ReleaseGateReceipt.build(
             gate_id=gate_id,
@@ -102,6 +152,7 @@ def build_release_envelope_files(
                     gate_paths[gate_id],
                     release_candidate_id=candidate_id,
                     build_manifest_hash=manifest.manifest_hash,
+                    gate_id=gate_id, protocol=protocol, protocol_hash=protocol_hash,
                 )
             },
             issued_at=issued_at,
@@ -139,7 +190,14 @@ def build_release_envelope_files(
     output.mkdir(parents=True)
     receipts_dir = output / "receipts"
     receipts_dir.mkdir()
+    evidence_dir = output / "evidence"
+    evidence_dir.mkdir()
+    shutil.copyfile(protocol_path, output / "gate-test-protocol.json")
+    shutil.copyfile(manifest_path, output / "build-manifest.json")
+    shutil.copyfile(capabilities_path, output / "capabilities.json")
+    shutil.copyfile(dependency_lock_path, output / "dependency-lock.json")
     for receipt in receipts:
+        shutil.copyfile(gate_paths[receipt.gate_id], evidence_dir / f"{receipt.gate_id}.json")
         (receipts_dir / f"{receipt.gate_id}.json").write_text(
             canonical_json(receipt.to_dict()),
             encoding="utf-8",
@@ -152,6 +210,48 @@ def build_release_envelope_files(
         canonical_json(envelope.to_dict()),
         encoding="utf-8",
     )
+    verify_release_envelope_files(output, as_of=issued_at)
+    return envelope
+
+
+def verify_release_envelope_files(directory: Path, *, as_of: str) -> ReleaseEnvelope:
+    """复验封套、收据与封存的原始 Gate 证据，不依赖原工作目录。"""
+
+    def load(relative: str) -> dict[str, object]:
+        return json.loads((directory / relative).read_text(encoding="utf-8"))
+
+    manifest = load_build_manifest(directory / "build-manifest.json")
+    envelope = ReleaseEnvelope.from_dict(load("release-envelope.json"))
+    acceptance = ReleaseAcceptanceInput.from_dict(load("acceptance-input.json"))
+    receipts = tuple(
+        ReleaseGateReceipt.from_dict(load(f"receipts/{gate_id}.json"))
+        for gate_id in REQUIRED_GATE_IDS
+    )
+    verify_release_envelope(
+        envelope, manifest=manifest, receipts=receipts,
+        acceptance=acceptance, as_of=as_of,
+    )
+    if envelope.capabilities_digest != _sha256(directory / "capabilities.json"):
+        raise ValueError("封套能力清单内容不一致")
+    if envelope.dependency_lock_digest != _sha256(directory / "dependency-lock.json"):
+        raise ValueError("封套依赖锁内容不一致")
+    if manifest.input_digests.get("src/research_pipeline/capabilities.json") != envelope.capabilities_digest:
+        raise ValueError("能力清单未绑定当前 BuildManifest")
+    if manifest.input_digests.get("release/dependency-distributions.json") != envelope.dependency_lock_digest:
+        raise ValueError("依赖锁未绑定当前 BuildManifest")
+    protocol = load("gate-test-protocol.json")
+    protocol_hash = _sha256(directory / "gate-test-protocol.json")
+    if manifest.input_digests.get("release/gate-test-protocol.json") != protocol_hash:
+        raise ValueError("冻结测试协议未绑定当前 BuildManifest")
+    for receipt in receipts:
+        digest = _load_pass_evidence(
+            directory / f"evidence/{receipt.gate_id}.json",
+            release_candidate_id=envelope.release_candidate_id,
+            build_manifest_hash=manifest.manifest_hash, gate_id=receipt.gate_id,
+            protocol=protocol, protocol_hash=protocol_hash,
+        )
+        if receipt.evidence_hashes.get("acceptance") != digest:
+            raise ValueError("封套 Gate 证据内容不一致")
     return envelope
 
 

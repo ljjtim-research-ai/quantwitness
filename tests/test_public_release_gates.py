@@ -1,21 +1,27 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import yaml
 
-from research_pipeline.operations.capabilities import load_capability_manifest
+from research_pipeline.cli.capability_containment import (
+    evaluate_public_capability_release, load_remediation_baseline,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_initial_public_release_does_not_claim_sealed_capabilities() -> None:
-    capabilities = load_capability_manifest()["capabilities"]
-    assert capabilities
-    assert all(item["state"] in {"planned", "local_only"} for item in capabilities)
-    assert all(item["trust_level"] != "sealed" for item in capabilities)
-    assert all(item["evidence_level"] != "sealed_release_acceptance" for item in capabilities)
+def test_public_release_requires_actual_evidence_for_sealed_capabilities() -> None:
+    baseline_path = os.environ.get("QUANTWITNESS_CAPABILITY_BASELINE")
+    result = evaluate_public_capability_release(
+        project_root=ROOT,
+        baseline=load_remediation_baseline(baseline_path) if baseline_path else None,
+        release_evidence_root=os.environ.get("QUANTWITNESS_RELEASE_EVIDENCE_ROOT"),
+        release_candidate_id=os.environ.get("QUANTWITNESS_RELEASE_CANDIDATE_ID"),
+    )
+    assert result["status"] == "pass", result["issues"]
 
 
 def test_public_ci_uses_example_dependency_lock_and_current_build_receipt() -> None:

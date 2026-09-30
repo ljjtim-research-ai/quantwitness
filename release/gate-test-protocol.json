@@ -1,0 +1,33 @@
+{
+  "contract_version": "research-release-gate-test-protocol-v2",
+  "gates": {
+    "gate-d": {
+      "selectors": [
+        "tests/test_runtime_checkpoint.py",
+        "tests/test_financial_checkpoint_recovery.py::test_financial_checkpoint_resume_does_not_repeat_fill_fee_or_ledger_event",
+        "tests/test_financial_checkpoint_recovery.py::test_corrupt_financial_checkpoint_is_never_reused"
+      ],
+      "required_files": []
+    },
+    "gate-f": {
+      "selectors": [
+        "tests/test_financial_values.py",
+        "tests/test_cn_stock_simulation.py",
+        "tests/test_cn_etf_simulation.py",
+        "tests/test_cn_futures_simulation.py",
+        "tests/test_simulation_semantics.py",
+        "tests/test_dsr_formula.py"
+      ],
+      "required_files": []
+    },
+    "gate-l": {
+      "selectors": [
+        "tests/test_generic_lifecycle.py",
+        "tests/test_result_bundle.py::test_result_survives_run_root_deletion_and_reads_each_parquet_once",
+        "tests/test_result_bundle.py::test_result_bundle_rejects_rehashed_table_manifest_drift"
+      ],
+      "required_files": [],
+      "prerequisite_gate": "gate-c"
+    }
+  }
+}
