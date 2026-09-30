@@ -27,8 +27,13 @@ def _execute(args) -> dict[str, object]:
             args.root,
             workspace_id=args.workspace_id,
             allow_existing=args.allow_existing,
+            from_package=getattr(args, "from_package", None),
         )
         return {"workspace_id": config.workspace_id, "root": str(config.root), "status": "initialized"}
+    if args.workspace_command == "execute":
+        from .workspace_flow import execute_workspace
+
+        return execute_workspace(args)
     if args.workspace_command == "validate":
         result = validate_workspace(args.workspace)
         if result["status"] == "fail":
@@ -48,6 +53,13 @@ def _execute(args) -> dict[str, object]:
     if args.workspace_command == "rebuild-index":
         return rebuild_workspace_index(args.workspace)
     if args.workspace_command == "run":
+        def run_with_diagnostics(runtime_args):
+            from . import research_run
+
+            # 服务已校验 execution；将实际运行目录交给统一异常投影。
+            args.run_root = runtime_args.run_root
+            return research_run._execute(runtime_args)
+
         source_dbs = list(getattr(args, "source_db", []))
         return run_workspace_execution(
             args.workspace,
@@ -67,12 +79,25 @@ def _execute(args) -> dict[str, object]:
             resource_stale_seconds=args.resource_stale_seconds,
             source_db=source_dbs,
             minute_data_root=args.minute_data_root,
+            reuse_run_root=args.reuse_run_root,
+            require_reused_node=args.require_reused_node,
+            reuse_failed_run_root=args.reuse_failed_run_root,
+            handler=run_with_diagnostics,
         )
     if args.workspace_command in {"resume", "retry-node"}:
+        def resume_with_diagnostics(*, run_root, retry_node_id):
+            from . import research_run
+
+            args.run_root = run_root
+            return research_run.resume_operator_graph(
+                run_root=run_root, retry_node_id=retry_node_id,
+            )
+
         return resume_workspace_execution(
             args.workspace,
             execution_id=args.execution,
             retry_node_id=(args.node if args.workspace_command == "retry-node" else None),
+            handler=resume_with_diagnostics,
         )
     if args.workspace_command == "dashboard":
         return export_dashboard_manifest(args.workspace)

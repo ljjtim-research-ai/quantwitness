@@ -6,7 +6,9 @@
     [Parameter(Mandatory = $true)]
     [string]$ReceiptOut,
     [Parameter(Mandatory = $true)]
-    [string]$CatalogLock
+    [string]$CatalogLock,
+    [Parameter(Mandatory = $true)]
+    [string]$Wheelhouse
 )
 
 $ErrorActionPreference = "Stop"
@@ -97,7 +99,14 @@ $catalogLockPath = [IO.Path]::GetFullPath($CatalogLock)
 if (-not (Test-Path -LiteralPath (Join-Path $catalogLockPath "CURRENT") -PathType Leaf)) {
     throw "显式 Catalog Lock 缺少 CURRENT"
 }
+$wheelhousePath = [IO.Path]::GetFullPath($Wheelhouse)
+if (-not (Test-Path -LiteralPath $wheelhousePath -PathType Container)) {
+    throw "显式 wheelhouse 目录不存在"
+}
 $lockPath = [IO.Path]::GetFullPath((Join-Path $project "release\dependency-distributions.json"))
+$lockedRequirements = @((Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json).distributions | ForEach-Object {
+    $_.name + "==" + $_.version
+})
 $inventoryVerifier = [IO.Path]::GetFullPath((Join-Path $project "tools\wheel_source_inventory.py"))
 $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
 $work = [IO.Path]::GetFullPath((Join-Path $temporaryRoot ("research-pipeline-wheel-" + [guid]::NewGuid().ToString("N"))))
@@ -121,21 +130,29 @@ try {
 
     $venvPath = Join-Path $work "venv"
     [void](Invoke-AcceptanceCommand "venv.create" $Python @(
-        "-m", "venv", "--system-site-packages", $venvPath
+        "-m", "venv", $venvPath
     ))
     $venvPython = Join-Path $venvPath "Scripts\python.exe"
-    [void](Invoke-AcceptanceCommand "wheel.install" $venvPython @(
-        "-m", "pip", "install", "--no-index", "--no-deps", "--ignore-installed", $wheelPath
-    ))
-
     $env:PYTHONPATH = ""
+    # 先从离线 wheelhouse 安装锁定依赖及其传递依赖，再安装本次 wheel。
+    $installProbe = (
+        "import subprocess,sys;" +
+        "pip=[sys.executable,'-m','pip','install','--no-index','--find-links',sys.argv[1]];" +
+        "subprocess.run(pip+sys.argv[3:],check=True);" +
+        "subprocess.run(pip+['--no-deps',sys.argv[2]],check=True)"
+    )
+    $installArguments = @("-c", $installProbe, $wheelhousePath, $wheelPath) + $lockedRequirements
+    [void](Invoke-AcceptanceCommand "wheel.install" $venvPython $installArguments)
     Push-Location $work
     try {
         $originProbe = (
-            "import pathlib,research_pipeline,sys;" +
+            "import pathlib,research_pipeline,site,sys;" +
             "root=pathlib.Path(sys.argv[1]).resolve();" +
+            "venv=pathlib.Path(sys.prefix).resolve();" +
             "origin=pathlib.Path(research_pipeline.__file__).resolve();" +
-            "assert root not in origin.parents,origin;print('isolated-wheel')"
+            "assert sys.prefix!=sys.base_prefix and site.ENABLE_USER_SITE is False;" +
+            "assert 'include-system-site-packages = false' in (venv/'pyvenv.cfg').read_text();" +
+            "assert venv in origin.parents and root not in origin.parents,origin;print(origin)"
         )
         [void](Invoke-AcceptanceCommand "installed.import-origin" $venvPython @(
             "-c", $originProbe, $project
@@ -169,7 +186,7 @@ try {
             "-c", $resourceProbe, $catalogLockPath
         )
         [void](Invoke-AcceptanceCommand "installed.dependencies" $venvPython @(
-            "-c", "from research_pipeline.platform import verify_dependency_distribution_lock;import sys;print(len(verify_dependency_distribution_lock(sys.argv[1])))", $lockPath
+            "-c", "from research_pipeline.platform import verify_dependency_distribution_lock;import subprocess,sys;subprocess.run([sys.executable,'-m','pip','check'],check=True);print(len(verify_dependency_distribution_lock(sys.argv[1])))", $lockPath
         ))
 
         $package = Join-Path $work "package"

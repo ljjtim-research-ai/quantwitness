@@ -10,6 +10,10 @@ ExternalArtifact提交时，staging内部的链接项会先复制为普通内容
 
 ## 不可变身份
 
+依赖 distribution 使用 v2 规范内容记录身份，排除安装标记及已声明入口在解释器 scripts 目录中的环境路径包装器，完整定义见[发布说明](release.md#依赖分发身份)。同一内容记录在不同安装路径下不会改变依赖身份；数值模式仍绑定声明的数值后端，严格字节模式仍绑定全部依赖与构建制品。
+
+旧 v1 摘要不会自动转换为 v2。恢复或复用时，已绑定依赖的身份不一致必须按现行门禁拒绝；需要重新准入并新建运行，不能编辑旧 checkpoint 或把旧摘要标成 v2。已封存 Result 与 VerificationResult 按其原有内容身份继续只读消费，不因当前依赖锁升级而重写。
+
 研究运行身份绑定：plan、package、Catalog/PIT、数据 revision、core 与项目实现、clock、seed、mode 和父子 run lineage。机器容量、worker 数和可选跨进程治理只写入调用及运行记录，恢复时必须与首次调用一致，但不改变研究身份。
 
 节点实现身份按共同变化的算子族绑定源码：Runtime 适配器位于 `runtime/adapters/`，横截面执行器及适配器位于 `application/grid_*.py`。`OperatorDefinition` 显式列出实现文件和共享语义依赖；`runtime_adapter_ref.dependency_modules` 参与摘要，运行前也按同一清单复核。某族修改只改变该族和真实依赖它的定义，共享模块修改则使全部消费者失效。同族不按单函数进一步拆分，不自动推断调用图。

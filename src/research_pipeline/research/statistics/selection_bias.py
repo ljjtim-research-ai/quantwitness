@@ -82,15 +82,27 @@ def deflated_sharpe_ratio(selected_returns: object, candidate_returns: object) -
     candidate_sharpes = matrix.mean(axis=0) / matrix.std(axis=0, ddof=1)
     if np.any(~np.isfinite(candidate_sharpes)):
         raise StatisticsError("DSR 候选 Sharpe 退化")
-    mean_sr = float(candidate_sharpes.mean())
     std_sr = float(candidate_sharpes.std(ddof=1))
-    benchmark = _expected_maximum_sharpe(mean_sr, std_sr, effective)
+    benchmark = _expected_maximum_sharpe(0.0, std_sr, effective)
     base = probabilistic_sharpe_ratio(selected, benchmark_sharpe=benchmark)
-    return _result("deflated_sharpe_ratio_v1", base.statistic, base.p_value or 0.0, len(selected), matrix.shape[1], effective, {"benchmark_sharpe": benchmark, "effective_trials_method": "correlation_participation_ratio", "expected_maximum_formula": "bailey_lopez_de_prado_2014_eq1"}, ("候选全集完整", "候选相关结构可代表有效试验数"), ("DSR 是选择偏差诊断，不等于策略有效",), np.column_stack([selected, matrix]))
+    return _result(
+        "deflated_sharpe_ratio_v2", base.statistic, base.p_value, len(selected),
+        matrix.shape[1], effective,
+        {
+            "benchmark_sharpe": benchmark,
+            "candidate_sharpe_std": std_sr,
+            "null_mean_sharpe": 0.0,
+            "effective_trials_method": "correlation_participation_ratio",
+            "expected_maximum_formula": "bailey_lopez_de_prado_2014_eq2",
+        },
+        ("候选全集完整且与选中收益使用相同观察期", "候选相关矩阵参与率近似有效独立试验数"),
+        ("DSR 是选择偏差诊断，不等于策略有效", "参与率是相关性近似，不是独立试验数的精确识别"),
+        np.column_stack([selected, matrix]),
+    )
 
 
 def _expected_maximum_sharpe(mean: float, standard_deviation: float, effective_trials: float) -> float:
-    """论文式（1）；有效试验数采用候选相关矩阵的参与率。"""
+    """论文式（1）的一般最大值期望；DSR 式（2）调用时均值取零。"""
     if effective_trials <= 1.0 or standard_deviation == 0.0:
         return mean
     euler_gamma = 0.5772156649015329

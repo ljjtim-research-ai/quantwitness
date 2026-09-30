@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import csv
 import hashlib
+import io
 from importlib import metadata
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import platform
 import sys
+import sysconfig
 from types import MappingProxyType
 from typing import Mapping
 
@@ -16,7 +19,8 @@ from .canonical import typed_canonical_hash
 
 
 BUILD_MANIFEST_VERSION = "research-build-manifest-v1"
-DEPENDENCY_LOCK_VERSION = "research-dependency-distribution-lock-v1"
+DEPENDENCY_LOCK_VERSION = "research-dependency-distribution-lock-v2"
+_DISTRIBUTION_IDENTITY_VERSION = "research-distribution-content-record-v2"
 
 
 def _hash(value: object, field: str) -> str:
@@ -197,7 +201,7 @@ def load_build_manifest(path: str | Path) -> BuildManifest:
 
 
 def installed_distribution_digest(distribution_name: str) -> tuple[str, str, str]:
-    """返回规范名称、版本及已安装 distribution 的 METADATA/RECORD 摘要。"""
+    """以分发内容记录计算身份，不绑定安装器标记和环境路径包装器。"""
     try:
         distribution = metadata.distribution(distribution_name)
     except metadata.PackageNotFoundError as exc:
@@ -206,9 +210,54 @@ def installed_distribution_digest(distribution_name: str) -> tuple[str, str, str
     record_text = distribution.read_text("RECORD") or ""
     if not metadata_text or not record_text:
         raise ValueError(f"依赖 distribution 缺少 METADATA/RECORD: {distribution_name}")
-    digest = hashlib.sha256(
-        f"{metadata_text}\n--RECORD--\n{record_text}".encode("utf-8")
-    ).hexdigest()
+    records = list(csv.reader(io.StringIO(record_text)))
+    if any(len(row) != 3 or not row[0] for row in records):
+        raise ValueError(f"依赖 distribution RECORD 格式无效: {distribution_name}")
+    metadata_paths = [
+        PurePosixPath(row[0]) for row in records
+        if row[0].endswith(".dist-info/METADATA") and len(PurePosixPath(row[0]).parts) == 2
+    ]
+    if len(metadata_paths) != 1:
+        raise ValueError(f"依赖 distribution RECORD 清单不唯一: {distribution_name}")
+    dist_info = metadata_paths[0].parent
+    installation_records = {
+        str(dist_info / name)
+        for name in ("RECORD", "INSTALLER", "REQUESTED", "direct_url.json")
+    }
+    entry_points_text = distribution.read_text("entry_points.txt") or ""
+    wrapper_names = {
+        name
+        for entry in distribution.entry_points
+        if entry.group in {"console_scripts", "gui_scripts"}
+        for name in (
+            entry.name, f"{entry.name}.exe", f"{entry.name}-script.py",
+            f"{entry.name}-script.pyw",
+        )
+    }
+    scripts_root = Path(sysconfig.get_path("scripts")).resolve()
+    content_records = []
+    for row in records:
+        relative_path = PurePosixPath(row[0])
+        if row[0] in installation_records:
+            continue
+        if relative_path.suffix in {".pyc", ".pyo"} and not row[1] and not row[2]:
+            continue
+        # 只排除当前脚本目录中由声明入口生成的包装器；包内同名文件仍绑定身份。
+        if relative_path.name in wrapper_names:
+            installed_path = Path(distribution.locate_file(row[0])).resolve()
+            if installed_path.parent == scripts_root:
+                continue
+        content_records.append(row)
+    if len({row[0] for row in content_records}) != len(content_records):
+        raise ValueError(f"依赖 distribution RECORD 内容清单不唯一: {distribution_name}")
+    digest = typed_canonical_hash({
+        "contract_version": _DISTRIBUTION_IDENTITY_VERSION,
+        "name": distribution.metadata["Name"],
+        "version": distribution.version,
+        "metadata": metadata_text,
+        "entry_points": entry_points_text,
+        "records": sorted(content_records),
+    })
     return distribution.metadata["Name"], distribution.version, digest
 
 

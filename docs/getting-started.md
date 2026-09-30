@@ -1,5 +1,9 @@
 # 首次使用
 
+第一次接触框架，先完成 [Workspace 合成研究入门](workspace-quickstart.md)：已有股票横截面项目包含填写完整的声明、算子和独立 Verifier，可以贯穿运行、报告与变体比较。按 [README 的源码获取步骤](../README.md)取得同版文档与 `examples/`；仅安装 wheel 不包含示例。
+
+本页用于创建自己的研究。`package init` 生成中性草稿，不能直接运行；现成示例与公共 Recipe 是不同入口，当前公共 Recipe 清单为空。
+
 ## Windows 当前会话使用 UTF-8
 
 机器 JSON 始终按 UTF-8 字节输出。Windows 下先在当前 PowerShell 会话设置：

@@ -29,16 +29,11 @@ def load_research_package(root: str | Path) -> ResearchPackage:
     _exact(localization_payload, {"decisions"}, "localization.yaml")
     sources = tuple(_load_source(item) for item in _typed_list(source_payload["sources"], "sources/sources.yaml.sources"))
     localizations = tuple(
-        LocalizationDecision(**{**_typed_mapping(item, _LOCALIZATION_KEYS, "localization"), "evidence_source_ids": _string_sequence(item["evidence_source_ids"], "localization.evidence_source_ids")})
+        _load_localization(item)
         for item in _typed_list(localization_payload["decisions"], "localization.yaml.decisions")
     )
-    metric = _typed_mapping(package["metric_contract"], _METRIC_KEYS, "metric_contract")
-    claim = _typed_mapping(package["claim_contract"], _CLAIM_KEYS, "claim_contract")
-    semantics = metric["semantics"]
-    if not isinstance(semantics, Mapping) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in semantics.items()):
-        raise ResearchPackageError("metric semantics 必须是字符串映射")
-    metric_contract = MetricContract.build(contract_id=metric["contract_id"], version=metric["version"], metrics=_string_sequence(metric["metrics"], "metric_contract.metrics"), semantics=semantics)
-    claim_contract = PackageClaimContract.build(allowed_claim_levels=_string_sequence(claim["allowed_claim_levels"], "claim_contract.allowed_claim_levels"), max_claim_level=claim["max_claim_level"])
+    metric_contract = _load_metric_contract(package["metric_contract"])
+    claim_contract = _load_claim_contract(package["claim_contract"])
     return ResearchPackage.build(
         package_slug=package["package_slug"],
         display_name=package["display_name"],
@@ -125,13 +120,40 @@ def _load_source(value: object) -> PackageSource:
         raise ResearchPackageError("source 必须是映射")
     # 旧研究包没有 provenance；明确降级为仅引用，不把历史 content_hash 当作正文证明。
     expected = _SOURCE_KEYS | ({"provenance"} if "provenance" in value else set())
-    source = _typed_mapping(value, expected, "source")
+    source = dict(_typed_mapping(value, expected, "source"))
     provenance_payload = source.pop("provenance", None)
     if provenance_payload is None:
         provenance = SourceProvenance.citation_only()
     else:
         provenance = SourceProvenance(**_typed_mapping(provenance_payload, _PROVENANCE_KEYS, "source.provenance"))
     return PackageSource(**source, provenance=provenance)
+
+
+def _load_localization(value: object) -> LocalizationDecision:
+    item = _typed_mapping(value, _LOCALIZATION_KEYS, "localization")
+    return LocalizationDecision(**{
+        **item,
+        "evidence_source_ids": _string_sequence(item["evidence_source_ids"], "localization.evidence_source_ids"),
+    })
+
+
+def _load_metric_contract(value: object) -> MetricContract:
+    metric = _typed_mapping(value, _METRIC_KEYS, "metric_contract")
+    semantics = metric["semantics"]
+    if not isinstance(semantics, Mapping) or any(not isinstance(key, str) or not isinstance(value, str) for key, value in semantics.items()):
+        raise ResearchPackageError("metric semantics 必须是字符串映射")
+    return MetricContract.build(
+        contract_id=metric["contract_id"], version=metric["version"],
+        metrics=_string_sequence(metric["metrics"], "metric_contract.metrics"), semantics=semantics,
+    )
+
+
+def _load_claim_contract(value: object) -> PackageClaimContract:
+    claim = _typed_mapping(value, _CLAIM_KEYS, "claim_contract")
+    return PackageClaimContract.build(
+        allowed_claim_levels=_string_sequence(claim["allowed_claim_levels"], "claim_contract.allowed_claim_levels"),
+        max_claim_level=claim["max_claim_level"],
+    )
 
 
 def _typed_mapping(value: object, expected: set[str], field: str) -> dict[str, object]:

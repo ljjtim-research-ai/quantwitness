@@ -101,7 +101,7 @@ finalize 失败但 `result_published=true` 时，`next_command` 使用真实 Res
 ## 结果验证与消费
 
 ```powershell
-python -m research_pipeline verify --result <Result目录> --result-store <ResultStore> --output <VerificationResult.json> --verification-memory-bytes <字节> --verification-temp-bytes <字节> --verification-scratch-root <临时目录> --json
+python -m research_pipeline verify --result <Result目录> --result-store <ResultStore> --output <VerificationResult.json> --verification-memory-bytes <字节> --verification-temp-bytes <字节> --verification-process-slots <进程槽> --verification-scratch-root <临时目录> --json
 python -m research_pipeline report --verification-result <VerificationResult.json> --result-store <ResultStore> --output <报告.md> --format markdown --json
 python -m research_pipeline compare --left-verification-result <左.json> --left-result-store <左Store> --right-verification-result <右.json> --right-result-store <右Store> --json
 python -m research_pipeline analysis run --verification-result <VerificationResult.json> --result-store <ResultStore> --request <AnalysisRequest.yaml> --output <AnalysisResult.json> --analysis-memory-bytes <字节> --json
@@ -109,7 +109,7 @@ python -m research_pipeline analysis compare --analysis-result <左AnalysisResul
 python -m research_pipeline export-result --verification-result <VerificationResult.json> --result-store <ResultStore> --output <导出目录> --json
 ```
 
-三个 `--verification-*` 参数只约束独立金融 oracle。默认进程预算为 1 GiB、临时盘预算为 8 GiB；未指定 scratch root 时使用系统临时目录。大型 canonical/TCA 使用批次扫描和受限 DuckDB，不按固定 Result 大小跳过；真实额度不足会使 `verify` 失败且不产生输出文件。
+`--verification-memory-bytes`、`--verification-temp-bytes` 和 `--verification-scratch-root` 用于独立金融 oracle，并作为项目 Verifier 的默认内存、临时空间和工作目录预算。默认内存为 1 GiB、临时盘为 8 GiB；未指定 scratch root 时使用系统临时目录。`--verification-process-slots` 单独约束项目 Verifier 的 Supervisor 与 Worker 树，默认 2，Windows venv 可显式声明 3，见[资源预算](project_resource_budgets.md)。大型 canonical/TCA 使用批次扫描和受限 DuckDB，不按固定 Result 大小跳过；真实额度不足会使 `verify` 执行失败且不产生输出文件。数值复核发现研究错误时则会生成 `status=fail` 的 VerificationResult，命令退出码不替代研究验证状态。
 
 新项目 Result 已包含 Plan 冻结的 Verifier bundle，`verify` 不再要求外部路径；历史 Result 仍可用
 `--verifier-bundle` 提供同一身份的旧闭包。`report --output` 按 UTF-8 原子发布，目标已存在时拒绝
@@ -148,3 +148,27 @@ python -m research_pipeline gc --root <工件根> --ttl-seconds 86400 --json
 `artifact describe` 从正式 Metric registry 返回可绑定的 `metrics` 与 `schema.result_tables`，包括指标引用、单位、测量语义、结果 schema、字段类型和 `path_prefix`。ResultSpec 使用发现的 producer 端口和结果表声明；字段来源于查询的数据表仍由 Catalog 提供，Catalog 搜索必须显式传入持久 `--catalog-lock`。指标表匹配失败时显示预期节点、端口、schema 和实际表声明。
 
 `doctor --run-root <目录> --json` 未通过时返回非零退出码和 `doctor_failed`，`data.findings` 保留每个目标的状态、错误码、对象、说明与下一步建议。多个同名运行目录用完整路径定位失败对象。
+
+## Workspace 运行与复用
+
+完整合成研究流程见 [Workspace 入门](workspace-quickstart.md)。`workspace run` 自动管理工件、handoff、run 和 ResultStore 路径，与普通 `run` 共用复用选项及校验：
+
+- `--reuse-run-root <完成态run目录>` 可重复传入，按显式顺序尝试复用。
+- `--require-reused-node <节点ID>` 可重复传入；必须同时提供完成态来源，任一指定节点不可复用时在计算前拒绝。
+- `--reuse-failed-run-root <失败run目录>` 复用终态失败 run 中通过完整复验的成功 checkpoint，不能与完成态复用组合使用。
+
+Workspace 不自动执行 lint、admit、verify 或 report；clock 和 root-seed 必须与分配 execution 时一致。
+
+## 状态摘要与完整流程
+
+支持 `--json` 的操作型命令也支持互斥的 `--summary`：前者保留完整 data 并附带 summary，后者只返回摘要、错误和下一步参数。默认文本输出展示主要状态、结果位置和诊断。
+
+`summary.command_status` 只描述命令是否完成；`execution_status` 需要 Runtime 与 Result 封存共同成功；`verification_status` 来自独立验证结论。尚未执行或不适用的状态为 null。单独 verify 的退出码含义保持不变，验证 fail 不能因命令退出 0 被解释为通过。
+
+```powershell
+python -m research_pipeline workspace init <新工作区> --from-package <完整研究包> --json
+python -m research_pipeline workspace execute --workspace <工作区> --catalog-lock <Lock目录> --data-db <只读DuckDB> --extension-bundle <算子bundle> --verifier-bundle <验证bundle> --summary
+python -m research_pipeline package lint --package <研究包> --summary
+```
+
+`workspace execute` 沿用现有 lint、admit、run、verify、report；时点和种子从包读取，显式值必须一致。它每次分配新 execution，失败返回 `failed_stage`、`stages` 和已生成的结果位置。验证 fail 仍生成失败报告，但完整流程退出非零。恢复使用 inspect/resume/retry-node 后独立 verify/report，不以新的 execute 替代恢复。来源与资源参数见各命令 --help。

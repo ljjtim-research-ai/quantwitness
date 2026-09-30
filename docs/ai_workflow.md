@@ -40,7 +40,7 @@ AI 不创建项目 runner，不手写内部 drift bundle，不猜 Catalog、PIT 
 
 ### lint
 
-一次读取结构化结果：声明、字段、算子图、ResultSpec、指标、来源、已声明资源预算、缺失项和下一条命令。lint 失败就修改 package 或 bundle，不进入数据运行。
+研究包能完成加载和编译后，lint 返回声明、字段、算子图、ResultSpec、指标、来源、资源预算、准入缺口和下一条命令。中性草稿的独立静态缺口由 `data.issues` 聚合返回，每项包含 `code`、`file`、`field`、`message` 和 `action`；无法解析的文件不产生依赖于其内容的后续结论。`data.status=linted` 与 `data.execution_ready=false` 表示完成静态检查，仍需执行 admit。lint 失败就修改 package 或 bundle，不进入数据运行。
 
 ### admit
 
@@ -59,6 +59,32 @@ run 固定 plan、clock、seed、mode 和资源额度。恢复先看 `inspect` �
 ### verify 与消费
 
 Result 是自包含计算结果；VerificationResult 是独立复验结论。报告、比较、导出和 Dashboard 必须同时绑定二者，不能只看 Runtime 的 succeeded。真正复现仍从 package lint/admit → run → verify 重新执行研究。
+
+## 读取命令结果
+
+操作型命令使用 `--summary` 获取精简 JSON，或用 `--json` 获取完整数据，两者互斥；发现命令按各自帮助使用 `--format json`。摘要中的 `command_status`、`execution_status`、`verification_status` 各自表示命令、执行和验证状态；不适用时为 null。摘要不读取数据库或重新验证 Result。
+
+| 阶段 | 需要读取的事实 | 可以采取的下一步 |
+| --- | --- | --- |
+| 操作型命令返回 | 退出码、顶层 `status`、`error_code`、`message` | 非零退出码或顶层 `fail` 时处理错误；顶层 `pass` 只表示命令完成 |
+| `package lint` | `data.status`、`data.execution_ready`、`data.checks`、`data.missing_requirements` | 根据准入缺口准备显式输入，再执行 admit |
+| `run` 或恢复返回 | `data.status=result_finalized`、`data.result_id`、`data.result_directory` | 保存本次返回的结果位置，再独立 verify |
+| `inspect` | `data.run_status`、`data.finalize.status`、`data.recommended_action`、`data.required_inputs` | 使用返回的恢复建议；仅节点成功不代表 Result 已封存 |
+| `verify` | `data.status`、`data.validity_status`、`data.claim_level`、`data.output` | 验证结论为 `pass` 后，才把它作为通过验证的研究结果消费；`fail` 时阅读验证报告定位原因 |
+
+`verify` 可以成功生成一份结论为 `fail` 的 VerificationResult，所以退出码 0 和顶层 `status=pass` 都不能替代 `data.status`。资源不足或命令异常也不等于研究金融结论为假，应先读错误原因。计算和独立验证各自证明什么，见 [证据与金融口径](evidence.md)。
+
+自动执行建议命令时优先使用 `next_command_argv` 参数数组，不把路径拼接为 shell 字符串。命令建议中的显式占位参数仍需填入；缺少参数时不能猜测数据库位置、时点或样本。
+
+Workspace 运行失败返回的 `data.failed_node`、`data.root_error` 和 `data.run_root` 用于定位节点错误；其他阶段的错误不保证带这些字段。新的 PowerShell 会话先用 `workspace inspect` 找到 execution；resume 或 retry-node 成功后，用本次返回值更新结果引用，不复用旧 `$run`。完整例子见 [Workspace 入门](workspace-quickstart.md)。
+
+## 复用已有研究
+
+第一次使用从公开源码中的完整示例开始，按 [Workspace 入门](workspace-quickstart.md)构建项目 bundle，用 `workspace init --from-package` 复制四份声明，再以 `workspace execute` 完成整条流程。`package init` 生成的是待填写草稿；`operator scaffold` 生成的是接口示例，两者都不替用户决定研究假设。
+
+接入自己的数据时，先确定数据集、字段、可见时间、研究窗口和评价指标，再选择或编写对应项目算子。保存显式 Catalog Lock、只读数据路径、bundle、clock 和 seed；恢复直接使用既有 execution 的调用记录，不重新猜一组参数。数据源、研究口径或计划发生变化时，重新 lint/admit 并建立新运行。
+
+资源不足时保留样本、频率、参数和 seed。根据诊断调整明确授权的预算；Windows venv 的独立验证示例使用 `--verification-process-slots 3`，具体来源见 [资源预算](project_resource_budgets.md)。
 
 ## 项目算子最短闭环
 

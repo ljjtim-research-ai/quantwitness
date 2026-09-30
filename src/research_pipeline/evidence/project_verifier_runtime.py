@@ -36,6 +36,21 @@ _PROJECT_VERIFIER_OUTPUT_V1 = "project-verifier-output-v1"
 _STATISTICS_MATRIX_EVIDENCE_VERSION = "research-statistics-matrix-evidence-v1"
 
 
+class ProjectVerifierResourceError(ResultContractError):
+    """保留复核资源失败的机器码和实际测量，不混同结果合同错误。"""
+
+    def __init__(self, code: str, *, exceeded=None, measurement_status=None, configuration=None):
+        super().__init__(code)
+        self.error_code = code
+        self.failure_payload = {}
+        if exceeded:
+            self.failure_payload["exceeded"] = exceeded
+        if measurement_status is not None:
+            self.failure_payload["resource_measurement_status"] = measurement_status
+        if configuration is not None:
+            self.failure_payload["configuration"] = configuration
+
+
 def _statistics_matrix_evidence(payload: object) -> dict[str, object]:
     expected = {
         "contract_version",
@@ -153,7 +168,7 @@ def execute_project_verifier(
         default_budget.memory_bytes, 1, default_budget.temp_bytes, 300
     )
     if type(process_slots) is not int or process_slots < 2:
-        raise ResultContractError("project_verifier_process_slots_exceeded")
+        raise ProjectVerifierResourceError("project_verifier_process_slots_exceeded", configuration={"declared_slots": process_slots, "minimum_slots": 2})
     started = time.monotonic()
     manifest = verify_project_verifier_bundle(bundle_path)
     if manifest.identity() != dict(expected_identity):
@@ -187,9 +202,10 @@ def execute_project_verifier(
             for relative_path in snapshot.table_manifest(schema_id).files
         ) + sum(len(snapshot.support_bytes[path]) for path in support_by_path)
         if required_bytes > budget.temp_bytes:
-            raise ResultContractError("project_verifier_temp_exceeded")
-        if required_bytes > shutil.disk_usage(root).free:
-            raise ResultContractError("project_verifier_disk_space_exceeded")
+            raise ProjectVerifierResourceError("project_verifier_temp_exceeded", exceeded={"temp_bytes": {"actual": required_bytes, "limit": budget.temp_bytes}}, measurement_status="measured")
+        free_bytes = shutil.disk_usage(root).free
+        if required_bytes > free_bytes:
+            raise ProjectVerifierResourceError("project_verifier_disk_space_exceeded", exceeded={"disk_space_bytes": {"actual": required_bytes, "limit": free_bytes}}, measurement_status="measured")
         input_root = root / "input"
         input_root.mkdir()
         table_entries = []
@@ -221,7 +237,7 @@ def execute_project_verifier(
                         writer.write(content[offset:offset + 1024 * 1024])
                 del content
             except OSError as exc:
-                raise ResultContractError("project_verifier_copy_failed") from exc
+                raise ProjectVerifierResourceError("project_verifier_copy_failed") from exc
             guard.check()
             support_entries.append({
                 "artifact_type": item.artifact_type,
@@ -266,19 +282,25 @@ def execute_project_verifier(
             env=environment, cwd=root,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        resource_error = None
         try:
             while process.poll() is None:
                 guard.check(process)
                 time.sleep(0.02)
             guard.check()
             if process.returncode != 0:
-                raise ResultContractError("project_verifier_worker_failed")
+                raise ProjectVerifierResourceError("project_verifier_worker_failed")
+        except ProjectVerifierResourceError as exc:
+            resource_error = exc
+            raise
         finally:
             cleanup = _terminate_process_tree(
                 process, observed_descendants=guard.descendants
             )
+            if resource_error is not None:
+                resource_error.failure_payload["process_cleanup_status"] = cleanup
         if cleanup != "complete":
-            raise ResultContractError("project_verifier_cleanup_failed")
+            raise ProjectVerifierResourceError("project_verifier_cleanup_failed")
         try:
             raw_outcome = json.loads(output_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -300,21 +322,31 @@ class _VerifierResources:
         self.descendants = {}
 
     def check(self, process=None, *, check_disk=True):
-        if time.monotonic() - self.started > self.budget.wall_seconds:
-            raise ResultContractError("project_verifier_timeout")
+        elapsed = time.monotonic() - self.started
+        if elapsed > self.budget.wall_seconds:
+            raise ProjectVerifierResourceError("project_verifier_timeout", exceeded={"wall_seconds": {"actual": elapsed, "limit": self.budget.wall_seconds}}, measurement_status="measured")
         try:
             rss, count = _project_process_usage(
                 None if process is None else process.pid, self.descendants,
             )
             disk_bytes = _measure_attempt_tree_bytes(self.root) if check_disk else 0
         except (psutil.Error, OSError, RuntimeError) as exc:
-            raise ResultContractError("project_verifier_measurement_unavailable") from exc
-        if rss > self.budget.memory_bytes:
-            raise ResultContractError("project_verifier_memory_exceeded")
-        if count > self.process_slots:
-            raise ResultContractError("project_verifier_process_slots_exceeded")
-        if disk_bytes > self.budget.temp_bytes:
-            raise ResultContractError("project_verifier_temp_exceeded")
+            raise ProjectVerifierResourceError("project_verifier_measurement_unavailable", measurement_status="measurement_unavailable") from exc
+        exceeded = {
+            name: {"actual": actual, "limit": limit}
+            for name, actual, limit in (
+                ("memory_bytes", rss, self.budget.memory_bytes),
+                ("process_slots", count, self.process_slots),
+                ("temp_bytes", disk_bytes, self.budget.temp_bytes),
+            ) if actual > limit
+        }
+        for name, code in (
+            ("memory_bytes", "project_verifier_memory_exceeded"),
+            ("process_slots", "project_verifier_process_slots_exceeded"),
+            ("temp_bytes", "project_verifier_temp_exceeded"),
+        ):
+            if name in exceeded:
+                raise ProjectVerifierResourceError(code, exceeded=exceeded, measurement_status="measured")
 
 
 def _copy_verifier_input(source, target, guard):
@@ -330,7 +362,7 @@ def _copy_verifier_input(source, target, guard):
             writer.flush()
         guard.check()
     except OSError as exc:
-        raise ResultContractError("project_verifier_copy_failed") from exc
+        raise ProjectVerifierResourceError("project_verifier_copy_failed") from exc
 
 
 def _parse_outcome(

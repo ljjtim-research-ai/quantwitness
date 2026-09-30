@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+from email.parser import BytesParser
 import hashlib
 import json
 from pathlib import Path
 import re
 from typing import Mapping
+from zipfile import ZipFile
 
 
 CLEAN_WHEEL_RECEIPT_VERSION = "research-clean-wheel-acceptance-v1"
@@ -120,6 +122,20 @@ def verify_clean_wheel_receipt(
     if any(payload.get(field) != value for field, value in expected_files.items()):
         raise ValueError("干净 wheel receipt 与当前输入字节不一致")
 
+    with ZipFile(wheel_path) as archive:
+        metadata_names = [
+            name for name in archive.namelist()
+            if name.endswith(".dist-info/METADATA")
+        ]
+        if len(metadata_names) != 1:
+            raise ValueError("干净 wheel 缺少唯一 METADATA")
+        metadata = BytesParser().parsebytes(archive.read(metadata_names[0]))
+    wheel_version = metadata.get("Version")
+    if not wheel_version:
+        raise ValueError("干净 wheel METADATA 缺少 Version")
+    if payload.get("installed_version") != f"QuantWitness {wheel_version}":
+        raise ValueError("干净 wheel receipt 安装版本与 wheel 元数据不一致")
+
     commands = payload.get("commands")
     if not isinstance(commands, list):
         raise ValueError("干净 wheel receipt 缺少命令记录")
@@ -159,10 +175,15 @@ def verify_clean_wheel_receipt(
         for command in commands
     }
     if any(
-        expectation != ("failure" if command_id == "recipe.unknown-id" else "success")
+        expectation != (
+            "failure" if command_id in {"package.lint", "recipe.unknown-id"} else "success"
+        )
         for command_id, expectation in command_expectations.items()
     ):
         raise ValueError("干净 wheel receipt 命令预期与固定协议不一致")
+    draft_lint = next(command for command in commands if command["command_id"] == "package.lint")
+    if draft_lint["exit_code"] != 1:
+        raise ValueError("干净 wheel receipt 中性草稿 lint 必须以 exit=1 拒绝")
 
     inventory = payload.get("inventory")
     environment = payload.get("environment")
@@ -191,8 +212,6 @@ def verify_clean_wheel_receipt(
         or not environment["python"].startswith("3.10.")
         or environment.get("platform") != "windows"
         or environment.get("cache_tag") != "cpython-310"
-        or not isinstance(payload.get("installed_version"), str)
-        or not payload["installed_version"].startswith("QuantWitness 1.0.0")
     ):
         raise ValueError("干净 wheel receipt 清单或正式环境身份无效")
     for field in (

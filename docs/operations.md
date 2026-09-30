@@ -44,6 +44,8 @@ python -m research_pipeline gc --root <工件根> --ttl-seconds 86400 --apply --
 
 Workspace 分配不可复用 execution 目录，并把运行委托给同一个 run 服务。Dashboard 清单先复验 VerificationResult 与 Result 身份，再只列 `status=pass` 的结果；混合清单跳过失败项，全失败时拒绝生成可信清单，并移除上一次导出的旧清单。单结果 Viewer 和手写 Workspace 清单也执行同一门禁，不能把 Runtime succeeded、文件存在或自然语言报告当成通过。
 
+Workspace 记录中的 `runtime_run_id`、`run_id` 都必须与 VerificationResult 的运行身份一致；两者同时存在时也必须一致，Dashboard 不按文件存在与否跳过身份核对。
+
 ## 数据库
 
 research_pipeline 的数据库访问只读。采集、修复、建表、因子重算和发布不属于运维命令；这些操作必须在对应子系统获得单独授权。

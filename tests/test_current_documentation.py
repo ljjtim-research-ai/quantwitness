@@ -196,9 +196,16 @@ def test_public_guides_use_current_research_pipeline_workflow() -> None:
         "`catalog`、`package`、`plan`、`run`",
     )
 
-    for name in ("README.md", "CONTRIBUTING.md", "EXTENSIONS.md"):
+    for name in (
+        "README.md",
+        "docs/framework-contracts.md",
+        "CONTRIBUTING.md",
+        "EXTENSIONS.md",
+    ):
         content = (PACKAGE_ROOT / name).read_text(encoding="utf-8")
         if name == "README.md":
+            assert "(docs/framework-contracts.md)" in content
+        if name == "docs/framework-contracts.md":
             flow_match = re.search(
                 r"```text\n研究问题与口径冻结(?P<flow>.*?)```",
                 content,

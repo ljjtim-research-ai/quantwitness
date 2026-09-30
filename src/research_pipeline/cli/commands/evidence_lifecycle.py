@@ -51,6 +51,7 @@ def _execute(args) -> dict[str, object]:
             output=args.output,
             financial_oracle_budget=FinancialOracleBudget(**budget_kwargs),
             verifier_bundle=getattr(args, "verifier_bundle", None),
+            project_verifier_process_slots=args.verification_process_slots,
         )
         return {
             "verification_hash": context.verification.verification_hash,

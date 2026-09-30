@@ -47,6 +47,16 @@ jobs:
           tests/test_framework_intrusion_gate.py
           tests/test_public_operator_governance.py
           tests/test_public_release_gates.py
+          tests/test_workspace.py
+          tests/test_workspace_flow.py
+          tests/test_package_diagnostics.py
+          tests/test_cli_summary.py
+          tests/test_process_budget_advice.py
+          tests/test_verifier_resource_diagnostics.py
+          tests/test_dsr_formula.py
+          tests/test_cli_failure_details.py
+          tests/test_dependency_distribution_identity.py
+          tests/test_dependency_identity_recovery.py
       - name: Build release wheel
         id: release
         shell: bash
@@ -62,4 +72,4 @@ jobs:
           "$RUNNER_TEMP/quantwitness-wheel-env/bin/python" -m pip check
           cd "$RUNNER_TEMP"
           PYTHONPATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/quantwitness-wheel-env/bin/python" -c 'import importlib.metadata as m, pathlib, research_pipeline, sys; assert pathlib.Path(research_pipeline.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()); assert m.version("pyarrow") == "21.0.0"'
-          PYTHONPATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/quantwitness-wheel-env/bin/python" -m pytest -o pythonpath= -q "$GITHUB_WORKSPACE/tests/test_public_examples.py"
+          PYTHONPATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/quantwitness-wheel-env/bin/python" -m pytest -o pythonpath= -q "$GITHUB_WORKSPACE/tests/test_public_examples.py" "$GITHUB_WORKSPACE/tests/test_workspace.py" "$GITHUB_WORKSPACE/tests/test_workspace_flow.py" "$GITHUB_WORKSPACE/tests/test_package_diagnostics.py" "$GITHUB_WORKSPACE/tests/test_cli_summary.py" "$GITHUB_WORKSPACE/tests/test_process_budget_advice.py" "$GITHUB_WORKSPACE/tests/test_verifier_resource_diagnostics.py" "$GITHUB_WORKSPACE/tests/test_dsr_formula.py" "$GITHUB_WORKSPACE/tests/test_cli_failure_details.py" "$GITHUB_WORKSPACE/tests/test_dependency_distribution_identity.py" "$GITHUB_WORKSPACE/tests/test_dependency_identity_recovery.py"

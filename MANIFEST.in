@@ -24,7 +24,9 @@ include docs/catalog.md
 include docs/cli.md
 include docs/data_plane.md
 include docs/evidence.md
+include docs/framework-contracts.md
 include docs/getting-started.md
+include docs/workspace-quickstart.md
 include docs/index.md
 include docs/minute_rule_provenance.md
 include docs/operations.md
