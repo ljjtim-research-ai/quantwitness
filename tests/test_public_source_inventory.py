@@ -34,6 +34,7 @@ def test_public_source_inventory_reuses_package_inventory() -> None:
         "THIRD_PARTY_NOTICES.md",
         ".github/CODEOWNERS.template",
         ".github/workflows/ci.yml",
+        ".github/workflows/publish.yml",
     } <= public
     for project_name in PUBLIC_EXAMPLE_PROJECTS:
         prefix = f"examples/{project_name}/"
