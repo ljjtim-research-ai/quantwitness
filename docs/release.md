@@ -72,6 +72,14 @@ v1 的原始 METADATA/RECORD 摘要与 v2 不兼容；验证器拒绝 v1 锁，�
 
 工作流检查通过不代表 GitHub ruleset 或 required checks 已生效；首次公开前需在平台按批准的治理方案配置并验证。四项目闭环只证明合成研究，不证明交易费用、保证金或真实市场表现。
 
+## PyPI 正式发布
+
+`.github/workflows/publish.yml` 只在推送 `v*` Tag 时运行。Tag 必须是带注释的 Tag，与 `pyproject.toml` 版本完全一致，并指向 `main` 历史中的提交。工作流重新检查公开源码、发布合同和隔离 wheel，只使用本次正式构建 JSON 回执中的 wheel 与 sdist；源码 zip 作为 GitHub Release 附件保留，不上传 PyPI。
+
+PyPI 使用 Trusted Publishing。PyPI 项目绑定 GitHub owner `ljjtim`、仓库 `QuantWitness`、工作流 `publish.yml` 和 Environment `pypi`；GitHub 的 `pypi` Environment 负责正式上传前的审批。发布任务只授予 `contents: read` 和 `id-token: write`，仓库不保存 PyPI API Token。上传失败不得使用 `skip-existing` 绕过；已经发布的版本不能用不同文件覆盖，修复后发布新版本。
+
+正式顺序为：合并发布改动，基于最终 `main` 重新生成并复验发布证据，创建并推送 `v<版本>`，批准 `pypi` Environment，等待 PyPI 上传和干净安装验证通过，再使用同一构建产物创建 GitHub Release。GitHub Release 使用 `--verify-tag`，避免在错误提交上隐式创建 Tag。
+
 
 ## 当前候选的本地发布验收
 

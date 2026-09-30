@@ -1,0 +1,131 @@
+name: publish
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build and verify release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install release test dependencies
+        run: |
+          python -m pip install ".[test]" "pyarrow==21.0.0"
+          python -m pip check
+      - name: Verify release tag
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+
+          version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"Tag {tag!r} 与项目版本 {version!r} 不一致")
+          PY
+          test "$(git cat-file -t "$GITHUB_REF")" = "tag"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+      - name: Check public source inventory
+        run: python tools/public_source_inventory.py --project . --check
+      - name: Run release contract tests
+        run: >-
+          python -m pytest -q
+          tests/test_current_documentation.py
+          tests/test_public_source_inventory.py
+          tests/test_public_release_gates.py
+          tests/test_release_envelope.py
+          tests/test_release_gate_runner.py
+          tests/test_capability_release_evidence.py
+          tests/test_release_workflows.py
+          tests/test_gate_c_evidence.py
+      - name: Build release artifacts
+        id: release
+        shell: bash
+        run: |
+          python tools/build_release_artifacts.py --project . --output "$RUNNER_TEMP/quantwitness-release" > "$RUNNER_TEMP/quantwitness-build.json"
+          python - "$RUNNER_TEMP/quantwitness-build.json" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          receipt = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if receipt.get("status") != "pass":
+              raise SystemExit("正式构建未通过")
+          names = ("wheel", "sdist", "source_archive")
+          paths = {name: Path(receipt[name]).resolve(strict=True) for name in names}
+          parents = {path.parent for path in paths.values()}
+          if len(parents) != 1 or set(paths.values()) != set(next(iter(parents)).iterdir()):
+              raise SystemExit("正式构建目录必须只包含本次三个发行产物")
+          with Path(sys.argv[2]).open("a", encoding="utf-8") as output:
+              for name, path in paths.items():
+                  print(f"{name}={path}", file=output)
+          PY
+      - name: Verify isolated wheel
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/quantwitness-release-env"
+          python_bin="$RUNNER_TEMP/quantwitness-release-env/bin/python"
+          "$python_bin" -m pip install "${{ steps.release.outputs.wheel }}[test]" "pyarrow==21.0.0"
+          "$python_bin" -m pip check
+          cd "$RUNNER_TEMP"
+          "$python_bin" -c 'import importlib.metadata as m, research_pipeline; assert m.version("quantwitness") == "${{ github.ref_name }}"[1:]'
+          "$RUNNER_TEMP/quantwitness-release-env/bin/quantwitness" --help
+      - name: Upload Python distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-distributions
+          path: |
+            ${{ steps.release.outputs.wheel }}
+            ${{ steps.release.outputs.sdist }}
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload source archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: source-archive
+          path: ${{ steps.release.outputs.source_archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/quantwitness
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download Python distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-distributions
+          path: dist
+      - name: Publish Python distributions
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          packages-dir: dist

@@ -97,6 +97,7 @@ _PUBLIC_EXAMPLE_SUFFIXES = frozenset({".md", ".py", ".yaml"})
 PUBLIC_GITHUB_FILES = (
     ".github/CODEOWNERS.template",
     ".github/workflows/ci.yml",
+    ".github/workflows/publish.yml",
 )
 PUBLIC_GOVERNANCE_FILES = (
     ".github/CODEOWNERS",
