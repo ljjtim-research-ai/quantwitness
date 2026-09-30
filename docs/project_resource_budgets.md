@@ -2,6 +2,8 @@
 
 项目 Worker 的节点租约覆盖当前 Supervisor、当前 Worker 及其后代，RSS 与进程槽使用同一范围。当前正式调度逐节点执行，每次租约只计一次 Supervisor，不按 CPU 槽或进程槽倍乘父进程开销。其他运行的进程不进入当前 Worker 树。Worker 正常退出、测量异常或用户中断均进入进程清理；正常退出后仍检查内存、临时空间、进程槽和时间。节点外层采样覆盖 COMMITTED、目录发布与内容复验，成功事件写入前按节点预算与租约两者的较小上限核对峰值；超额或测量不可用进入失败状态。
 
+项目 Worker 的内存或临时空间超额保持 `project_worker_resource_exceeded` 错误码，CLI JSON 的 `data.exceeded` 按 `memory_bytes`、`temp_bytes` 返回各超额维度的 `actual` 与 `limit`，单位为字节；同时超额时保留两项。资源测量状态和进程清理状态继续独立返回。
+
 `ResourceBudget` 与进程测量、清理工具由 platform 提供，Runtime 和独立验证共用；原 Runtime 的预算导入入口保持可用。独立项目 Verifier 使用 `ResourceBudget` 的内存、CPU、临时磁盘和墙钟额度，进程槽默认 2，包含父进程和 Worker。`verify_result` 接受 `project_verifier_budget` 和 `project_verifier_process_slots`；未传预算时继承 `financial_oracle_budget` 的内存与磁盘值，默认 1 GiB 内存、8 GiB 临时空间、1 CPU、300 秒。`execute_project_verifier` 直接接收 `budget`、`process_slots` 和 `scratch_root`。
 
 准备阶段先汇总授权 Parquet 和支持工件的复制体积，超过临时配额或实际磁盘剩余空间即拒绝。复制采用 1 MiB 块，块间检查内存和时间，文件完成后核对实际空间。执行阶段监督父进程与当前 Worker 树的 RSS、进程数、临时空间和时间，Worker 退出后的末端检查仍包含已经观测到的存活后代；清理等待后代退出，未完成清理不得成功。资源测量不可用、复制失败、Worker 失败、超时或资源超额均抛出稳定错误码，成功结果发布不会继续。

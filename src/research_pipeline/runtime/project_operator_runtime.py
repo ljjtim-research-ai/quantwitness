@@ -658,6 +658,7 @@ def _run_project_worker(
         raise
     started = time.monotonic()
     failure = None
+    exceeded: dict[str, dict[str, int]] = {}
     observed_descendants: dict[int, float] = {}
     measurement_status = "available"
     try:
@@ -678,6 +679,14 @@ def _run_project_worker(
                 failure = "project_worker_process_slots_exceeded"
             elif rss > budget.memory_bytes or size > budget.temp_bytes:
                 failure = "project_worker_resource_exceeded"
+                exceeded = {
+                    name: {"actual": actual, "limit": limit}
+                    for name, actual, limit in (
+                        ("memory_bytes", rss, budget.memory_bytes),
+                        ("temp_bytes", size, budget.temp_bytes),
+                    )
+                    if actual > limit
+                }
             if failure or finished:
                 break
             time.sleep(0.02)
@@ -699,6 +708,7 @@ def _run_project_worker(
             failure_payload={
                 "resource_measurement_status": measurement_status,
                 "process_cleanup_status": cleanup_status,
+                **({"exceeded": exceeded} if exceeded else {}),
             },
         )
     if process.returncode != 0 or not result_path.is_file():
