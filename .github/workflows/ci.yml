@@ -108,7 +108,7 @@ jobs:
       - name: Upload version release request
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: version-release-request
+          name: version-release-request-${{ github.run_attempt }}
           path: ${{ runner.temp }}/version-release-request.json
           if-no-files-found: error
           retention-days: 7

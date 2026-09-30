@@ -71,7 +71,7 @@ def test_public_publish_workflow_uses_tag_bound_trusted_publishing() -> None:
     assert plan_steps["Checkout tested commit"]["with"]["ref"] == "${{ github.event.workflow_run.head_sha }}"
     request = plan_steps["Download CI version request"]["with"]
     assert request["run-id"] == "${{ github.event.workflow_run.id }}"
-    assert request["name"] == "version-release-request"
+    assert request["name"] == "version-release-request-${{ github.event.workflow_run.run_attempt }}"
     assert "--request" in plan_steps["Check version change"]["run"]
     assert plan_steps["Upload release notes"]["if"] == "${{ steps.plan.outputs.publish == 'true' }}"
 
@@ -182,4 +182,4 @@ def test_ci_records_original_push_versions_only_after_main_checks() -> None:
         "PREVIOUS_SHA": "${{ github.event.before }}", "CANDIDATE_SHA": "${{ github.sha }}",
     }
     assert '--previous-commit "$PREVIOUS_SHA"' in record["run"]
-    assert steps["Upload version release request"]["with"]["name"] == "version-release-request"
+    assert steps["Upload version release request"]["with"]["name"] == "version-release-request-${{ github.run_attempt }}"
