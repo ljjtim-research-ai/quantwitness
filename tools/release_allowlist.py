@@ -370,7 +370,7 @@ def file_digests(project: Path, paths: Iterable[str]) -> dict[str, str]:
     }
 
 
-def _is_current_package_path(path: str, *, current_lock: str) -> bool:
+def _is_current_package_path(path: str, *, current_lock: str | None) -> bool:
     normalized = _validate_relative(path)
     relative = PurePosixPath(normalized)
     if relative.parts[:2] == ("src", "factor_contracts"):
@@ -389,7 +389,8 @@ def _is_current_package_path(path: str, *, current_lock: str) -> bool:
 def _tracked_package_paths(project: Path) -> set[str]:
     """返回 Git 已跟踪的当前包文件，包含工作区中已删除的文件。"""
 
-    current = current_catalog_lock_name(project)
+    current_file = project / "src/research_pipeline/catalog/default_lock/CURRENT"
+    current = current_catalog_lock_name(project) if current_file.is_file() else None
     completed = subprocess.run(
         [
             "git", "-C", str(project), "ls-files", "-z", "--",
