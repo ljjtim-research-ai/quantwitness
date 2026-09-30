@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import date
 from functools import cached_property
+from fractions import Fraction
 import hashlib
 
 from research_pipeline.domain import require_integer_quantity
@@ -218,10 +219,54 @@ class FuturesPosition:
     instrument_hash: str
     contracts: int
     settlement_price_units: int
+    cost_numerator: int | None = None
+    cost_denominator: int = 1
+    pnl_remainder_numerator: int = 0
+    pnl_remainder_denominator: int = 1
+    margin_units: int = 0
+
+    @property
+    def cost_price(self) -> Fraction:
+        return Fraction(self.cost_numerator, self.cost_denominator)
+
+    def with_fill(
+        self, *, contracts_delta: int, price_units: int,
+        pnl_remainder: Fraction, margin_units: int,
+    ) -> "FuturesPosition":
+        remaining = self.contracts + contracts_delta
+        if self.contracts * contracts_delta > 0:
+            basis = (self.cost_price * abs(self.contracts) + price_units * abs(contracts_delta)) / abs(remaining)
+        elif self.contracts * remaining > 0:
+            basis = self.cost_price
+        else:
+            basis = Fraction(price_units)
+        return FuturesPosition(
+            self.instrument_hash, remaining, int(basis), basis.numerator, basis.denominator,
+            pnl_remainder.numerator, pnl_remainder.denominator, margin_units,
+        )
+
+    def after_settlement(self, *, price_units: int, multiplier: int, margin_units: int) -> "FuturesPosition":
+        _, remainder = self.realize(price_units=price_units, contracts=self.contracts, multiplier=multiplier)
+        return FuturesPosition(
+            self.instrument_hash, self.contracts, price_units,
+            pnl_remainder_numerator=remainder.numerator,
+            pnl_remainder_denominator=remainder.denominator,
+            margin_units=margin_units,
+        )
+
+    def realize(self, *, price_units: int, contracts: int, multiplier: int) -> tuple[int, Fraction]:
+        exact = (price_units - self.cost_price) * contracts * multiplier
+        exact += Fraction(self.pnl_remainder_numerator, self.pnl_remainder_denominator)
+        units = int(exact)
+        return units, exact - units
 
     def __post_init__(self) -> None:
         if not self.instrument_hash or self.settlement_price_units <= 0:
             raise SimulationContractError("期货持仓身份或结算价无效")
+        if self.cost_numerator is None:
+            object.__setattr__(self, "cost_numerator", self.settlement_price_units)
+        if self.cost_denominator <= 0 or self.pnl_remainder_denominator <= 0 or self.cost_price <= 0 or self.margin_units < 0:
+            raise SimulationContractError("期货持仓成本、精度余数或保证金无效")
 
 
 @dataclass(frozen=True)
@@ -389,7 +434,15 @@ def reduce_futures(state: FuturesLedgerState, event: FinancialEvent) -> FuturesL
         fee = _nonnegative(values, "fee_units")
         price = _positive(values, "settlement_price_units")
         old = positions.get(key, FuturesPosition(key, 0, price))
-        positions[key] = FuturesPosition(key, old.contracts + contracts, price)
+        positions[key] = old.with_fill(
+            contracts_delta=contracts,
+            price_units=price,
+            pnl_remainder=Fraction(
+                int(values.get("pnl_remainder_numerator", old.pnl_remainder_numerator)),
+                int(values.get("pnl_remainder_denominator", old.pnl_remainder_denominator)),
+            ),
+            margin_units=int(values.get("position_margin_units", old.margin_units)),
+        )
         equity -= fee
         realized -= fee
     elif event.kind == "mark_to_market":

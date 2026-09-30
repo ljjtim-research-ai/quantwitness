@@ -12,3 +12,26 @@ prune release
 prune scripts
 prune tests
 prune tools
+
+include ARCHITECTURE.md
+include CONTRIBUTING.md
+include EXTENSIONS.md
+include SECURITY.md
+include THIRD_PARTY_NOTICES.md
+include docs/ai_workflow.md
+include docs/architecture.md
+include docs/catalog.md
+include docs/cli.md
+include docs/data_plane.md
+include docs/evidence.md
+include docs/getting-started.md
+include docs/index.md
+include docs/minute_rule_provenance.md
+include docs/operations.md
+include docs/release.md
+include docs/research_package.md
+include docs/runtime.md
+include docs/walk_forward_model.md
+include docs/project_resource_budgets.md
+include project_extensions/README.md
+include examples/README.md

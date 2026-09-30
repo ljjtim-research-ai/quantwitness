@@ -6,7 +6,9 @@ from datetime import datetime, timezone
 import shutil
 from typing import Iterator, Mapping
 from research_pipeline.platform import canonical_json
-from research_pipeline.platform.metric_contracts import build_mainline_metric_registry
+from research_pipeline.platform.metric_contracts import (
+    build_mainline_metric_registry, builtin_metric_output_path,
+)
 from research_pipeline.research.statistics import MinuteLabelReturn, MinuteStatisticsProfile, stream_minute_statistics_artifact
 from ..operator_graph_evidence import build_minute_intraday_validity_facts
 from ..operator_runtime import OperatorRuntimeContext, RuntimeCompletionMetadata, RuntimeNodeOutputs, RuntimeNodeValue
@@ -173,7 +175,7 @@ def execute_research_statistics_minute_v1(
         (staging / "result.json").write_text(
             canonical_json(_json_ready(dict(result))), encoding="utf-8"
         )
-        metrics = staging / "statistics/part-00000.parquet"
+        metrics = staging / builtin_metric_output_path("research.minute-statistics.v1") / "part-00000.parquet"
         metrics.parent.mkdir(parents=True, exist_ok=True)
         pq.write_table(pa.Table.from_pylist(table_rows), metrics)
         commit = context.external_store.commit(

@@ -9,6 +9,14 @@ class MainlineError(ValueError):
     error_code = "mainline_error"
 
 
+class RuntimeErrorBase(MainlineError):
+    error_code = "runtime_error"
+
+
+class RuntimeContractError(RuntimeErrorBase):
+    error_code = "runtime_contract_invalid"
+
+
 class CanonicalEncodingError(MainlineError):
     """输入无法按已声明的 canonical codec 无歧义编码。"""
 

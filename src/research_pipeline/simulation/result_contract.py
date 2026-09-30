@@ -662,10 +662,25 @@ def verify_simulation_result_contract(result: SimulationResultContract) -> None:
 def write_simulation_result_contract(
     result: SimulationResultContract,
     output_root: str | Path,
+    *,
+    daily_etf_context: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """原子写入六张规范表；manifest 绑定 schema、语义和逐表内容。"""
 
     root = Path(output_root).resolve()
+    context = None
+    if daily_etf_context is not None:
+        from .daily_financial_context import build_daily_etf_financial_context
+
+        if result.semantics.asset_class != "cn_etf" or result.semantics.frequency != "daily":
+            raise SimulationContractError("日频 ETF 金融上下文只能随对应六表发布")
+        context = build_daily_etf_financial_context(
+            **daily_etf_context, simulation_result_hash=result.result_hash,
+        )
+        if context["source_simulation_hash"] != result.source_simulation_hash:
+            raise SimulationContractError("日频 ETF 金融上下文与六表来源仿真不一致")
+        if (root.parent / "daily-context.json").exists():
+            raise FileExistsError("日频 ETF 金融上下文已存在")
     staging = root.parent / f".{root.name}.staging-{uuid.uuid4().hex}"
     if root.exists():
         raise FileExistsError(f"仿真结果合同已存在: {root}")
@@ -694,6 +709,9 @@ def write_simulation_result_contract(
             raise SimulationContractError(
                 f"{name} 写入后的 schema 或行数不闭合"
             )
+    if context is not None:
+        with (root.parent / "daily-context.json").open("x", encoding="utf-8") as stream:
+            stream.write(canonical_json(context))
     # 输入 ResultContract 已在构造时完成金融校验；消费或 resume 时再做
     # 独立全表复核，避免写入阶段同时保留原 DataFrame 和读回副本。
     return manifest

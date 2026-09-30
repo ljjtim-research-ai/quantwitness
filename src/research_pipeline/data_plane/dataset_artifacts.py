@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
+from decimal import Decimal
 import math
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -14,6 +15,7 @@ from research_pipeline.platform.canonical import typed_canonical_hash
 from .errors import SnapshotIntegrityError
 from .admission import AdmittedQueryPlan
 from .path_policy import PathRolePolicy
+from .query_ir import FilterOperator
 from .snapshots import verify_parquet_snapshot
 from .verification_lifecycle import current_artifact_verification
 
@@ -140,7 +142,9 @@ def _filter_expression(
     filters: tuple[DatasetFilter, ...],
     *,
     allowed_columns: tuple[str, ...],
+    schema: object = None,
 ):
+    import pyarrow as pa
     import pyarrow.dataset as ds
 
     expression = None
@@ -148,19 +152,43 @@ def _filter_expression(
         if item.field not in allowed_columns:
             raise SnapshotIntegrityError(f"过滤请求包含未批准列: {item.field}")
         field = ds.field(item.field)
+        value = item.value
+        field_type = None if schema is None else schema.field(item.field).type
+        if field_type is not None and pa.types.is_decimal(field_type):
+            if item.operator == "in":
+                value = pa.array([Decimal(str(entry)) for entry in value], type=field_type)
+            elif item.operator not in {"is_null", "is_valid"}:
+                value = pa.scalar(Decimal(str(value)), type=field_type)
         current = {
-            "eq": lambda: field == item.value,
-            "ne": lambda: field != item.value,
-            "lt": lambda: field < item.value,
-            "le": lambda: field <= item.value,
-            "gt": lambda: field > item.value,
-            "ge": lambda: field >= item.value,
-            "in": lambda: field.isin(list(item.value)),
+            "eq": lambda: field == value,
+            "ne": lambda: field != value,
+            "lt": lambda: field < value,
+            "le": lambda: field <= value,
+            "gt": lambda: field > value,
+            "ge": lambda: field >= value,
+            "in": lambda: field.isin(value),
             "is_null": field.is_null,
             "is_valid": field.is_valid,
         }[item.operator]()
         expression = current if expression is None else expression & current
     return expression
+
+
+def _query_dataset_filters(plan: AdmittedQueryPlan) -> tuple[DatasetFilter, ...]:
+    """沿用 Arrow 过滤表达式，保留 QueryIR 的闭区间和空值语义。"""
+
+    filters: list[DatasetFilter] = []
+    for predicate in plan.query.filters:
+        field, values = predicate.field_id, predicate.values
+        if predicate.operator == FilterOperator.RANGE:
+            filters.extend((DatasetFilter(field, "ge", values[0]), DatasetFilter(field, "le", values[1])))
+        elif predicate.operator == FilterOperator.IS_NULL:
+            filters.append(DatasetFilter(field, "is_null" if values[0] else "is_valid"))
+        elif predicate.operator == FilterOperator.IN:
+            filters.append(DatasetFilter(field, "in", values))
+        else:
+            filters.append(DatasetFilter(field, "eq", values[0]))
+    return tuple(filters)
 
 
 class VerifiedDataset:
@@ -211,10 +239,19 @@ class VerifiedDataset:
         expression = _filter_expression(
             filters,
             allowed_columns=self.allowed_columns,
+            schema=self.schema,
         )
         files = self._require_current_binding()
         dataset = ds.dataset([str(path) for path in files], format="parquet")
-        scanner = dataset.scanner(columns=list(columns), filter=expression, batch_size=batch_size)
+        scanner = dataset.scanner(
+            columns=list(columns),
+            filter=expression,
+            batch_size=batch_size,
+            batch_readahead=0,
+            fragment_readahead=1,
+            use_threads=False,
+            fragment_scan_options=ds.ParquetFragmentScanOptions(pre_buffer=False),
+        )
         for batch in scanner.to_batches():
             if int(batch.nbytes) > self.max_batch_bytes:
                 raise SnapshotIntegrityError("扫描 RecordBatch 超过批准内存上限")
@@ -257,6 +294,8 @@ class VerifiedDataset:
         """在正式消费边界按单个样本时点选择版本，并裁剪回公开列。"""
 
         import pyarrow as pa
+        import pyarrow.dataset as ds
+
         if self.manifest.get("temporal_source") is not True:
             raise SnapshotIntegrityError("普通数据工件不接受逐决策时态选择")
         if self.manifest.get("admitted_plan_hash") != plan.plan_hash:
@@ -267,30 +306,63 @@ class VerifiedDataset:
             raise SnapshotIntegrityError("逐决策扫描只能返回 QueryIR 公开列")
         if type(batch_size) is not int or batch_size <= 0 or batch_size > self.max_batch_rows:
             raise SnapshotIntegrityError("扫描 batch_size 超过批准上限")
+        temporal = plan.temporal_selection
+        all_filters = (*_query_dataset_filters(plan), *filters)
+        expression = _filter_expression(
+            all_filters, allowed_columns=temporal.required_scan_fields, schema=self.schema,
+        )
+        stable_filters = tuple(
+            item for item in all_filters if item.field in temporal.stable_filter_fields
+        )
         records = (
             row
             for batch in self._iter_ordered_file_batches(
-                columns=plan.temporal_selection.required_scan_fields,
-                filters=filters,
-                allowed_columns=plan.temporal_selection.required_scan_fields,
+                columns=temporal.required_scan_fields,
+                filters=stable_filters,
+                allowed_columns=temporal.required_scan_fields,
                 batch_size=batch_size,
             )
             for row in batch.to_pylist()
         )
-        selected_records = plan.temporal_selection.iter_grouped_selected_records(
+        # 内部保留过滤和排序列，完成选择后才裁剪公开输出。
+        selection = replace(temporal, public_projection=temporal.required_scan_fields)
+        selected_records = selection.iter_grouped_selected_records(
             records,
             consumer_time=consumer_time,
             primary_key=plan.primary_key,
+            order_by=tuple((item.field_id, item.descending) for item in plan.query.sort),
         )
-        output_schema = pa.schema([self.schema.field(field) for field in columns])
+        scan_schema = pa.schema([self.schema.field(field) for field in temporal.required_scan_fields])
+        remaining = plan.query.limit
+
+        def output_batches(rows: list[dict[str, object]]) -> Iterator[object]:
+            nonlocal remaining
+            table = pa.Table.from_batches([self._record_batch(rows, scan_schema)])
+            if expression is not None:
+                table = ds.dataset(table).scanner(
+                    filter=expression,
+                    batch_size=batch_size,
+                    batch_readahead=0,
+                    fragment_readahead=1,
+                    use_threads=False,
+                    fragment_scan_options=ds.ParquetFragmentScanOptions(pre_buffer=False),
+                ).to_table()
+            table = table.select(list(columns))
+            if remaining is not None:
+                table = table.slice(0, remaining)
+                remaining -= table.num_rows
+            yield from table.to_batches(max_chunksize=batch_size)
+
         output_rows: list[dict[str, object]] = []
         for row in selected_records:
-            output_rows.append({field: row[field] for field in columns})
+            output_rows.append(dict(row))
             if len(output_rows) == batch_size:
-                yield self._record_batch(output_rows, output_schema)
+                yield from output_batches(output_rows)
                 output_rows = []
+                if remaining == 0:
+                    return
         if output_rows:
-            yield self._record_batch(output_rows, output_schema)
+            yield from output_batches(output_rows)
 
     def iter_temporal_fact_batches(
         self,
@@ -331,13 +403,18 @@ class VerifiedDataset:
 
         import pyarrow.dataset as ds
 
-        expression = _filter_expression(filters, allowed_columns=allowed_columns)
+        expression = _filter_expression(
+            filters, allowed_columns=allowed_columns, schema=self.schema,
+        )
         for path in self._require_current_binding():
             scanner = ds.dataset(str(path), format="parquet").scanner(
                 columns=list(columns),
                 filter=expression,
                 batch_size=batch_size,
+                batch_readahead=0,
+                fragment_readahead=1,
                 use_threads=False,
+                fragment_scan_options=ds.ParquetFragmentScanOptions(pre_buffer=False),
             )
             for batch in scanner.to_batches():
                 if int(batch.nbytes) > self.max_batch_bytes:

@@ -11,7 +11,19 @@ from research_pipeline.operations import (
     run_research_doctor,
 )
 
+from research_pipeline.platform import MainlineError
+
 from ..result import execute_guarded
+
+
+class DoctorFailedError(MainlineError):
+    """保留各检查目标的诊断事实和处理建议。"""
+
+    error_code = "doctor_failed"
+
+    def __init__(self, findings: list[dict[str, object]]) -> None:
+        super().__init__("research doctor 未通过，请按 findings 定位检查目标")
+        self.failure_payload = {"doctor_status": "fail", "findings": findings}
 
 
 def execute(args) -> int:
@@ -32,9 +44,10 @@ def _execute(args) -> dict[str, object]:
     report = run_research_doctor(
         run_roots=tuple(args.run_root),
     )
+    findings = [asdict(item) for item in report.findings]
     if report.status == "fail":
-        raise ValueError(f"research doctor 未通过: {[item.code for item in report.findings]}")
-    return {"doctor_status": report.status, "findings": [asdict(item) for item in report.findings]}
+        raise DoctorFailedError(findings)
+    return {"doctor_status": report.status, "findings": findings}
 
 
 __all__ = ["execute"]

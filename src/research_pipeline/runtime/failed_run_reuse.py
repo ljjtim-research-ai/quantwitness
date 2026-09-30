@@ -102,7 +102,7 @@ def prepare_failed_run_reuse(
         parent_run_id,
         projection,
         first_unfinished,
-        verified_nodes=frozenset(ordered_nodes),
+        verified_nodes=frozenset(node_id for node_id, status in projection.node_statuses.items() if status == "succeeded"),
     )
     if any(
         projection.node_statuses.get(node_id) != "succeeded"

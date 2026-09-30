@@ -61,7 +61,7 @@ def _ordered(dag: DagSpec, values: frozenset[str] | set[str]) -> tuple[str, ...]
 
 
 def plan_resume(dag: DagSpec, run_id: str, projection: RuntimeProjection, *, verified_nodes: frozenset[str], invalid_nodes: frozenset[str]) -> RecoveryPlan:
-    if projection.run_id != run_id or projection.run_status not in {"planned", "running", "paused"}:
+    if projection.run_id != run_id or projection.run_status not in {"created", "planned", "running", "paused"}:
         raise RuntimeStateError("resume 只接受同一非终态 run")
     invalidated = _descendants(dag, invalid_nodes) if invalid_nodes else frozenset()
     successful = frozenset(node for node, status in projection.node_statuses.items() if status == "succeeded")
@@ -84,8 +84,12 @@ def plan_rerun_from(dag: DagSpec, new_run_id: str, parent_run_id: str, projectio
     if projection.run_id != parent_run_id or projection.run_status not in {"succeeded", "failed", "cancelled"}:
         raise RuntimeStateError("rerun-from 只接受终态父 run")
     forced = _descendants(dag, frozenset({node_id}))
-    reuse = verified_nodes - forced
-    return RecoveryPlan("rerun-from", new_run_id, parent_run_id, _ordered(dag, reuse), _ordered(dag, forced), (), _ordered(dag, forced), reason=f"force-from:{node_id}")
+    all_nodes = frozenset(node.node_id for node in dag.nodes)
+    successful = frozenset(node for node, status in projection.node_statuses.items() if status == "succeeded")
+    invalidated = _descendants(dag, all_nodes - (successful & verified_nodes))
+    recompute = forced | invalidated
+    reuse = all_nodes - recompute
+    return RecoveryPlan("rerun-from", new_run_id, parent_run_id, _ordered(dag, reuse), _ordered(dag, recompute), (), _ordered(dag, forced), reason=f"force-from:{node_id}")
 
 
 __all__ = ["RECOVERY_PLAN_VERSION", "RecoveryPlan", "plan_rerun_from", "plan_resume", "plan_retry_node"]

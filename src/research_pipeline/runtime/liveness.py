@@ -15,11 +15,14 @@ import psutil
 from research_pipeline.platform import canonical_json
 
 from .errors import RuntimeIntegrityError
+from .store import _StoreLock, process_identity_alive
 
 
 RUNTIME_LIVENESS_VERSION = "research-runtime-liveness-v1"
 RUNTIME_LIVENESS_FILE = "runtime-liveness.json"
 _PHASES = frozenset({
+    "starting",
+    "stopped",
     "waiting_for_resources",
     "executing",
     "checkpointing",
@@ -38,7 +41,7 @@ class RuntimeLiveness:
         self,
         run_root: str | Path,
         *,
-        run_id: str,
+        run_id: str | None,
         phase: str,
         node_id: str | None = None,
         attempt_id: str | None = None,
@@ -72,17 +75,34 @@ class RuntimeLiveness:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._active = False
 
     def start(self) -> "RuntimeLiveness":
-        with self._lock:
-            self._write_locked()
+        with _StoreLock(self.path.parent / ".owner.lock"):
+            require_inactive_owner(self.path.parent)
+            with self._lock:
+                self._write_locked()
+                self._active = True
         self._thread = threading.Thread(
             target=self._maintain,
             name="runtime-liveness-heartbeat",
             daemon=True,
         )
-        self._thread.start()
+        try:
+            self._thread.start()
+        except BaseException:
+            self._thread = None
+            self.stop()
+            raise
         return self
+
+    def bind_run(self, run_root: str | Path, run_id: str) -> None:
+        """同一次调用在准入完成后绑定正式运行身份。"""
+        if Path(run_root).resolve() != self.path.parent or not self._active:
+            raise RuntimeIntegrityError("Runtime owner 不属于当前活动调用")
+        with self._lock:
+            self._payload["run_id"] = run_id
+            self._write_locked()
 
     def update(
         self,
@@ -100,10 +120,30 @@ class RuntimeLiveness:
                 self._payload["reserved_resources"] = dict(reserved_resources)
             self._write_locked()
 
+    def set_node(
+        self, *, node_id: str, attempt_id: str,
+        requested_resources: Mapping[str, int],
+    ) -> None:
+        with self._lock:
+            self._payload.update(
+                node_id=node_id, attempt_id=attempt_id,
+                requested_resources=dict(requested_resources), reserved_resources={},
+                phase="waiting_for_resources", phase_started_at=_utc_now(),
+            )
+            self._write_locked()
+
     def stop(self) -> None:
+        if not self._active:
+            return
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=max(1.0, self.interval_seconds * 2))
+        with self._lock:
+            if self._active:
+                self._payload["phase"] = "stopped"
+                self._payload["phase_started_at"] = _utc_now()
+                self._write_locked()
+                self._active = False
 
     def _maintain(self) -> None:
         while not self._stop.wait(self.interval_seconds):
@@ -150,12 +190,16 @@ def read_runtime_liveness(run_root: str | Path) -> dict[str, object] | None:
     return payload
 
 
-def process_identity_alive(pid: int, process_started_at: float) -> bool:
-    try:
-        process = psutil.Process(pid)
-        return process.is_running() and abs(process.create_time() - process_started_at) < 1e-6
-    except (psutil.Error, OSError, ValueError):
-        return False
+def runtime_owner_alive(payload: Mapping[str, object] | None) -> bool:
+    return bool(
+        payload is not None and payload["phase"] != "stopped"
+        and process_identity_alive(int(payload["pid"]), float(payload["process_started_at"]))
+    )
+
+
+def require_inactive_owner(run_root: str | Path) -> None:
+    if runtime_owner_alive(read_runtime_liveness(run_root)):
+        raise RuntimeIntegrityError("Runtime owner 仍存活，不能接管运行；请等待原进程退出")
 
 
 __all__ = [
@@ -164,4 +208,6 @@ __all__ = [
     "RuntimeLiveness",
     "process_identity_alive",
     "read_runtime_liveness",
+    "runtime_owner_alive",
+    "require_inactive_owner",
 ]

@@ -82,6 +82,8 @@ class CheckpointStore:
             len(content),
             content_hash,
         )
+        if target.exists() and not (target / "COMMITTED").is_file():
+            shutil.rmtree(target)
         if target.exists():
             existing = self.verify(expectation)
             comparable_existing = existing.identity_payload()
@@ -105,16 +107,16 @@ class CheckpointStore:
             os.fsync(handle.fileno())
         if phase_hook:
             phase_hook("checkpoint_prepared")
-        os.replace(stage, target)
-        if phase_hook:
-            phase_hook("renamed")
-        marker = target / "COMMITTED"
+        marker = stage / "COMMITTED"
         with marker.open("w", encoding="ascii") as handle:
             handle.write(manifest.manifest_hash)
             handle.flush()
             os.fsync(handle.fileno())
         if phase_hook:
             phase_hook("marker_fsynced")
+        os.replace(stage, target)
+        if phase_hook:
+            phase_hook("renamed")
         return self.verify(expectation)
 
     def verify(

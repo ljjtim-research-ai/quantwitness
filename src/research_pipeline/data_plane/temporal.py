@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
+from functools import cmp_to_key
 from itertools import groupby
 import re
 from types import MappingProxyType
@@ -685,6 +686,16 @@ class TemporalSelectionPlan:
         return replace(self, selection_clock=self.selection_clock.bind(value))
 
     @property
+    def stable_filter_fields(self) -> frozenset[str]:
+        """只能下推不改变修订胜者和区间冲突判定的字段。"""
+
+        fields = set(self.required_scan_fields)
+        for selector in (self.revision_selector, self.effective_interval_selector):
+            if selector is not None:
+                fields.intersection_update(selector.entity_fields)
+        return frozenset(fields)
+
+    @property
     def source_order_fields(self) -> tuple[str, ...]:
         """内部版本事实的稳定键；正式消费者仍只能看到 public projection。"""
 
@@ -821,6 +832,39 @@ class TemporalSelectionPlan:
             tuple[tuple[date | datetime, ...], Mapping[str, object], int],
         ] = {}
         active: dict[tuple[object, ...], tuple[Mapping[str, object], int]] = {}
+
+        def interval_contains(raw: Mapping[str, object]) -> bool:
+            if interval is None:
+                return True
+            start = _selection_value(
+                raw[interval.effective_from_field],
+                interval.effective_from_field,
+                field_type=self._field_type(interval.effective_from_field),
+                timezone_name=self.source_timezone,
+            )
+            raw_end = raw[interval.effective_to_field]
+            end = (
+                None
+                if raw_end is None
+                else _selection_value(
+                    raw_end,
+                    interval.effective_to_field,
+                    field_type=self._field_type(interval.effective_to_field),
+                    timezone_name=self.source_timezone,
+                )
+            )
+            cutoff = _selection_value(
+                consumer_time,
+                "consumer_time",
+                field_type=self._field_type(interval.effective_from_field),
+                timezone_name=self.source_timezone,
+            )
+            starts = start < cutoff or (interval.left_closed and start == cutoff)
+            ends = end is None or end > cutoff or (
+                interval.right_closed and end == cutoff
+            )
+            return starts and ends
+
         for raw in records:
             if not set(self.required_scan_fields) <= set(raw):
                 raise QueryIRInvalidError("逐决策时态来源缺少 admitted plan 要求的字段")
@@ -877,39 +921,6 @@ class TemporalSelectionPlan:
                     raise QueryIRInvalidError("逐决策时态来源存在完全重复记录")
                 seen.add(identity)
 
-            if interval is not None:
-                start = _selection_value(
-                    raw[interval.effective_from_field],
-                    interval.effective_from_field,
-                    field_type=self._field_type(interval.effective_from_field),
-                    timezone_name=self.source_timezone,
-                )
-                raw_end = raw[interval.effective_to_field]
-                end = (
-                    None
-                    if raw_end is None
-                    else _selection_value(
-                        raw_end,
-                        interval.effective_to_field,
-                        field_type=self._field_type(interval.effective_to_field),
-                        timezone_name=self.source_timezone,
-                    )
-                )
-                cutoff = _selection_value(
-                    consumer_time,
-                    "consumer_time",
-                    field_type=self._field_type(interval.effective_from_field),
-                    timezone_name=self.source_timezone,
-                )
-                starts = start < cutoff or (interval.left_closed and start == cutoff)
-                ends = end is None or end > cutoff or (
-                    interval.right_closed and end == cutoff
-                )
-                if starts and ends:
-                    pass
-                else:
-                    continue
-
             if revision is not None:
                 entity = tuple(raw[field] for field in revision.entity_fields)
                 order = tuple(
@@ -929,6 +940,8 @@ class TemporalSelectionPlan:
                 continue
 
             if interval is not None:
+                if not interval_contains(raw):
+                    continue
                 entity = tuple(raw[field] for field in interval.entity_fields)
                 previous = active.get(entity)
                 active[entity] = (
@@ -951,6 +964,8 @@ class TemporalSelectionPlan:
                     yield self._public_record(winner)
                 return
             for winner in winners:
+                if not interval_contains(winner):
+                    continue
                 entity = tuple(winner[field] for field in interval.entity_fields)
                 previous = active.get(entity)
                 active[entity] = (
@@ -971,8 +986,27 @@ class TemporalSelectionPlan:
         *,
         consumer_time: str | date | datetime,
         primary_key: tuple[str, ...],
+        order_by: tuple[tuple[str, bool], ...] = (),
     ) -> Iterator[Mapping[str, object]]:
-        """利用已验证的主键排序逐实体选择，避免保留全体实体胜者。"""
+        """利用主键前缀逐实体选择，组内按查询排序，避免全表胜者排序。"""
+
+        if order_by and order_by[:len(primary_key)] != tuple(
+            (field, False) for field in primary_key
+        ):
+            raise QueryIRInvalidError("逐决策查询排序必须以完整主键升序开头")
+
+        def compare(left: Mapping[str, object], right: Mapping[str, object]) -> int:
+            for field, descending in order_by:
+                a, b = left[field], right[field]
+                if a is None or b is None:
+                    result = (a is None) - (b is None)
+                else:
+                    result = (a > b) - (a < b)
+                    if descending:
+                        result = -result
+                if result:
+                    return result
+            return 0
 
         selectors = tuple(
             item
@@ -982,13 +1016,6 @@ class TemporalSelectionPlan:
             )
             if item is not None
         )
-        if not selectors:
-            yield from self.iter_selected_records(
-                records,
-                consumer_time=consumer_time,
-                source_uniqueness_verified=True,
-            )
-            return
         key = tuple(primary_key)
         for selector in selectors:
             entity_fields = selector.entity_fields
@@ -999,7 +1026,10 @@ class TemporalSelectionPlan:
         group_fields = (
             self.effective_interval_selector.entity_fields
             if self.effective_interval_selector is not None
-            else self.revision_selector.entity_fields
+            else (
+                self.revision_selector.entity_fields
+                if self.revision_selector is not None else primary_key
+            )
         )
 
         def entity_key(raw: Mapping[str, object]) -> tuple[object, ...]:
@@ -1015,11 +1045,13 @@ class TemporalSelectionPlan:
             if last_key is not None and comparable <= last_key:
                 raise QueryIRInvalidError("逐决策时态来源没有按实体主键稳定排序")
             last_key = comparable
-            yield from self.iter_selected_records(
+            selected = self.iter_selected_records(
                 group,
                 consumer_time=consumer_time,
                 source_uniqueness_verified=True,
             )
+            # 组间已按查询的主键前缀有序；只保留当前实体的选择结果。
+            yield from sorted(selected, key=cmp_to_key(compare)) if order_by else selected
 
     def _public_record(
         self,

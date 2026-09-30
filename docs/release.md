@@ -6,6 +6,14 @@
 两者同时准备`setuptools>=68`、`build`和`wheel`，满足无隔离发行测试的本机构建依赖。
 这些 extras 不包括可选机器学习模型，按研究需求另装 `ml` 或 `ml-lightgbm`。
 
+## 分发内容与命令适用范围
+
+sdist 和源码 zip 均按显式清单附带当前公开操作文档、文档链接所需的根目录说明、项目扩展合同及示例说明。源码 zip 另含核心测试；wheel 只安装运行所需的包代码和资源。
+
+本文的发布构建、最低版本验收、干净 wheel 验收及公开 CI 命令从独立公开源码仓库的根目录执行，也可在完整单仓的 `research_pipeline/` 下执行发布构建和验收。发布工具、`tests/test_release_metadata_ssot.py` 及可执行合成示例随独立公开源码仓库提供，不包含在 sdist 和源码 zip 中；压缩包中的示例说明用于查阅，执行示例须使用独立公开源码仓库。
+
+文档由 `tools/release_allowlist.py` 的 `CORE_DOC_FILES` 与 `MANIFEST.in` 显式列入，不递归收录历史文档。个人研究项目源码、真实研究数据、私有 Catalog 声明和 Lock、内部整改基线及维护脚本均不进入三类发行产物。需要 Catalog 的命令由调用方提供自己的持久 Lock。
+
 ## 正式构建
 
 先在独立环境准备 `pyproject.toml` 的构建依赖以及 `build`。离线机器需提前准备当前平台和 Python 版本兼容的 wheelhouse；构建本身不联网安装依赖。
@@ -19,7 +27,7 @@ python tools/build_release_artifacts.py --project . --output <不存在的仓库
 
 人工发布只使用本次命令 JSON 回执中的 `wheel`、`sdist` 和 `source_archive` 绝对路径，并记录候选提交及库存验收结果。确认新目录恰好包含这三件文件；混入第二个 wheel 不得发布。历史 `dist/` 文件不属于本次候选，不能按通配符选择，更不能以旧文件代替当前源码构建。
 
-干净 wheel 验收需要调用方显式提供一个持久 Catalog Lock，供安装后资源读取测试使用；它不是发行包资源。验收还检查公共 Recipe 为空、`package init/lint` 可用：
+干净 wheel 验收需要调用方显式提供一个持久 Catalog Lock，供安装后资源读取测试使用；它不是发行包资源。验收还检查公共 Recipe 为空、`package init` 可用；新建中性草稿的 `lint` 必须返回 exit=1，且 JSON 中 `status=fail`、`error_code=research_package_invalid` 并明确指出 sources 为空。意外成功、其他错误或无效 JSON 都使验收失败：
 
 ```powershell
 ./scripts/verify_clean_wheel.ps1 -Wheel <wheel路径> -ReceiptOut <仓库外新收据路径> -CatalogLock <持久Catalog-Lock目录>
@@ -29,7 +37,7 @@ python tools/build_release_artifacts.py --project . --output <不存在的仓库
 
 ## 最低版本验收
 
-`tests/test_release_metadata_ssot.py` 比较 pyproject、wheel、sdist、安装后元数据的名称、版本、Python 范围、依赖、extras 和 console script。使用最低版本创建三个不继承系统包的虚拟环境，分别安装 wheel、sdist 和源码 zip，并运行 CLI、依赖完整性检查及不访问数据库的核心 smoke。
+独立公开源码清单中的 `tests/test_release_metadata_ssot.py` 比较 pyproject、wheel、sdist、安装后元数据的名称、版本、Python 范围、依赖、extras 和 console script。使用最低版本创建三个不继承系统包的虚拟环境，分别安装 wheel、sdist 和源码 zip，并运行 CLI、依赖完整性检查及不访问数据库的核心 smoke。
 
 该验收只证明安装与发布元数据合同，不代表通过真实研究、全部发布门禁或能力晋级。
 

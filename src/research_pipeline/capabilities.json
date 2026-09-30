@@ -332,7 +332,7 @@
       "required_inputs": [
         "本清单",
         "OperatorDefinition 与 Recipe registry",
-        "Catalog Lock（可省略时使用内置默认 Lock）",
+        "Catalog 搜索必须显式提供持久 Catalog Lock",
         "package lint 使用的 ResearchPackage"
       ],
       "implementation_anchors": [

@@ -67,7 +67,6 @@ def _execute(args) -> dict[str, object]:
             resource_stale_seconds=args.resource_stale_seconds,
             source_db=source_dbs,
             minute_data_root=args.minute_data_root,
-            acceptance_proof=args.acceptance_proof,
         )
     if args.workspace_command in {"resume", "retry-node"}:
         return resume_workspace_execution(

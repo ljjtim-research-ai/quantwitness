@@ -14,13 +14,19 @@ python -m research_pipeline --help
 
 项目扩展必须是可信本地代码：框架核验正式输入输出和工件内容，并提供worker超时及进程清理；它不是安全沙箱，不拦截任意Python在staging外的副作用。数据库只读仍须遵守。
 
-分钟金融独立验证将历史关联和分组交给受配额DuckDB，Python只保留当前金融状态。实际支持规模以验证记录为准，不承诺任意数据规模的绝对内存上界。
+分钟金融独立验证将历史关联和分组交给受配额DuckDB，Python只保留当前金融状态。项目 Worker 与 Verifier 的资源预算覆盖 Supervisor、当前 Worker 及其后代；复制准备也计入 Verifier 预算，详见[资源预算](docs/project_resource_budgets.md)。实际支持规模以验证记录为准。
+
+滚动模型在每个测试时点只使用已可见的验证结果冻结候选，标签可见时间参与训练准入，详见[滚动模型合同](docs/walk_forward_model.md)。`artifact describe` 返回正式指标、单位、字段及 ResultSpec 目录；Catalog 搜索必须显式提供持久 Lock。
 
 算子实现身份按共同变化的语义族及明确共享依赖计算，避免无关适配器修改使数值节点缓存失效；严格字节模式保留整个构建一致的要求。恢复边界见 [Runtime 与恢复](docs/runtime.md)。
+
+在聚宽数据库仓库中，`data_factor.duckdb` 默认只读。研究主链不导入 `FactorPublisher`，不会发布或改写数据库；正式因子库仍只能由 `factor_calc.publish` 写入，因子发布必须走独立授权流程。
 
 ## 唯一闭环
 
 安装要求 Python 3.10 或更新版本；开发使用 `python -m pip install ".[dev]"`。正式构建只从 `pyproject.toml` 生成元数据，命令与最低版本验收见 [安装与发布构建](docs/release.md)。
+
+sdist 与源码 zip 包含公开操作文档及其本地链接依赖；发布工具、完整发布验收和可执行合成示例请使用独立公开源码仓库。发行产物不包含个人研究源码、真实研究数据或私有 Catalog Lock。
 
 ```text
 研究问题与口径冻结
@@ -121,6 +127,8 @@ revision 漂移都在准入或计划复核时失败。当前正式发布范围�
 - `operator list/describe` 的机器发现合同为 `research-machine-discovery-v2`，会标明 `builtin`、`legacy_exit` 或 `promoted`。普通发现只核对 Runtime manifest 的分类、identity 与定义冻结值，不读取私有项目或晋级测试目录。人工晋级前，外层专用审查显式接收两个真实项目目录与测试证据根，核对目标算子的实际消费、可编译性、异构算子图以及不同的 oracle/攻击 pytest 节点，并执行这些节点。审查者还要线下核实项目真实性与证据含义；示例或临时合成包不是实际晋级证据。刷新 capability/remediation baseline 不能代替晋级。
 - framework boundary 扫描完整生产 core 并识别业务节点读取全图、按兄弟节点或 dataset 猜输入、直接下传全体已准入计划和固定项目身份分支。业务节点只能从当前参数的 request 绑定投影 admitted plan；完整请求集合由列式物化调度器负责。`capability_containment_gate.py --mode snapshot` 在有批准晋级记录时要求显式复用项目目录与证据根，随后执行晋级审查、结构门和 node-local 变形测试；普通 `check` 不追溯私有审查输入。不接受将失败状态同步冻结为新 baseline。
 - 当前公共 manifest 有 24 个已审查的 `builtin` 定义；项目算子只通过本次 Package 的扩展 bundle 准入，不进入公共注册表。新增公共算子必须通过正式晋级证据，不能借刷新 baseline 放行。
+
+研究复现由项目 Verifier 声明和验证。公共命令不接收独立研究 proof，包声明不含 `reproduction` 开关。变更后的声明与实现须重新准入并产生新运行身份，历史 Result 保持原样。
 
 模板只影响新生成的 package。已经生成的 package 不自动迁移；上述合同变化后，
 应使用项目自有模板或手工修改声明，重新 `package lint`、`package admit` 并新建 run。

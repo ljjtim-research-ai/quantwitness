@@ -39,8 +39,8 @@ class MinuteLabelReturn:
             self.decision_at_ns, self.entry_at_ns, self.exit_at_ns,
         )):
             raise StatisticsError("分钟标签时间必须是正整数纳秒")
-        if not self.decision_at_ns < self.entry_at_ns < self.exit_at_ns:
-            raise StatisticsError("分钟标签必须满足 decision < entry < exit")
+        if not (self.entry_at_ns < self.exit_at_ns and self.decision_at_ns < self.exit_at_ns):
+            raise StatisticsError("分钟标签起价事件和决策必须早于终价事件")
         if not math.isfinite(self.return_value):
             raise StatisticsError("分钟收益必须有限")
 

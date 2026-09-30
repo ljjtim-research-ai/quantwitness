@@ -523,9 +523,22 @@ class MetricRegistry:
                 == definition.result_schema_id
             )
             if len(table_matches) != 1:
+                actual_tables = [
+                    {
+                        "node": getattr(item, "source_node_id", None),
+                        "port": getattr(item, "source_port", None),
+                        "artifact_type": getattr(item, "artifact_type", None),
+                        "schema_id": getattr(item, "schema_id", None),
+                    }
+                    for item in result_tables
+                ]
                 raise UnreachableMetricError(
                     "metric 必须唯一绑定 ResultSpec 中的指标表: "
-                    f"{metric_ref}; matches={len(table_matches)}"
+                    f"{metric_ref}; expected_node={node_id}, expected_port={port}, "
+                    f"expected_artifact_type={artifact_type}, "
+                    f"expected_schema_id={definition.result_schema_id}; "
+                    f"actual_tables={actual_tables}; "
+                    f"matches={len(table_matches)}"
                 )
             table = table_matches[0]
             result_binding = (
@@ -556,6 +569,19 @@ def _implementation_digest(implementation_ref: str, modules: Sequence[str]) -> s
     )
 
 
+_BUILTIN_METRIC_OUTPUT_LAYOUTS = {
+    "data.columnar-bundle.v1": ("data.columnar-bundle.metrics.v1", "observation"),
+    "research.minute-observation.v1": ("research.minute-observation.metrics.v1", "observation"),
+    "research.minute-statistics.v1": ("research.minute-statistics.v1", "statistics"),
+}
+
+
+def builtin_metric_output_path(artifact_type: str) -> str:
+    """正式内建指标表的相对目录，由写入方与发现接口共同消费。"""
+
+    return _BUILTIN_METRIC_OUTPUT_LAYOUTS[artifact_type][1]
+
+
 def _definition(
     metric_id: str,
     *,
@@ -569,16 +595,11 @@ def _definition(
     modules: Sequence[str],
     measurement_semantics: MetricMeasurementSemantics,
 ) -> MetricDefinition:
-    result_schemas = {
-        "data.columnar-bundle.v1": "data.columnar-bundle.metrics.v1",
-        "research.minute-observation.v1": "research.minute-observation.metrics.v1",
-        "research.minute-statistics.v1": "research.minute-statistics.v1",
-    }
     return MetricDefinition.build(
         metric_id=metric_id,
         version="1.0.0",
         input_artifact_type=artifact_type,
-        result_schema_id=result_schemas[artifact_type],
+        result_schema_id=_BUILTIN_METRIC_OUTPUT_LAYOUTS[artifact_type][0],
         output_schema={
             "metric_ref": "string",
             "value": "float64",

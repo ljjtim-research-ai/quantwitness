@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fractions import Fraction
+
 from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 import json
@@ -360,6 +362,12 @@ def verify_minute_execution_rules(
                 eligible -= bought_today.get(instrument_id, 0)
             if quantity > eligible:
                 raise EvidenceContractError("分钟卖出 fill 绕过 T+1 可卖数量")
+            if quantity % lot_size:
+                allowed = lot_parameters.get("sell_remainder_allowed")
+                if allowed is None:
+                    allowed = instrument_id.rpartition(".")[2] in {"XSHG", "XSHE"} and session >= date(2006, 7, 1) and lot_size == 100
+                if allowed is not True or quantity % lot_size != eligible % lot_size:
+                    raise EvidenceContractError("分钟卖出 fill 拆分零股或不符合历史交易单位")
             sold_total[instrument_id] = sold_total.get(instrument_id, 0) + quantity
     _verify_minute_spot_position_buckets(
         positions=canonical["positions"],
@@ -549,7 +557,10 @@ def _verify_minute_futures_execution_rules(
         session_date = _date_value(event.get("session"), "settlement.session")
         if session_date not in cash_by_session:
             raise EvidenceContractError("分钟期货结算事件引用未知现金快照会话")
-    positions: dict[str, tuple[int, int]] = {}
+    positions: dict[str, tuple[int, Fraction]] = {}
+    funded_notional: dict[str, Fraction] = {}
+    rounding_balance: dict[str, Fraction] = {}
+    position_margins: dict[str, int] = {}
     instrument_hashes = {
         str(row["instrument_id"]): str(row["instrument_hash"])
         for row in canonical["orders"]
@@ -572,7 +583,8 @@ def _verify_minute_futures_execution_rules(
     for cash in _ordered_rows(canonical["cash"], order_by=("session",)):
         session_date = _date_value(cash["session"], "cash.session")
         for fill in _minute_filtered_rows(
-            canonical["fills"], {"session": session_date}, order_by=("fill_time", "fill_id"),
+            canonical["fills"], {"session": session_date},
+            order_by=("fill_time", "instrument_id", "position_effect", "fill_id"),
         ):
             instrument_id = str(fill["instrument_id"])
             price = int(fill["execution_price_units"])
@@ -584,14 +596,19 @@ def _verify_minute_futures_execution_rules(
             if str(fill["position_effect"]) == "close":
                 if old_quantity * expected_sign <= 0 or quantity > abs(old_quantity):
                     raise EvidenceContractError("分钟期货平仓与当时持仓不一致")
-                realized = (
-                    (price - old_basis) * quantity
-                    * int(fill["contract_multiplier"]) * expected_sign
-                )
+                # 按释放的持仓资金与反向交易现金流独立复核，不调用生产账本。
+                released = funded_notional[instrument_id] * Fraction(quantity, abs(old_quantity))
+                cashflow = -direction * quantity * price
+                exact = (cashflow - released) * int(fill["contract_multiplier"])
+                exact += rounding_balance.get(instrument_id, Fraction(0))
+                realized = int(exact)
+                rounding_balance[instrument_id] = exact - realized
+                funded_notional[instrument_id] -= released
             else:
                 if old_quantity and old_quantity * direction < 0:
                     raise EvidenceContractError("分钟期货反向开仓未先平仓")
                 realized = 0
+                funded_notional[instrument_id] = funded_notional.get(instrument_id, Fraction(0)) + direction * quantity * price
             if int(fill["realized_pnl_units"]) != realized:
                 raise EvidenceContractError("分钟期货 fill 已实现盈亏复算不一致")
             order = orders.get(str(fill["order_id"]))
@@ -610,10 +627,7 @@ def _verify_minute_futures_execution_rules(
             )
             multiplier = int(fill["contract_multiplier"])
             new_quantity = old_quantity + direction * quantity
-            old_margin = _ceil_ratio(
-                old_basis * multiplier * abs(old_quantity) * margin_ppm,
-                1_000_000,
-            )
+            old_margin = position_margins.get(instrument_id, 0)
             new_margin = _ceil_ratio(
                 price * multiplier * abs(new_quantity) * margin_ppm,
                 1_000_000,
@@ -626,9 +640,10 @@ def _verify_minute_futures_execution_rules(
                 raise EvidenceContractError("分钟期货 fill 绕过盘中投机保证金约束")
             running_margin = next_margin
             running_equity = next_equity
+            position_margins[instrument_id] = new_margin
             positions[instrument_id] = (
                 new_quantity,
-                price,
+                funded_notional[instrument_id] / new_quantity if new_quantity else Fraction(price),
             )
 
         instrument_ids = {
@@ -714,7 +729,10 @@ def _verify_minute_futures_execution_rules(
             quantity, basis = positions.get(
                 instrument_id, (0, settlement_price)
             )
-            pnl = (settlement_price - basis) * quantity * multiplier
+            exact = (quantity * settlement_price - funded_notional.get(instrument_id, Fraction(0))) * multiplier
+            exact += rounding_balance.get(instrument_id, Fraction(0))
+            pnl = int(exact)
+            rounding_balance[instrument_id] = exact - pnl
             margin = _ceil_ratio(
                 settlement_price * multiplier * abs(quantity) * margin_ppm,
                 1_000_000,
@@ -729,7 +747,7 @@ def _verify_minute_futures_execution_rules(
                     parameters.get("price_scale"), "price_scale", minimum=0
                 ),
                 "position_contracts_before": quantity,
-                "previous_settlement_price_units": basis,
+                "previous_settlement_price_units": int(basis),
                 "contract_multiplier": multiplier,
                 "speculative_margin_ppm": margin_ppm,
                 "pnl_units": pnl,
@@ -768,9 +786,11 @@ def _verify_minute_futures_execution_rules(
                 "event_hash": typed_canonical_hash(event),
             })
             if fact["instrument_id"] in positions:
+                funded_notional[str(fact["instrument_id"])] = Fraction(int(fact["position_contracts_before"]) * int(fact["settlement_price_units"]))
+                position_margins[str(fact["instrument_id"])] = int(fact["required_margin_units"])
                 positions[str(fact["instrument_id"])] = (
                     int(fact["position_contracts_before"]),
-                    int(fact["settlement_price_units"]),
+                    Fraction(int(fact["settlement_price_units"])),
                 )
         declared = sorted(
             _minute_events_for_session(settlement_events, session_date),

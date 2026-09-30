@@ -107,11 +107,15 @@ def build_walk_forward(
         test = frame.loc[frame["observation_time"].dt.date.isin(test_dates)]
         if candidate_train.empty or candidate_validation.empty or test.empty:
             raise ValidationError("walk-forward 窗口存在空训练/验证/测试集")
-        first_eval = candidate_validation["observation_time"].min()
-        keep = candidate_train["label_end"] < first_eval
+        first_eval = candidate_validation["decision_time"].min()
+        keep = (candidate_train["label_end"] < first_eval) & (
+            candidate_train["label_available_time"] <= first_eval
+        )
         train = candidate_train.loc[keep]
-        first_test = test["observation_time"].min()
-        validation_keep = candidate_validation["label_end"] < first_test
+        first_test = test["decision_time"].min()
+        validation_keep = (candidate_validation["label_end"] < first_test) & (
+            candidate_validation["label_available_time"] <= first_test
+        )
         validation = candidate_validation.loc[validation_keep]
         embargo_dates = set(sessions[validation_end + 1:test_start])
         embargoed = frame.loc[frame["observation_time"].dt.date.isin(embargo_dates)]
@@ -141,12 +145,20 @@ def _normalize_samples(samples: pd.DataFrame) -> pd.DataFrame:
     missing = required - set(samples.columns)
     if missing:
         raise ValidationError(f"切分样本缺少字段: {sorted(missing)}")
-    frame = samples.loc[:, sorted(required)].copy()
+    frame = samples.loc[:, sorted(required | ({"decision_time", "label_available_time"} & set(samples.columns)))].copy()
+    if "decision_time" not in frame:
+        frame["decision_time"] = frame["observation_time"]
+    if "label_available_time" not in frame:
+        frame["label_available_time"] = frame["label_end"]
     frame["sample_id"] = frame["sample_id"].astype(str)
     if frame["sample_id"].duplicated().any() or frame["sample_id"].eq("").any():
         raise ValidationError("sample_id 必须非空且唯一")
-    for column in ("observation_time", "label_start", "label_end"):
+    for column in ("observation_time", "decision_time", "label_start", "label_end", "label_available_time"):
         frame[column] = pd.to_datetime(frame[column], utc=True, errors="raise")
+    if frame[["decision_time", "label_available_time"]].isna().any().any():
+        raise ValidationError("样本决策时间和标签可见时间不能为空")
+    if (frame["label_available_time"] < frame["label_end"]).any():
+        raise ValidationError("标签可见时间不能早于标签结束时间")
     if ((frame["observation_time"] > frame["label_start"]) | (frame["label_start"] >= frame["label_end"])).any():
         raise ValidationError("样本时间必须满足 observation <= label_start < label_end")
     return frame.sort_values(["observation_time", "sample_id"], kind="mergesort").reset_index(drop=True)

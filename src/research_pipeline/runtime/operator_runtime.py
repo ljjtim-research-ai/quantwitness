@@ -130,36 +130,24 @@ class RuntimeCompletionMetadata:
         artifact_hashes: dict[str, str] = {}
         proof_hashes: dict[str, str] = {}
         counts: dict[str, int] = {}
-        backend_id = None
-        fidelity = None
+        backends = {item.backend_id for item in values.values() if item.backend_id is not None}
+        fidelities = {item.fidelity for item in values.values() if item.fidelity is not None}
         limitations: set[str] = set()
         for node_id, metadata in sorted(values.items()):
-            for target, incoming, field_name in (
-                (artifact_hashes, metadata.artifact_hashes, "artifact_hashes"),
-                (proof_hashes, metadata.proof_hashes, "proof_hashes"),
-                (counts, metadata.counts, "counts"),
+            for target, incoming in (
+                (artifact_hashes, metadata.artifact_hashes),
+                (proof_hashes, metadata.proof_hashes),
+                (counts, metadata.counts),
             ):
                 for key, value in incoming.items():
-                    if key in target and target[key] != value:
-                        raise RuntimeIntegrityError(
-                            f"Runtime completion {field_name} 冲突: {node_id}/{key}"
-                        )
-                    target[key] = value
-            if metadata.backend_id is not None:
-                if backend_id is not None and backend_id != metadata.backend_id:
-                    raise RuntimeIntegrityError("Runtime completion backend_id 冲突")
-                backend_id = metadata.backend_id
-            if metadata.fidelity is not None:
-                if fidelity is not None and fidelity != metadata.fidelity:
-                    raise RuntimeIntegrityError("Runtime completion fidelity 冲突")
-                fidelity = metadata.fidelity
+                    target[f"{node_id}/{key}"] = value
             limitations.update(metadata.limitations)
         return cls(
             artifact_hashes=artifact_hashes,
             proof_hashes=proof_hashes,
             counts=counts,
-            backend_id=backend_id,
-            fidelity=fidelity,
+            backend_id=next(iter(backends)) if len(backends) == 1 else None,
+            fidelity=next(iter(fidelities)) if len(fidelities) == 1 else None,
             limitations=tuple(limitations),
         )
 

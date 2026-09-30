@@ -142,3 +142,9 @@ python -m research_pipeline gc --root <工件根> --ttl-seconds 86400 --json
 ```
 
 `gc` 默认只给计划；真正应用需要显式 `--apply`。
+
+## 发现指标与诊断目标
+
+`artifact describe` 从正式 Metric registry 返回可绑定的 `metrics` 与 `schema.result_tables`，包括指标引用、单位、测量语义、结果 schema、字段类型和 `path_prefix`。ResultSpec 使用发现的 producer 端口和结果表声明；字段来源于查询的数据表仍由 Catalog 提供，Catalog 搜索必须显式传入持久 `--catalog-lock`。指标表匹配失败时显示预期节点、端口、schema 和实际表声明。
+
+`doctor --run-root <目录> --json` 未通过时返回非零退出码和 `doctor_failed`，`data.findings` 保留每个目标的状态、错误码、对象、说明与下一步建议。多个同名运行目录用完整路径定位失败对象。

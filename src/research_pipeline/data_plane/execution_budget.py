@@ -221,6 +221,8 @@ def _bounded_string_width(plan: AdmittedQueryPlan, field_id: str) -> int | None:
         return max(len(value.encode("utf-8")) for value in plan.query.universe.instruments)
     bounds: list[int] = []
     for predicate in plan.query.filters:
+        if predicate.field_id not in plan.temporal_selection.stable_filter_fields:
+            continue
         if predicate.field_id != field_id or predicate.operator not in {
             FilterOperator.EQ,
             FilterOperator.IN,
@@ -245,11 +247,8 @@ def projected_row_width_upper(
     """按本次真实扫描列计算单行 Arrow 字节上界。"""
 
     widths = dict(plan.field_types)
-    fields = (
-        plan.temporal_selection.required_scan_fields
-        if plan.temporal_selection.requires_consumer_binding
-        else plan.query.field_ids
-    )
+    # 普通 as-of 也先读取隐藏时态和业务列，再裁剪公开输出。
+    fields = plan.temporal_selection.required_scan_fields
     observed_widths = variable_width_upper or {}
     total = 0
     for field_id in fields:

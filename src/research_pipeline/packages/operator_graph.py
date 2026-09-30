@@ -71,7 +71,7 @@ def compile_operator_graph_package(
         "contract_version", "research_id", "as_of", "requests", "root_seed", "fixed_clock",
         "graph", "result",
     }
-    optional_fields = {"reproduction", "research_semantics"}
+    optional_fields = {"research_semantics"}
     if not required_fields.issubset(payload) or set(payload) - required_fields - optional_fields:
         expected = required_fields | optional_fields
         raise ResearchPackageError(
@@ -83,16 +83,11 @@ def compile_operator_graph_package(
     research_id = payload["research_id"]
     as_of = payload["as_of"]
     graph = payload["graph"]
-    reproduction = payload.get("reproduction", {"study_proof_required": False})
     raw_research_semantics = payload.get("research_semantics")
     if not isinstance(research_id, str) or not research_id.strip():
         raise ResearchPackageError("spec.research_id 必须是非空字符串")
     if not isinstance(graph, Mapping):
         raise ResearchPackageError("spec.graph 必须是映射")
-    if not isinstance(reproduction, Mapping) or set(reproduction) != {"study_proof_required"}:
-        raise ResearchPackageError("spec.reproduction schema 无效")
-    if type(reproduction["study_proof_required"]) is not bool:
-        raise ResearchPackageError("spec.reproduction.study_proof_required 必须是 bool")
     research_semantics = None
     if raw_research_semantics is not None:
         if not isinstance(raw_research_semantics, Mapping):

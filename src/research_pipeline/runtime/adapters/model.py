@@ -5,7 +5,7 @@ from __future__ import annotations
 from research_pipeline.research.validation import persistent_holdout_ledger_root
 from ..walk_forward_model_execution import execute_model_fit_artifact, execute_model_fold_metrics_artifact, execute_model_locked_holdout_artifact, execute_model_predict_artifact, execute_model_preprocess_artifact, execute_model_selection_artifact, execute_model_split_artifact
 from ..operator_runtime import OperatorRuntimeContext, RuntimeNodeValue
-from .common import _capture, _environment, _factor_external_result, _input_external_root, _parameters
+from .common import _environment, _factor_external_result, _input_external_root, _parameters
 
 
 def execute_research_model_split_manifest_v1(
@@ -20,7 +20,6 @@ def execute_research_model_split_manifest_v1(
         fixed_clock=_environment(context).fixed_clock,
         max_memory_bytes=context.effective_resource_budget.memory_bytes,
     )
-    _capture(context, "walk_forward_split", result)
     return value
 
 
@@ -35,7 +34,6 @@ def execute_research_model_preprocess_fit_v1(
         root_seed=_environment(context).root_seed,
         max_memory_bytes=context.effective_resource_budget.memory_bytes,
     )
-    _capture(context, "walk_forward_preprocess", result)
     return value
 
 
@@ -50,7 +48,6 @@ def execute_research_model_fit_v1(
         root_seed=_environment(context).root_seed,
         max_memory_bytes=context.effective_resource_budget.memory_bytes,
     )
-    _capture(context, "walk_forward_models", result)
     return value
 
 
@@ -64,7 +61,6 @@ def execute_research_model_predict_v1(
         model_root=_input_external_root(context, "models"),
         max_memory_bytes=context.effective_resource_budget.memory_bytes,
     )
-    _capture(context, "walk_forward_predictions", result)
     return value
 
 
@@ -79,7 +75,6 @@ def execute_research_model_fold_metrics_v1(
         parameters=_parameters(context),
         max_memory_bytes=context.effective_resource_budget.memory_bytes,
     )
-    _capture(context, "walk_forward_metrics", result)
     return value
 
 
@@ -95,7 +90,6 @@ def execute_research_model_selection_v1(
         parameters=_parameters(context),
         max_memory_bytes=context.effective_resource_budget.memory_bytes,
     )
-    _capture(context, "walk_forward_selection", result)
     return value
 
 
@@ -123,5 +117,4 @@ def execute_research_model_locked_holdout_v1(
         root_seed=env.root_seed,
         max_memory_bytes=context.effective_resource_budget.memory_bytes,
     )
-    _capture(context, "walk_forward_holdout", result)
     return value

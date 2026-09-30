@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import Callable
 import uuid
 
 import psutil
@@ -15,6 +16,14 @@ from .events import RuntimeEvent
 from .state import RuntimeProjection, apply_event
 
 
+def process_identity_alive(pid: int, process_started_at: float) -> bool:
+    try:
+        process = psutil.Process(pid)
+        return process.is_running() and abs(process.create_time() - process_started_at) < 1e-6
+    except (psutil.Error, OSError, ValueError):
+        return False
+
+
 class _StoreLock:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -22,7 +31,10 @@ class _StoreLock:
 
     def __enter__(self) -> _StoreLock:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = canonical_json({"pid": os.getpid(), "token": self.token})
+        payload = canonical_json({
+            "pid": os.getpid(), "token": self.token,
+            "process_started_at": psutil.Process().create_time(),
+        })
         for _ in range(2):
             try:
                 fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -34,7 +46,12 @@ class _StoreLock:
             except FileExistsError:
                 try:
                     owner = json.loads(self.path.read_text(encoding="utf-8"))
-                    if psutil.pid_exists(int(owner["pid"])):
+                    started_at = owner.get("process_started_at")
+                    alive = (
+                        psutil.pid_exists(int(owner["pid"])) if started_at is None
+                        else process_identity_alive(int(owner["pid"]), float(started_at))
+                    )
+                    if alive:
                         raise RuntimeStateError("事件库已有活动写者")
                     self.path.unlink()
                 except RuntimeStateError:
@@ -82,7 +99,7 @@ class EventStore:
             projection = apply_event(projection, event)
         return projection
 
-    def append(self, run_id: str, kind: str, payload: dict[str, object], *, command_id: str, node_id: str | None = None, attempt_id: str | None = None) -> RuntimeEvent:
+    def append(self, run_id: str, kind: str, payload: dict[str, object], *, command_id: str, node_id: str | None = None, attempt_id: str | None = None, before_append: Callable[[RuntimeEvent], None] | None = None) -> RuntimeEvent:
         with _StoreLock(self.lock_path):
             events = self.read_events()
             for event in events:
@@ -95,6 +112,8 @@ class EventStore:
                 projection = apply_event(projection, existing)
             event = RuntimeEvent.build(projection.last_seq + 1, run_id, kind, payload, previous_hash=projection.chain_head, command_id=command_id, node_id=node_id, attempt_id=attempt_id)
             updated = apply_event(projection, event)
+            if before_append is not None:
+                before_append(event)
             with self.events_path.open("a", encoding="utf-8", newline="") as handle:
                 handle.write(canonical_json(event.to_dict()) + "\n")
                 handle.flush()

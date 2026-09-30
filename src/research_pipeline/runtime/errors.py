@@ -4,15 +4,7 @@ from __future__ import annotations
 
 from typing import Mapping
 
-from research_pipeline.platform.errors import MainlineError
-
-
-class RuntimeErrorBase(MainlineError):
-    error_code = "runtime_error"
-
-
-class RuntimeContractError(RuntimeErrorBase):
-    error_code = "runtime_contract_invalid"
+from research_pipeline.platform.errors import RuntimeErrorBase, RuntimeContractError
 
 
 class RuntimeGraphError(RuntimeContractError):

@@ -210,14 +210,14 @@ class RuntimeExecutionService:
             parent_run_id=parent_run_id,
             project_id=project_id,
         )
-        all_nodes = frozenset(item.node_id for item in dag.nodes)
+        successful_nodes = frozenset(node_id for node_id, status in parent_projection.node_statuses.items() if status == "succeeded")
         preliminary = plan_rerun_from(
             dag,
             child_run_id,
             parent_run_id,
             parent_projection,
             node_id,
-            verified_nodes=all_nodes,
+            verified_nodes=successful_nodes,
         )
         child_root.mkdir(parents=True, exist_ok=True)
         if any(
@@ -315,6 +315,61 @@ class RuntimeExecutionService:
         recovery_plan_hash: str | None = None,
         reuse_run_roots: tuple[str | Path, ...] = (),
         node_identity_projection: str = NODE_IDENTITY_PROJECTION_CURRENT,
+        owner: RuntimeLiveness | None = None,
+    ) -> dict[str, object]:
+        owns_lifetime = owner is None
+        run_id = derive_run_id(
+            dag, dag.dag_id,
+            DeterminismContext(root_seed, datetime.fromisoformat(fixed_clock)),
+            mode.value, audit_manifest_digest=self.audit_environment.manifest_digest,
+            project_id=project_id, parent_run_id=parent_run_id,
+        )
+        if owner is None:
+            owner = RuntimeLiveness(run_root, run_id=run_id, phase="starting").start()
+        else:
+            owner.bind_run(run_root, run_id)
+        try:
+            return self._execute(
+                dag=dag,
+                environment=environment,
+                run_root=run_root,
+                project_id=project_id,
+                root_seed=root_seed,
+                fixed_clock=fixed_clock,
+                mode=mode,
+                resume=resume,
+                retry_node_id=retry_node_id,
+                process_slots_by_node=process_slots_by_node,
+                parent_run_id=parent_run_id,
+                rerun_from_node=rerun_from_node,
+                recovery_plan_hash=recovery_plan_hash,
+                reuse_run_roots=reuse_run_roots,
+                node_identity_projection=node_identity_projection,
+                owner=owner,
+            )
+        finally:
+            if owns_lifetime:
+                owner.stop()
+
+    def _execute(
+        self,
+        *,
+        dag: DagSpec,
+        environment: object,
+        run_root: str | Path,
+        project_id: str,
+        root_seed: int,
+        fixed_clock: str,
+        mode: ExecutionMode = ExecutionMode.DETERMINISTIC_SERIAL,
+        resume: bool = False,
+        retry_node_id: str | None = None,
+        process_slots_by_node: Mapping[str, int] | None = None,
+        parent_run_id: str | None = None,
+        rerun_from_node: str | None = None,
+        recovery_plan_hash: str | None = None,
+        reuse_run_roots: tuple[str | Path, ...] = (),
+        node_identity_projection: str = NODE_IDENTITY_PROJECTION_CURRENT,
+        owner: RuntimeLiveness,
     ) -> dict[str, object]:
         root = Path(run_root).resolve()
         root.mkdir(parents=True, exist_ok=True)
@@ -458,8 +513,9 @@ class RuntimeExecutionService:
                 raise RuntimeIntegrityError("operator DAG run record 与当前输入不一致")
         else:
             self._write_record(record_path, base_record)
-        if projection.run_status is None:
-            for status in ("created", "planned", "running"):
+        if projection.run_status in {None, "created", "planned"}:
+            startup = (None, "created", "planned", "running")
+            for status in startup[startup.index(projection.run_status) + 1:]:
                 self._status(events, run_id, "run", status, command_id=f"run:{status}")
         elif projection.run_status == "paused":
             if retry_node_id is None:
@@ -492,7 +548,19 @@ class RuntimeExecutionService:
             checkpoint_path = (
                 checkpoints.checkpoints_root / expectation.node_execution_id
             )
-            if checkpoint_path.exists():
+            if (
+                (
+                    events.replay().node_statuses.get(node_id) == "succeeded"
+                    or any(
+                        event.kind == "checkpoint_committed" and event.node_id == node_id
+                        and event.payload.get("node_execution_id") == expectation.node_execution_id
+                        for event in events.read_events()
+                    )
+                )
+                and not (checkpoint_path / "COMMITTED").is_file()
+            ):
+                raise RuntimeIntegrityError(f"已提交节点 checkpoint 缺少提交标记: {node_id}")
+            if checkpoint_path.exists() and (checkpoint_path / "COMMITTED").is_file():
                 manifest = checkpoints.verify(expectation)
                 node_outputs = self._decode_outputs(
                     (checkpoint_path / manifest.content_path).read_bytes(),
@@ -660,14 +728,11 @@ class RuntimeExecutionService:
                 "wall_seconds": node.resource_budget.wall_seconds,
             }
             try:
-                liveness = RuntimeLiveness(
-                    root,
-                    run_id=run_id,
-                    node_id=node_id,
-                    attempt_id=attempt_id,
-                    phase="waiting_for_resources",
+                liveness = owner
+                liveness.set_node(
+                    node_id=node_id, attempt_id=attempt_id,
                     requested_resources=reservation_vector.to_dict(),
-                ).start()
+                )
                 if resource_ledger is not None:
                     local_reservation = ReadyCandidate(
                         topological_level,
@@ -729,15 +794,6 @@ class RuntimeExecutionService:
                             node_id=node_id,
                             attempt_id=attempt_id,
                         )
-                    elif phase == "marker_fsynced":
-                        events.append(
-                            run_id,
-                            "checkpoint_committed",
-                            {"node_execution_id": expectation.node_execution_id},
-                            command_id=f"{attempt_id}:checkpoint_committed",
-                            node_id=node_id,
-                            attempt_id=attempt_id,
-                        )
 
                 with ExitStack() as stack:
                     if lease is not None:
@@ -745,7 +801,8 @@ class RuntimeExecutionService:
                             self.resource_governor.maintained_lease(lease)
                         )
                     if self.resource_governor is not None:
-                        sampler = stack.enter_context(ResourceUsageSampler(work_dir))
+                        sampler_context = stack.enter_context(ExitStack())
+                        sampler = sampler_context.enter_context(ResourceUsageSampler(work_dir))
                         sampled = True
                     node_context = RuntimeNodeContext(
                         node=node,
@@ -794,6 +851,10 @@ class RuntimeExecutionService:
                     node_context.remaining_resource_budget()
                     node_outputs = self._coerce_outputs(node, raw_outputs)
                     self._validate_outputs(node, node_outputs)
+                    output_bytes = (
+                        _runtime_outputs_size(node_outputs, external)
+                        if sampler is not None else 0
+                    )
                     liveness.update("checkpointing")
                     events.append(
                         run_id,
@@ -819,7 +880,27 @@ class RuntimeExecutionService:
                         fixed_clock=fixed_clock,
                         phase_hook=phase_hook,
                     )
+                    try:
+                        if sampler is not None:
+                            sampler_context.close()
+                            _require_sampled_resources(
+                                sampler, budget=effective_budgets[node_id],
+                                reservation=reservation_vector,
+                            )
+                        node_context.remaining_resource_budget()
+                    except BaseException:
+                        # 本 attempt 的完整复验尚未通过资源门禁，不能留下可恢复的提交。
+                        shutil.rmtree(checkpoint_path)
+                        raise
                     checkpoint_committed = True
+                    events.append(
+                        run_id,
+                        "checkpoint_committed",
+                        {"node_execution_id": expectation.node_execution_id},
+                        command_id=f"{attempt_id}:checkpoint_committed",
+                        node_id=node_id,
+                        attempt_id=attempt_id,
+                    )
                 if self.resource_governor is not None:
                     operator_id, operator_version, profile_id = (
                         self._observation_identity(node)
@@ -840,7 +921,7 @@ class RuntimeExecutionService:
                             actual_components={
                                 "peak_rss_bytes": sampler.peak_rss_bytes,
                                 "peak_scratch_bytes": sampler.peak_scratch_bytes,
-                                "output_bytes": _runtime_outputs_size(node_outputs, external),
+                                "output_bytes": output_bytes,
                                 "max_processes": sampler.max_processes,
                                 "wall_milliseconds": sampler.wall_milliseconds,
                             },
@@ -936,6 +1017,7 @@ class RuntimeExecutionService:
                 failure_payload = getattr(exc, "failure_payload", None)
                 raise RuntimeWorkerError(
                     f"operator 节点执行失败: {node_id}",
+                    error_code=str(diagnostic["error_code"]),
                     failure_payload=(
                         failure_payload
                         if isinstance(failure_payload, Mapping)
@@ -943,8 +1025,6 @@ class RuntimeExecutionService:
                     ),
                 ) from exc
             finally:
-                if liveness is not None:
-                    liveness.stop()
                 if lease is not None:
                     self.resource_governor.release(lease)
                 if local_reservation is not None:
@@ -967,8 +1047,6 @@ class RuntimeExecutionService:
                 node_id=node_id,
             )
             outputs[node_id] = node_outputs
-        if events.replay().run_status != "succeeded":
-            self._status(events, run_id, "run", "succeeded", command_id="run:succeeded")
         result = {
             **base_record,
             "status": "succeeded",
@@ -980,6 +1058,11 @@ class RuntimeExecutionService:
                 }
                 for node_id, node_outputs in sorted(outputs.items())
             },
+            "node_completion_metadata": {
+                node_id: node_outputs.completion_metadata.to_dict()
+                for node_id, node_outputs in sorted(outputs.items())
+                if node_outputs.completion_metadata is not None
+            },
             "completion_metadata": RuntimeCompletionMetadata.merge(
                 {
                     node_id: node_outputs.completion_metadata
@@ -989,7 +1072,17 @@ class RuntimeExecutionService:
             ).to_dict(),
             "event_chain_head": events.replay().chain_head,
         }
-        self._write_record(record_path, result)
+        def persist_completion(event: RuntimeEvent) -> None:
+            result["event_chain_head"] = event.event_hash
+            self._write_record(record_path, result)
+
+        if events.replay().run_status != "succeeded":
+            events.append(
+                run_id, "run_status_changed", {"status": "succeeded"},
+                command_id="run:succeeded", before_append=persist_completion,
+            )
+        else:
+            self._write_record(record_path, result)
         return result
 
     @staticmethod
@@ -2419,6 +2512,31 @@ class RuntimeExecutionService:
         temporary = path.with_suffix(".tmp")
         temporary.write_text(canonical_json(dict(payload)), encoding="utf-8")
         temporary.replace(path)
+
+
+def _require_sampled_resources(
+    sampler: ResourceUsageSampler, *, budget: ResourceBudget,
+    reservation: ResourceVector,
+) -> None:
+    if sampler.measurement_status != "available":
+        raise RuntimeWorkerError(
+            "节点资源测量不可用，不能发布成功 checkpoint",
+            error_code="resource_measurement_unavailable",
+            failure_payload={"code": "resource_measurement_unavailable"},
+        )
+    limits = {
+        "memory_bytes": (sampler.peak_rss_bytes, min(budget.memory_bytes, reservation.memory_bytes)),
+        "temp_bytes": (sampler.peak_scratch_bytes, min(budget.temp_bytes, reservation.scratch_bytes)),
+        "process_slots": (sampler.max_processes, reservation.process_slots),
+        "wall_milliseconds": (sampler.wall_milliseconds, budget.wall_seconds * 1000),
+    }
+    exceeded = {name: {"actual": actual, "limit": limit} for name, (actual, limit) in limits.items() if actual > limit}
+    if exceeded:
+        raise RuntimeWorkerError(
+            "节点资源使用超过执行预算或租约",
+            error_code="resource_exceeded",
+            failure_payload={"code": "resource_exceeded", "exceeded": exceeded},
+        )
 
 
 def _runtime_value_size(value: RuntimeNodeValue, store: ExternalArtifactStore) -> int:

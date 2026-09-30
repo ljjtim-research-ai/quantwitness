@@ -863,8 +863,8 @@ def _reconcile_spot_target(
         rules.parameters,
         "buy_lot_shares" if instrument.asset_class == "cn_stock" else "buy_lot_units",
     )
-    if desired % lot_size:
-        raise SimulationContractError("分钟目标数量不符合交易单位")
+    if desired > current and (desired - current) % lot_size:
+        raise SimulationContractError("分钟买入数量不符合交易单位")
     _require_cash_lifecycle(
         rules.parameters,
         asset_class=instrument.asset_class,
@@ -884,7 +884,9 @@ def _reconcile_spot_target(
         rejection_key = (bar.trading_date, sellable, desired)
         if active.t1_rejection_key == rejection_key:
             return state
-    capacity = _remaining_capacity(bar, policy, used_capacity, lot_size=lot_size)
+    capacity = _remaining_capacity(
+        bar, policy, used_capacity, lot_size=lot_size if side == "buy" else 1,
+    )
     result_state, reason, filled = _execute_spot_order(
         target=active.prepared.target,
         instrument=instrument,
@@ -1175,20 +1177,12 @@ def _execute_futures_order(
             expected_sign = 1 if side == "sell" else -1
             if old_position.contracts * expected_sign <= 0 or filled > abs(old_position.contracts):
                 raise SimulationContractError("期货平仓意图与当前持仓不一致")
-            realized_pnl = (
-                (price_units - old_position.settlement_price_units)
-                * filled
-                * multiplier
-                * expected_sign
+            realized_pnl, pnl_remainder = old_position.realize(
+                price_units=price_units, contracts=filled * expected_sign, multiplier=multiplier,
             )
         direction = 1 if side == "buy" else -1
         new_contracts = old_position.contracts + direction * filled
-        old_margin = _required_futures_margin(
-            price_units=old_position.settlement_price_units,
-            multiplier=multiplier,
-            contracts=abs(old_position.contracts),
-            margin_ppm=margin_ppm,
-        )
+        old_margin = old_position.margin_units
         new_margin = _required_futures_margin(
             price_units=price_units,
             multiplier=multiplier,
@@ -1231,6 +1225,9 @@ def _execute_futures_order(
                     "fee_units": fee,
                     "instrument_hash": instrument.instrument_hash,
                     "settlement_price_units": price_units,
+                    "position_margin_units": new_margin,
+                    "pnl_remainder_numerator": (pnl_remainder.numerator if position_effect == "close" else old_position.pnl_remainder_numerator),
+                    "pnl_remainder_denominator": (pnl_remainder.denominator if position_effect == "close" else old_position.pnl_remainder_denominator),
                 }.items())),
                 order.order_id,
             )
@@ -1615,6 +1612,8 @@ def _combined_cash_rule(
             "commission_ppm": _nonnegative_integer(rules.parameters, "commission_ppm"),
             "cost_model_scope": str(rules.parameters.get("cost_model_scope", "market_rule")),
             "lot_size": lot_size,
+            **({"sell_remainder_allowed": rules.parameters["sell_remainder_allowed"]}
+               if "sell_remainder_allowed" in rules.parameters else {}),
             "min_commission_units": _nonnegative_integer(
                 rules.parameters, "min_commission_units"
             ),
@@ -1843,10 +1842,8 @@ def _settle_futures_session(
             item for item in state.positions
             if item.instrument_hash == instrument.instrument_hash
         ), FuturesPosition(instrument.instrument_hash, 0, settlement_price))
-        pnl_units = (
-            (settlement_price - position.settlement_price_units)
-            * position.contracts
-            * multiplier
+        pnl_units, _remainder = position.realize(
+            price_units=settlement_price, contracts=position.contracts, multiplier=multiplier,
         )
         required_margin = _required_futures_margin(
             price_units=settlement_price,
@@ -1896,7 +1893,11 @@ def _settle_futures_session(
         settled = replace(
             settled,
             positions=tuple(
-                FuturesPosition(item.instrument_hash, item.contracts, settlement_price)
+                item.after_settlement(
+                    price_units=settlement_price,
+                    multiplier=_positive_integer(rules.parameters, "contract_unit_kg"),
+                    margin_units=_required_margin,
+                )
                 if item.instrument_hash == instrument.instrument_hash
                 else item
                 for item in settled.positions

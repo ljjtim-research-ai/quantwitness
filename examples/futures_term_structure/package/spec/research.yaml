@@ -1,6 +1,5 @@
 contract_version: research-operator-graph-package-v2
 research_id: quantwitness.futures_term_structure
-reproduction: {study_proof_required: false}
 as_of: '2024-01-05'
 root_seed: 1704
 fixed_clock: '2024-01-06T00:00:00+08:00'

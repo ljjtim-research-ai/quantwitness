@@ -54,9 +54,6 @@ from research_pipeline.runtime.operator_registry import (
     admitted_implementation_manifest_hash,
     operator_process_slots_by_node,
 )
-from research_pipeline.runtime.operator_graph_admission import (
-    load_study_reproduction_proof,
-)
 from research_pipeline.runtime.failed_run_reuse import prepare_failed_run_reuse
 from research_pipeline.runtime.required_run_reuse import prepare_required_run_reuse
 
@@ -77,6 +74,17 @@ def _execute(args) -> dict[str, object]:
 
 
 def _execute_operator_graph(args) -> dict[str, object]:
+    if getattr(args, "acceptance_proof", None) is not None:
+        raise ValueError("acceptance-proof 已删除；研究复现请声明项目 Verifier")
+    _validate_run_paths(args)
+    owner = RuntimeLiveness(args.run_root, run_id=None, phase="starting").start()
+    try:
+        return _execute_owned_operator_graph(args, owner)
+    finally:
+        owner.stop()
+
+
+def _execute_owned_operator_graph(args, owner: RuntimeLiveness) -> dict[str, object]:
     if getattr(args, "execution_engine", "unified") != "unified":
         raise ValueError("execution_engine 迁移参数已删除；正式运行只使用统一 Runtime")
     _require_data_run_arguments(args)
@@ -141,14 +149,6 @@ def _execute_operator_graph(args) -> dict[str, object]:
         )
     if args.root_seed != manifest["root_seed"] or args.clock != manifest["fixed_clock"]:
         raise ValueError("run 的 clock/root_seed 必须与算子图计划完全一致")
-    study_proof = None
-    if args.acceptance_proof:
-        study_proof = load_study_reproduction_proof(
-            args.acceptance_proof,
-            expected_study_id=str(manifest["research_id"]),
-            expected_package_hash=str(manifest["package_hash"]),
-            expected_package_plan_hash=str(manifest["package_plan_hash"]),
-        )
     runtime_result = _execute_unified_operator_runtime(
         args=args,
         manifest=manifest,
@@ -164,7 +164,7 @@ def _execute_operator_graph(args) -> dict[str, object]:
             else Path(args.minute_data_root).resolve()
         ),
         resource_capacity=resource_capacity,
-        study_reproduction_proof=study_proof,
+        owner=owner,
     )
     result_payload = _finalize_operator_graph_result(
         args=args,
@@ -177,7 +177,7 @@ def _execute_operator_graph(args) -> dict[str, object]:
         database_probe=database_probe,
         source_databases=source_databases,
         source_database_probes=source_database_probes,
-        study_proof=study_proof,
+        owner=owner,
     )
     completion = {
         **result_payload,
@@ -217,13 +217,13 @@ def _finalize_operator_graph_result(
     database_probe: tuple[int, int],
     source_databases: Mapping[str, Path],
     source_database_probes: Mapping[str, tuple[int, int]],
-    study_proof,
     verifier_bundle_source: Path | None = None,
+    owner: RuntimeLiveness | None = None,
 ) -> dict[str, object]:
     """投影 Runtime 之后的唯一 Result finalize 生命周期。"""
 
     write_finalize_status(args.run_root, status="pending")
-    liveness: RuntimeLiveness | None = None
+    liveness = owner
     result_bundle = None
     result_directory = None
 
@@ -233,20 +233,15 @@ def _finalize_operator_graph_result(
         result_directory = directory
 
     try:
-        liveness = RuntimeLiveness(
-            args.run_root,
-            run_id=str(runtime_result["run_id"]),
-            phase="finalizing",
-        ).start()
+        if liveness is None:
+            liveness = RuntimeLiveness(
+                args.run_root, run_id=str(runtime_result["run_id"]), phase="finalizing",
+            ).start()
+        else:
+            liveness.update("finalizing")
         completion_metadata = runtime_result.get("completion_metadata")
         if not isinstance(completion_metadata, Mapping):
             raise ValueError("统一 Runtime 缺少 completion metadata")
-        proof_hashes = completion_metadata.get("proof_hashes")
-        if study_proof is not None and (
-            not isinstance(proof_hashes, Mapping)
-            or proof_hashes.get("study_reproduction") != study_proof.proof_hash
-        ):
-            raise ValueError("StudyReproductionProof 未由对应领域 adapter 验证")
         if (database.stat().st_size, database.stat().st_mtime_ns) != database_probe:
             raise ValueError("算子图正式运行后数据库指纹发生变化")
         if {
@@ -308,9 +303,6 @@ def _finalize_operator_graph_result(
             "package_id": manifest["package_id"],
             "package_plan_hash": manifest["package_plan_hash"],
             "dag_hash": manifest["dag_hash"],
-            "study_reproduction_proof_hash": (
-                None if study_proof is None else study_proof.proof_hash
-            ),
             "database_unchanged": True,
             "execution_engine": "unified",
             "runtime_run_id": runtime_result["run_id"],
@@ -348,7 +340,7 @@ def _finalize_operator_graph_result(
             pass
         raise
     finally:
-        if liveness is not None:
+        if owner is None and liveness is not None:
             liveness.stop()
     return result_payload
 
@@ -365,12 +357,11 @@ def _execute_unified_operator_runtime(
     source_databases,
     minute_data_root,
     resource_capacity,
-    study_reproduction_proof,
+    owner: RuntimeLiveness | None = None,
 ):
     """把现行算子实现交给唯一统一 Runtime。"""
     runtime_root = Path(args.run_root).resolve()
     _write_or_verify_runtime_invocation(runtime_root, args)
-    captured: dict[str, Mapping[str, object]] = {}
     raw_graph_plan = json.loads(
         (Path(args.plan).resolve() / "operator-graph-plan.json").read_text(
             encoding="utf-8"
@@ -416,8 +407,6 @@ def _execute_unified_operator_runtime(
         resource_timeout_seconds=getattr(args, "resource_timeout_seconds", None),
         strategy_spec_hashes=strategy_spec_hashes,
         operator_graph_strategy_hash=operator_graph_strategy_hash,
-        study_reproduction_proof=study_reproduction_proof,
-        captured=captured,
     )
 
     audit, dependencies = _build_runtime_audit_environment()
@@ -442,6 +431,7 @@ def _execute_unified_operator_runtime(
         registry,
     )
     runtime_kwargs = {
+        "owner": owner,
         "dag": dag,
         "environment": environment,
         "run_root": args.run_root,
@@ -622,9 +612,6 @@ def _write_or_verify_runtime_invocation(runtime_root: Path, args) -> None:
         "workers": args.workers,
         "root_seed": args.root_seed,
         "clock": args.clock,
-        "acceptance_proof": (
-            None if not args.acceptance_proof else str(Path(args.acceptance_proof).resolve())
-        ),
         "execution_engine": "unified",
         "resource_capacity": resource_capacity.to_dict(),
         "reuse_run_roots": [
@@ -664,11 +651,13 @@ def _load_operator_invocation(run_root: str | Path) -> Namespace:
     payload = json.loads(target.read_text(encoding="utf-8"))
     invocation_hash = payload.pop("invocation_hash", None)
     original_payload = dict(payload)
+    if "acceptance_proof" in payload:
+        raise ValueError("旧 acceptance-proof invocation 不再支持；研究复现请声明项目 Verifier")
     version = payload.get("contract_version")
     expected = {
         "contract_version", "plan", "data_db", "source_dbs", "minute_data_root", "artifact_root", "holdout_ledger_anchor", "handoff_out",
         "run_root", "result_store", "mode", "workers", "root_seed", "clock",
-        "acceptance_proof", "execution_engine", "resource_capacity",
+        "execution_engine", "resource_capacity",
         "resource_governance",
     }
     if version == "research-operator-dag-invocation-v13":
@@ -917,8 +906,6 @@ def _validate_run_paths(args) -> None:
     }
     if getattr(args, "minute_data_root", None):
         roles["minute_data_input"] = args.minute_data_root
-    if args.acceptance_proof:
-        roles["acceptance_proof_input"] = args.acceptance_proof
     if getattr(args, "resource_state_dir", None):
         roles["resource_governance_output"] = args.resource_state_dir
     read_only = ["plan_input", "database_input"]
@@ -935,8 +922,6 @@ def _validate_run_paths(args) -> None:
         role = f"source_database_input_{profile}"
         roles[role] = str(path)
         read_only.append(role)
-    if args.acceptance_proof:
-        read_only.append("acceptance_proof_input")
     PathRolePolicy().validate(roles, read_only_roles=tuple(read_only))
 
 

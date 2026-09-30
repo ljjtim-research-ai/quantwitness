@@ -50,6 +50,7 @@ class DailyCashSimulationResult:
     position_snapshots: pd.DataFrame
     cash_snapshots: pd.DataFrame
     simulation_hash: str
+    corporate_actions: tuple[CorporateAction, ...] = ()
     backend_id: str = "cash-daily-v1"
     fidelity: str = "bar_level_historical_research"
     limitations: tuple[str, ...] = (
@@ -388,6 +389,7 @@ def run_daily_cash_event_simulation(
         position_snapshots=position_snapshots,
         cash_snapshots=cash_snapshots,
         simulation_hash=typed_canonical_hash(identity),
+        corporate_actions=tuple(corporate_actions),
     )
 
 

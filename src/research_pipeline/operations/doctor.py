@@ -68,7 +68,7 @@ def run_research_doctor(
             findings.append(DoctorFinding(
                 "fail",
                 "doctor.runtime_invalid",
-                root.name,
+                str(root),
                 "当前运行目录、事件链或 run identity 无效",
                 "检查 operator-dag-run.json、events.jsonl 和 checkpoints",
             ))

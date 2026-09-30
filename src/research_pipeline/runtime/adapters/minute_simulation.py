@@ -11,16 +11,15 @@ from typing import Iterable, Iterator, Mapping, MutableMapping
 import pandas as pd
 from research_pipeline.platform import canonical_json, typed_canonical_hash
 from research_pipeline.data_plane import require_minute_price_mode
-from research_pipeline.domain import MinuteRuleResolver, PortfolioTarget, load_minute_rule_snapshot_bundle, load_session_policy_bundle
+from research_pipeline.domain import PortfolioTarget, load_minute_rule_snapshot_bundle, load_session_policy_bundle
 from research_pipeline.platform.minute_operator_contracts import MINUTE_TARGET_PAYLOAD_SCHEMA_ID
 from research_pipeline.simulation import BarTcaFormalFill, BarTcaOrder, IntradayExecutionPolicy, MinuteExecutionBar, bar_tca_policy_from_parameters
 from research_pipeline.simulation.bar_tca import BarTcaArtifactWriter
-from research_pipeline.simulation.events import FinancialEvent
 from research_pipeline.simulation.minute_execution import MinuteEventSimulationStateMachine, PreparedMinuteTarget
 from research_pipeline.simulation.result_contract import SimulationResultArtifactWriter
 from ..bar_tca_adapter import tca_metadata
 from ..operator_runtime import OperatorRuntimeContext, RuntimeCompletionMetadata, RuntimeNodeOutputs, RuntimeNodeValue
-from .common import _capture, _input_external_payload, _input_external_root, _json_ready, _parameters
+from .common import _input_external_payload, _input_external_root, _json_ready, _parameters
 from .minute_io import _aware, _minute_adjustment_context, _minute_artifact_partitions, _minute_timestamp_type, _operator_bar_partitions, _write_minute_row_partition
 
 
@@ -684,7 +683,6 @@ def execute_finance_simulation_intraday_v3(
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    _capture(context, "minute_simulation", payload)
     return RuntimeNodeOutputs(
         {commit.artifact_name: RuntimeNodeValue.external(commit)},
         completion_metadata=RuntimeCompletionMetadata(
@@ -784,178 +782,6 @@ def _minute_tca_inputs(
         pd.DataFrame.from_records(observations, columns=observation_columns),
     )
 
-
-def _minute_futures_settlement_events(
-    *,
-    result,
-    bundle,
-    targets: tuple[PortfolioTarget, ...],
-    instrument_hashes: Mapping[str, str] | None = None,
-) -> list[dict[str, object]]:
-    """把仿真已消费的逐日结算事实完整写入 ResultStore 上下文。"""
-
-    if result.semantics.asset_class != "cn_future":
-        return []
-    resolver = MinuteRuleResolver(bundle)
-    settlement_rule_ids = (
-        "rule.cn_futures.contract_multiplier.v1",
-        "rule.cn_futures.margin.v1",
-        "rule.cn_futures.price_tick.v1",
-        "rule.cn_futures.session.v1",
-        "rule.cn_futures.settlement.v1",
-    )
-    positions: dict[str, tuple[int, int]] = {}
-    resolved_instrument_hashes = dict(instrument_hashes or {})
-    for item in targets:
-        instrument = item.entries[0].instrument
-        existing = resolved_instrument_hashes.setdefault(
-            instrument.instrument_id, instrument.instrument_hash
-        )
-        if existing != instrument.instrument_hash:
-            raise ValueError("分钟期货结算标的身份漂移")
-    fills_by_session: dict[date, list[object]] = {}
-    for fill in result.tables["fills"].itertuples(index=False):
-        fills_by_session.setdefault(fill.session, []).append(fill)
-    events = []
-    for cash in result.tables["cash"].itertuples(index=False):
-        session = cash.session
-        session_fills = fills_by_session.get(session, [])
-        for fill in session_fills:
-            instrument_id = str(fill.instrument_id)
-            old_quantity, old_basis = positions.get(
-                instrument_id,
-                (0, int(fill.execution_price_units)),
-            )
-            direction = 1 if str(fill.side) == "buy" else -1
-            expected_sign = 1 if str(fill.side) == "sell" else -1
-            expected_realized = (
-                (int(fill.execution_price_units) - old_basis)
-                * int(fill.quantity)
-                * int(fill.contract_multiplier)
-                * expected_sign
-                if str(fill.position_effect) == "close"
-                else 0
-            )
-            if int(fill.realized_pnl_units) != expected_realized:
-                raise ValueError("分钟期货 fill 已实现盈亏与结算基价不一致")
-            positions[instrument_id] = (
-                old_quantity + direction * int(fill.quantity),
-                int(fill.execution_price_units),
-            )
-
-        instrument_ids = {
-            instrument_id
-            for instrument_id, (quantity, _basis) in positions.items()
-            if quantity != 0
-        }
-        if not instrument_ids:
-            if (
-                int(cash.non_trade_cash_change_units) != 0
-                or int(cash.margin_units) != 0
-                or str(cash.non_trade_source_hash) != typed_canonical_hash([])
-            ):
-                raise ValueError("分钟期货空仓会话包含伪结算或保证金")
-            continue
-        facts = []
-        for instrument_id in sorted(instrument_ids):
-            settlement_candidates = [
-                item for item in bundle.rules
-                if item.instrument_id == instrument_id
-                and item.rule_id == "rule.cn_futures.settlement.v1"
-                and item.effective_from <= session <= item.effective_to
-            ]
-            if (
-                len(settlement_candidates) != 1
-                or settlement_candidates[0].available_at is None
-            ):
-                raise ValueError("分钟期货结算上下文缺少唯一收盘事件")
-            settlement_time = settlement_candidates[0].available_at
-            bindings = tuple(
-                resolver.resolve(
-                    rule_id=rule_id,
-                    instrument_id=instrument_id,
-                    effective_on=session,
-                    as_of=settlement_time,
-                )
-                for rule_id in settlement_rule_ids
-            )
-            parameters = {
-                key: value
-                for binding in bindings
-                for key, value in binding.rule.parameters
-            }
-            settlement_price = int(parameters["settlement_price_units"])
-            multiplier = int(parameters["contract_unit_kg"])
-            margin_ppm = int(parameters["speculative_initial_margin_ppm"])
-            quantity, basis = positions.get(
-                instrument_id, (0, settlement_price)
-            )
-            pnl_units = (settlement_price - basis) * quantity * multiplier
-            required_margin = (
-                settlement_price * multiplier * abs(quantity) * margin_ppm
-                + 999_999
-            ) // 1_000_000
-            rule_hash = typed_canonical_hash({
-                "bundle_hash": bundle.bundle_hash,
-                "bindings": [item.identity_hash for item in bindings],
-            })
-            facts.append({
-                "instrument_id": instrument_id,
-                "instrument_hash": resolved_instrument_hashes.get(instrument_id),
-                "settlement_time": settlement_time,
-                "settlement_price_units": settlement_price,
-                "price_scale": int(parameters["price_scale"]),
-                "position_contracts_before": quantity,
-                "previous_settlement_price_units": basis,
-                "contract_multiplier": multiplier,
-                "speculative_margin_ppm": margin_ppm,
-                "pnl_units": pnl_units,
-                "required_margin_units": required_margin,
-                "rule_hash": rule_hash,
-                "rule_snapshot_hashes": [
-                    item.rule.snapshot_hash for item in bindings
-                ],
-            })
-        settlement_times = {item["settlement_time"] for item in facts}
-        if len(settlement_times) != 1:
-            raise ValueError("分钟期货同一账户结算时点不一致")
-        aggregate_margin = sum(int(item["required_margin_units"]) for item in facts)
-        session_events = []
-        for fact in facts:
-            event = FinancialEvent(
-                f"minute-settlement:{fact['instrument_id']}:{session.isoformat()}",
-                "mark_to_market",
-                fact["settlement_time"],
-                session.isoformat(),
-                "minute-default-cn-futures",
-                str(fact["rule_hash"]),
-                (
-                    ("pnl_units", int(fact["pnl_units"])),
-                    ("required_margin_units", aggregate_margin),
-                ),
-            )
-            positions[str(fact["instrument_id"])] = (
-                int(fact["position_contracts_before"]),
-                int(fact["settlement_price_units"]),
-            )
-            session_events.append({
-                **fact,
-                "settlement_time": fact["settlement_time"].isoformat(),
-                "aggregate_required_margin_units": aggregate_margin,
-                "event": event.to_dict(),
-                "event_hash": event.event_hash,
-            })
-        event_hashes = [str(item["event_hash"]) for item in session_events]
-        if (
-            typed_canonical_hash(sorted(event_hashes))
-            != str(cash.non_trade_source_hash)
-            or sum(int(item["pnl_units"]) for item in session_events)
-            != int(cash.non_trade_cash_change_units)
-            or aggregate_margin != int(cash.margin_units)
-        ):
-            raise ValueError("分钟期货结算上下文与正式现金账本不一致")
-        events.extend(session_events)
-    return events
 
 
 def _minute_price_limit_references(

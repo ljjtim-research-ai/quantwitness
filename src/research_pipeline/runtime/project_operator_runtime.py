@@ -6,7 +6,6 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 import hashlib
 import json
-import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -16,6 +15,10 @@ from types import MappingProxyType
 from typing import Mapping
 
 import psutil
+
+from research_pipeline.platform.process_resources import (
+    _measure_attempt_tree_bytes, _project_process_usage, _terminate_process_tree,
+)
 
 from research_pipeline.extensions import (
     AdmittedProjectOperatorRegistry,
@@ -293,6 +296,12 @@ def project_worker_adapter_hash() -> str:
             for name in ("project_table_input.py", "project_output.py", "project_causal.py",
                          "project_causal_worker.py", "project_causal_execution.py",
                          "project_causal_minute.py")
+        },
+        "resource_contracts": {
+            name: hashlib.sha256(
+                runtime_path.parent.parent.joinpath("platform", name).read_bytes()
+            ).hexdigest()
+            for name in ("resource_budget.py", "process_resources.py")
         },
         "causal_contract": hashlib.sha256(
             runtime_path.parent.parent.joinpath("platform", "project_causal_contract.py").read_bytes()
@@ -649,40 +658,45 @@ def _run_project_worker(
         raise
     started = time.monotonic()
     failure = None
+    exceeded: dict[str, dict[str, int]] = {}
     observed_descendants: dict[int, float] = {}
     measurement_status = "available"
-    while process.poll() is None:
-        elapsed = time.monotonic() - started
-        try:
-            current = psutil.Process(process.pid)
-            children = current.children(recursive=True)
-            for child in children:
-                observed_descendants[child.pid] = child.create_time()
-            rss = current.memory_info().rss + sum(child.memory_info().rss for child in children)
-            process_count = 2 + len(children)
-        except (psutil.Error, OSError, RuntimeError):
-            rss = None
-            process_count = None
-            measurement_status = "measurement_unavailable"
-        size = _measure_attempt_tree_bytes(attempt_root)
-        if elapsed > budget.wall_seconds:
-            failure = "project_worker_timeout"
-        elif (
-            process_slots is not None
-            and process_count is not None
-            and process_count > process_slots
-        ):
-            failure = "project_worker_process_slots_exceeded"
-        elif (rss is not None and rss > budget.memory_bytes) or size > budget.temp_bytes:
-            failure = "project_worker_resource_exceeded"
-        if failure:
-            break
-        time.sleep(0.02)
-    cleanup_status = _terminate_process_tree(
-        process,
-        observed_descendants=observed_descendants,
-    )
-    task_path.unlink(missing_ok=True)
+    try:
+        while True:
+            finished = process.poll() is not None
+            try:
+                rss, process_count = _project_process_usage(
+                    None if finished else process.pid, observed_descendants
+                )
+                size = _measure_attempt_tree_bytes(attempt_root)
+            except (psutil.Error, OSError, RuntimeError):
+                measurement_status = "measurement_unavailable"
+                failure = "project_worker_measurement_unavailable"
+                break
+            if time.monotonic() - started > budget.wall_seconds:
+                failure = "project_worker_timeout"
+            elif process_slots is not None and process_count > process_slots:
+                failure = "project_worker_process_slots_exceeded"
+            elif rss > budget.memory_bytes or size > budget.temp_bytes:
+                failure = "project_worker_resource_exceeded"
+                exceeded = {
+                    name: {"actual": actual, "limit": limit}
+                    for name, actual, limit in (
+                        ("memory_bytes", rss, budget.memory_bytes),
+                        ("temp_bytes", size, budget.temp_bytes),
+                    )
+                    if actual > limit
+                }
+            if failure or finished:
+                break
+            time.sleep(0.02)
+    finally:
+        cleanup_status = _terminate_process_tree(
+            process, observed_descendants=observed_descendants,
+        )
+        task_path.unlink(missing_ok=True)
+    if failure is None and cleanup_status != "complete":
+        failure = "project_worker_cleanup_failed"
     if failure is not None:
         raise RuntimeWorkerError(
             failure,
@@ -694,6 +708,7 @@ def _run_project_worker(
             failure_payload={
                 "resource_measurement_status": measurement_status,
                 "process_cleanup_status": cleanup_status,
+                **({"exceeded": exceeded} if exceeded else {}),
             },
         )
     if process.returncode != 0 or not result_path.is_file():
@@ -817,24 +832,6 @@ def _run_project_worker(
     )
 
 
-def _measure_attempt_tree_bytes(root: Path) -> int:
-    """统计临时空间；Worker 正常删除临时路径时跳过已经消失的条目。"""
-
-    total = 0
-
-    def directory_error(error: OSError) -> None:
-        if not isinstance(error, FileNotFoundError):
-            raise error
-
-    for directory, _, files in os.walk(root, onerror=directory_error):
-        for name in files:
-            try:
-                total += (Path(directory) / name).stat().st_size
-            except FileNotFoundError:
-                continue
-    return total
-
-
 def _staged_commit_path(attempt_root: Path, relative_path: str, *, directory: bool = False) -> Path:
     root = (attempt_root / "outputs").resolve(strict=True)
     path = (root / relative_path).resolve(strict=True)
@@ -860,53 +857,6 @@ def _project_worker_failure_payload(error_code: str) -> dict[str, object] | None
             "python -m research_pipeline operator scaffold --help",
         ],
     }
-
-
-def _terminate_process_tree(
-    process: subprocess.Popen[bytes],
-    *,
-    observed_descendants: Mapping[int, float] | None = None,
-) -> str:
-    cleanup_status = "complete"
-    try:
-        descendants: dict[int, psutil.Process] = {}
-        for pid, started_at in (observed_descendants or {}).items():
-            try:
-                item = psutil.Process(pid)
-                if abs(item.create_time() - started_at) < 0.01:
-                    descendants[pid] = item
-            except psutil.Error:
-                continue
-        try:
-            parent = psutil.Process(process.pid)
-            for child in parent.children(recursive=True):
-                descendants[child.pid] = child
-        except psutil.NoSuchProcess:
-            parent = None
-        targets = list(descendants.values())
-        if parent is not None:
-            targets.append(parent)
-        for item in targets:
-            try:
-                item.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        _, alive = psutil.wait_procs(targets, timeout=1.0) if targets else ([], [])
-        for item in alive:
-            try:
-                item.kill()
-            except psutil.NoSuchProcess:
-                pass
-    except (psutil.Error, OSError, RuntimeError):
-        cleanup_status = "direct_process_only"
-        if process.poll() is None:
-            process.kill()
-    try:
-        process.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        cleanup_status = "direct_process_only"
-    return cleanup_status
 
 
 __all__ = [

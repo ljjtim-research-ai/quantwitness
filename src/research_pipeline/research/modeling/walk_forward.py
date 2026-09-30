@@ -24,7 +24,7 @@ from research_pipeline.research.validation import (
 )
 
 
-WALK_FORWARD_MODEL_VERSION = "research-walk-forward-model-v2"
+WALK_FORWARD_MODEL_VERSION = "research-walk-forward-model-v3"
 SUPPORTED_MODELS = frozenset({"ridge", "elastic_net", "huber", "logistic", "lightgbm"})
 REGRESSION_MODELS = frozenset({"ridge", "elastic_net", "huber", "lightgbm"})
 CLASSIFICATION_MODELS = frozenset({"logistic", "lightgbm"})
@@ -368,12 +368,16 @@ def evaluate_locked_holdout(
         if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
             raise ModelMainlineError(f"{label} 必须是 sha256")
     try:
-        holdout_start_date = date.fromisoformat(holdout_start)
+        holdout_boundary = pd.Timestamp(holdout_start)
+        if holdout_boundary.tzinfo is None:
+            holdout_boundary = holdout_boundary.tz_localize("UTC")
+        holdout_start_date = holdout_boundary.date()
         holdout_end_date = date.fromisoformat(holdout_end)
     except ValueError as exc:
-        raise ModelMainlineError("holdout start/end 必须是 ISO 日期") from exc
+        raise ModelMainlineError("holdout start 必须是 ISO 日期或时点，end 必须是 ISO 日期") from exc
     if holdout_end_date < holdout_start_date:
         raise ModelMainlineError("holdout end 不能早于 start")
+    _metric(np.array([0.0]), np.array([0.0]), objective, target_kind)
     freeze_payload = {
         "parent_research_purpose": research_identity_hash,
         "data_snapshot": data_snapshot_hash,
@@ -394,7 +398,7 @@ def evaluate_locked_holdout(
             "rule": {"selection_hash": selection_hash, "objective": objective},
         },
         "primary_estimand": objective,
-        "direction": "greater" if objective in {"accuracy"} else "less",
+        "direction": "greater",
         "alpha": 0.05,
         "multiple_testing": None,
         "random_protocol": {"combinations": [], "repetitions": 0, "seed": root_seed},
@@ -425,6 +429,10 @@ def evaluate_locked_holdout(
         development_samples, feature_columns, target_kind
     ).set_index("sample_id", drop=False)
     train = frame.loc[list(development_ids)].copy()
+    if "label_available_time" in train:
+        available = pd.to_datetime(train["label_available_time"], utc=True, errors="raise")
+        if available.isna().any() or (available > holdout_boundary).any():
+            raise ModelMainlineError("development 标签在 locked holdout 拟合时尚不可见")
     preflight = model_dependency_preflight(
         (selected_candidate,),
         simple_model_gate_passed=True,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import combinations
+import math
 from statistics import NormalDist
 
 import numpy as np
@@ -83,10 +84,23 @@ def deflated_sharpe_ratio(selected_returns: object, candidate_returns: object) -
         raise StatisticsError("DSR 候选 Sharpe 退化")
     mean_sr = float(candidate_sharpes.mean())
     std_sr = float(candidate_sharpes.std(ddof=1))
-    quantile = NormalDist().inv_cdf(max(0.5, 1.0 - 1.0 / effective))
-    benchmark = mean_sr + std_sr * quantile
+    benchmark = _expected_maximum_sharpe(mean_sr, std_sr, effective)
     base = probabilistic_sharpe_ratio(selected, benchmark_sharpe=benchmark)
-    return _result("deflated_sharpe_ratio_v1", base.statistic, base.p_value or 0.0, len(selected), matrix.shape[1], effective, {"benchmark_sharpe": benchmark}, ("候选全集完整", "候选相关结构可代表有效试验数"), ("DSR 是选择偏差诊断，不等于策略有效",), np.column_stack([selected, matrix]))
+    return _result("deflated_sharpe_ratio_v1", base.statistic, base.p_value or 0.0, len(selected), matrix.shape[1], effective, {"benchmark_sharpe": benchmark, "effective_trials_method": "correlation_participation_ratio", "expected_maximum_formula": "bailey_lopez_de_prado_2014_eq1"}, ("候选全集完整", "候选相关结构可代表有效试验数"), ("DSR 是选择偏差诊断，不等于策略有效",), np.column_stack([selected, matrix]))
+
+
+def _expected_maximum_sharpe(mean: float, standard_deviation: float, effective_trials: float) -> float:
+    """论文式（1）；有效试验数采用候选相关矩阵的参与率。"""
+    if effective_trials <= 1.0 or standard_deviation == 0.0:
+        return mean
+    euler_gamma = 0.5772156649015329
+    normal = NormalDist()
+    # 用下尾对称式避免大量候选时 1 - p 舍入为 1。
+    first = -normal.inv_cdf(1.0 / effective_trials)
+    second = -normal.inv_cdf(math.exp(-1.0) / effective_trials)
+    # 极值近似在有效试验数接近 1 时会给出负溢价；最大值期望不能低于单候选均值。
+    premium = max(0.0, (1.0 - euler_gamma) * first + euler_gamma * second)
+    return mean + standard_deviation * premium
 
 
 def probability_of_backtest_overfitting(performance_by_split: object, *, max_combinations: int = 10_000) -> SelectionBiasResult:

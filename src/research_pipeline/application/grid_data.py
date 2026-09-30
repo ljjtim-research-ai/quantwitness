@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from research_pipeline.platform.metric_contracts import builtin_metric_output_path
+
 from .grid_data_contract import _columnar_materialization_plans, _verify_data_bundle
 from datetime import datetime
 from pathlib import Path
@@ -10,13 +12,13 @@ from research_pipeline.data_plane import DataPlaneExecutionBudget
 from research_pipeline.data_plane.execution_estimate import ExecutionEstimate, load_execution_estimates
 from research_pipeline.data_plane.service import _write_json_atomic, materialize_dataset_plan
 from research_pipeline.platform.metric_contracts import build_mainline_metric_registry
-from research_pipeline.runtime.adapters.common import _capture, _environment, _external_result
+from research_pipeline.runtime.adapters.common import _environment, _external_result
 from research_pipeline.runtime.operator_runtime import OperatorRuntimeContext, RuntimeNodeValue
 from typing import Mapping
 import json
 
 
-REQUEST_PARTIAL_INDEX_VERSION = "data-request-partial-index-v1"
+REQUEST_PARTIAL_INDEX_VERSION = "data-request-partial-index-v2"
 
 
 def execute_operator_graph_data(
@@ -199,7 +201,7 @@ def _materialize_or_load_data(
 def _load_request_partial_index(
     path: str | Path | None,
 ) -> dict[str, dict[str, object]]:
-    """逐项读取节点内部恢复索引；单项损坏不会牵连其他 request。"""
+    """只复用当前物化语义的索引；旧版本整体重算，单项损坏只淘汰该项。"""
 
     if path is None:
         return {}
@@ -347,12 +349,11 @@ def execute_data_columnar_materialize_v1(
         verified_dataset_manifests=verified_dataset_manifests,
     )
     result["observations"] = observations
-    _capture(context, "data", result)
     return _external_result(
         context,
         result,
         directories={"data": request_recovery_root / "data"},
-        parquet_rows=({"observation": metric_rows} if metric_rows else None),
+        parquet_rows=({builtin_metric_output_path("data.columnar-bundle.v1"): metric_rows} if metric_rows else None),
     )
 
 

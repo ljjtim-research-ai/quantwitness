@@ -13,6 +13,6 @@ python -m research_pipeline operator build --spec <声明.yaml> --source <源码
 
 普通 `operator list/describe` 和安装后运行不需要私有研究目录。晋级时由审查者向专用审查入口显式提供项目 ID 到目录的映射及测试证据根；审查会编译正式声明、核对不同拓扑与目标算子的消费，并执行引用的 pytest 节点。目录可在公开仓库外，私有项目真实性和测试覆盖的金融语义须由人工线下核实。运行可能写库的证据测试前须另行获得写库批准，不能以晋级审查代替批准。当前没有新增公共算子的批准晋级记录。
 
-刷新整改基线时使用 `python research_pipeline/tools/capability_containment_gate.py --mode snapshot --promotion-project <项目ID>=<项目目录> --promotion-project <另一项目ID>=<另一项目目录> --promotion-evidence-root <测试目录>`。只有在存在 approved 晋级记录时才要求这些显式参数；普通 `check` 不加载项目证据，也不接受晋级证据参数。该命令只输出快照，不自动发布或修改基线文件。
+整改基线的快照与 capability containment 属于完整单仓源码维护流程，依赖内部基线和晋级证据，不随公开仓库、sdist 或源码 zip 分发。公开扩展开发使用上面的 `operator validate/build`；公共算子晋级仍须完成独立审查和人工批准。
 
 完整 ABI、输出 writer、state 和 `causal_plan` 约束见 [项目扩展合同](project_extensions/README.md)。

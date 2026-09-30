@@ -1,6 +1,6 @@
 # 受控项目扩展
 
-这里存放尚未达到框架核心晋级条件的项目算子。扩展源码目录只允许 Python 文件，以便生成内容寻址的受控 bundle；薄声明放在源码目录旁，不进入源码闭包。
+本文说明尚未达到框架核心晋级条件的项目算子合同。扩展源码目录只允许 Python 文件，以便生成内容寻址的受控 bundle；薄声明放在源码目录旁，不进入源码闭包。
 
 Python 项目算子的公开构建路径为：
 
@@ -50,63 +50,7 @@ package lint/admit 会在数据库打开和正式运行前用真实冻结 contex
 
 项目算子默认 `reuse_scope: same_run`。只有正式输出完全由 typed 输入、参数、fixed clock 和 seed 决定，且不依赖 project/run/node/attempt 等易变 ID 时，薄声明才可显式写 `reuse_scope: cross_run`。Runtime 还会同时检查确定性合同和 `artifact_write_scope: output_only`；没有该字段的既有声明保持同 run 恢复语义。
 
-`minute_event_response/` 提供“分钟事件到后续窗口反应”的通用候选实现，支持参数化字段、Top-K/分位数、开头窗口排除、最小事件间隔、后续窗口和聚合函数。它目前仍是项目扩展：首个研究消费者不能单独证明通用性；只有第二个独立项目给出复用证据、独立 oracle 和攻击测试后，才评估是否晋级核心。
-
-该实现只读取决策时点前已经完成且质检通过的 bar。后续窗口也是在研究决策时点已经可见的历史窗口，不可把这个算子直接当成盘中实时信号。
-
-`dai_zhu_er_jiu_monthly_labels/` 是待著而救项目的完整分析扩展：消费分钟事件观察和显式
-日线/证券主数据/ST 输入，构造月末股票池与主/敏感性标签，逐月完成缩尾、标准化、IC、
-十分组和 HAC 指标，并分别提交主分析、敏感性分析和资格审计项目 Artifact。项目专属
-Verifier 位于 `dai_zhu_er_jiu_factor_verifier/`，从 Result 成员明细独立重算统计量和时间
-顺序。两者不会注册到框架公共 discovery。
-
-该项目的可重复构建入口为：
-
-```powershell
-$env:PYTHONPATH='research_pipeline/src'
-python research_pipeline/project_extensions/build_dai_zhu_er_jiu_bundles.py `
-  --output <仓库外新目录>
-```
-
-构建器读取分钟因子、分析和 validity 三个 Operator 声明及 Verifier `definition.yaml`，
-一次生成彼此独立的四个 bundle。validity Worker 只从 Supervisor 注入的四请求准入事实、
-主分析表和标签审计生成 Result 所需的唯一 `research.validity-facts.v1`；Verifier 的五个
-项目 Metric 定义仍由自身声明生成，不在构建脚本里另写一份。
-
-`e004_smallcap_grid_robustness/` 封装 E004 确定性小盘股网格研究的 panel、目标持仓、指数
-观察、现金账户仿真、稳健统计和 validity。八份 `.framework.yaml` 文件虽然保留历史文件名，
-内容均为当前 `project-operator-declaration-v2`；它们不再引用已退役的框架原语。独立
-Verifier 从 Result 的候选日收益重算八项项目指标。完整包选用全部八项，
-smoke Package 只将其中五项纳入正式 MetricContract。可重复构建入口为：
-
-```powershell
-$env:PYTHONPATH='research_pipeline/src'
-python research_pipeline/project_extensions/build_e004_bundles.py `
-  --output <仓库外新目录>
-```
-
-候选目标 Worker 同时支持确定性 `top_n` 和项目侧
-`random_without_replacement`。随机模式必须显式登记 `deterministic_selected`、`typical`
-和 `stress` 三类代表组合、选择来源与证据、重复编号轴及候选池倍数；每个调仓日只在已见
-横截面按市值稳定排序后的前 `K=N×multiplier` 只中无放回抽取 `N` 只。两个确定性 E004
-ResearchPackage 继续只使用 `top_n`。独立的 `e004_smallcap_random_stability_smoke` 已从正式
-发现/验证工件冻结三个代表组合、20 个 draw 和根种子，只报告路径分布，不在评价窗口重新
-选优。每日换手率使用当日成交金额除以调仓前开盘账户权益，原始成交金额仍留在仿真工件；
-它使用独立统计 Operator 和 Verifier，构建入口为：
-
-确定性全量包按排序后的 `combination_id` 每 64 组形成一个稳定分区。目标持仓和诊断逐批
-写入对应 Parquet，现金账户仿真逐分区读取目标、逐组合推进账户，再把 daily 与 fills 写回
-同编号分区；稳健统计逐分区消费 daily，只在内存保留检验矩阵和当前 candidates 分区。仿真
-会复用按交易日建立的行情索引和公司行动日期索引，不再为每个组合重复扫描整表。内存中不再
-同时保留 5,040 组目标、全部仿真结果或全量 candidates。分区只改变工件布局，不改变参数
-组合、调仓日、排名、权重、费用、公司行动、随机种子或统计口径；metadata 显式记录布局版本、
-每分区组合上限和分区数量，下游发现缺分区、重复分区或组合越界时拒绝运行。
-
-```powershell
-$env:PYTHONPATH='research_pipeline/src'
-python research_pipeline/project_extensions/build_e004_random_bundles.py `
-  --output <仓库外新目录>
-```
+公开分发只保留本目录的扩展合同；使用者自行提供项目源码、声明和独立 Verifier。可执行的合成示例位于独立公开源码仓库的 `examples/`，私人研究项目及其专用构建脚本不随包分发。
 
 ## 分批输入、输出和状态
 

@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from research_pipeline.domain import CorporateAction, MarketRuleSnapshot, Price
 from research_pipeline.domain.time import require_aware_datetime
+from research_pipeline.domain.trading import InstrumentKey, instrument_key_from_legacy
 from research_pipeline.platform import typed_canonical_hash
 
 from .events import FinancialEvent
@@ -130,9 +131,15 @@ def execute_cash_order(
     reason = _reject_reason(order, policy, snapshot, state, execution_price)
     if reason is not None:
         return CashExecutionResult(state, (), 0, reason, policy.rule.content_hash)
-    capacity = snapshot.visible_capacity // policy.lot_size * policy.lot_size
-    filled = min(order.quantity, capacity)
-    filled = filled // policy.lot_size * policy.lot_size
+    capacity = min(order.quantity, snapshot.visible_capacity)
+    filled = capacity // policy.lot_size * policy.lot_size
+    if (order.side == "sell" and order.quantity % policy.lot_size
+            and _sell_remainder_allowed(order, policy)):
+        sellable = next((item.sellable for item in state.positions if item.instrument_hash == snapshot.instrument_hash), 0)
+        remainder = sellable % policy.lot_size
+        # 一次成交可以带走全部零股；容量不足时只成交整手，不能拆分余额。
+        if remainder and capacity >= remainder:
+            filled = max(filled, (capacity - remainder) // policy.lot_size * policy.lot_size + remainder)
     if filled <= 0:
         return CashExecutionResult(state, (), 0, "capacity_exceeded", policy.rule.content_hash)
     if order.side == "buy":
@@ -232,8 +239,8 @@ def settle_cash_daily_open(
                 "settlement",
                 payload=(
                     ("cash_units", 0),
-                    ("quantity", 0),
                     ("entitlement_id", entitlement.entitlement_id),
+                    ("quantity", 0),
                 ),
                 **base,
             ))
@@ -370,9 +377,24 @@ def cash_rebalance_deltas(
     return tuple(sorted(rows, key=lambda item: (item[1] != "sell", item[0])))
 
 
+def _sell_remainder_allowed(order: Order, policy: CashMarketPolicy) -> bool:
+    """使用显式历史规则，或沪深交易所自 2006 年交易规则明确的整手零股政策。"""
+    declared = dict(policy.rule.parameters).get("sell_remainder_allowed")
+    if declared is not None:
+        return declared is True
+    return (
+        (order.instrument if isinstance(order.instrument, InstrumentKey) else instrument_key_from_legacy(order.instrument)).venue in {"XSHG", "XSHE"}
+        and policy.lot_size == 100
+        and order.submitted_at.date() >= date(2006, 7, 1)
+    )
+
+
 def _reject_reason(order: Order, policy: CashMarketPolicy, snapshot: OpeningSnapshot, state: SpotLedgerState, execution_price: Price) -> str | None:
-    if order.quantity < policy.lot_size or order.quantity % policy.lot_size:
-        return "invalid_lot"
+    remainder = order.quantity % policy.lot_size
+    if remainder:
+        sellable = next((item.sellable for item in state.positions if item.instrument_hash == snapshot.instrument_hash), 0)
+        if order.side != "sell" or not _sell_remainder_allowed(order, policy) or remainder != sellable % policy.lot_size:
+            return "invalid_lot"
     if snapshot.paused:
         return "suspended"
     if order.side == "buy" and execution_price.units >= snapshot.high_limit.units:

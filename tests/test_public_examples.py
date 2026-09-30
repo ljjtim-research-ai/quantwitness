@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -121,7 +123,8 @@ def test_public_examples_complete_formal_cli_workflow(
             (Path(project["package"]) / "spec/research.yaml").read_text(encoding="utf-8")
         )
         store_path = work / "results"
-        assert main([
+        run = subprocess.run([
+            sys.executable, "-B", "-m", "research_pipeline",
             "run", "--plan", str(plan), "--data-db", str(database),
             "--artifact-root", str(work / "artifacts"),
             "--handoff-out", str(work / "handoff.json"),
@@ -129,8 +132,9 @@ def test_public_examples_complete_formal_cli_workflow(
             "--result-store", str(store_path),
             "--clock", specification["fixed_clock"],
             "--root-seed", str(specification["root_seed"]), "--json",
-        ]) == 0, name
-        result = Path(_last_payload(capsys)["data"]["result_directory"])
+        ], capture_output=True, text=True, encoding="utf-8", timeout=120, check=False)
+        assert run.returncode == 0, run.stdout + run.stderr
+        result = Path(json.loads(run.stdout)["data"]["result_directory"])
         ResultStore(store_path, create=False).verify(result)
 
         verification = work / "verification-result.json"

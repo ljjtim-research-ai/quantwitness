@@ -457,9 +457,13 @@ def build_execution_estimate(
         if plan.query.limit is not None
         else plan.query.budget.max_rows,
     )
-    # Provider 使用 max_rows + 1 的 Top-N 观察预算超限；工作集因此不需要
-    # 随完整来源行数增长。窗口选择仍必须看到完整范围，不能按输出上限缩小。
-    sort_rows = min(intermediate_rows, output_rows + 1)
+    # 逐消费者物化保留全部时态事实，SQL 没有 LIMIT，必须预算完整排序。
+    # 普通快照的最终查询才可按 Top-N 估计；窗口仍覆盖完整来源范围。
+    sort_rows = (
+        intermediate_rows
+        if plan.temporal_selection.requires_consumer_binding
+        else min(intermediate_rows, output_rows + 1)
+    )
     sort_bytes = (
         intermediate_bytes
         if evidence.partition_bound_method is not None

@@ -335,6 +335,8 @@ def run_workspace_execution(
 ) -> dict[str, Any]:
     """把 Workspace execution 映射到现有 run 服务；本函数不猜测数据库路径。"""
 
+    if "acceptance_proof" in options:
+        raise WorkspaceError("acceptance-proof 已删除；研究复现请声明项目 Verifier")
     config = load_workspace(root)
     _validate_clock(clock)
     index = _read_index(config.generated_root / "index.json", config.workspace_id)
@@ -360,7 +362,6 @@ def run_workspace_execution(
         "workers": options.pop("workers", None),
         "source_db": options.pop("source_db", []),
         "minute_data_root": options.pop("minute_data_root", None),
-        "acceptance_proof": options.pop("acceptance_proof", None),
         **{key: str(value) for key, value in paths.items()},
         **options,
     }

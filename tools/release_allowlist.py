@@ -62,8 +62,18 @@ PUBLIC_DOC_FILES = (
     "docs/release.md",
     "docs/research_package.md",
     "docs/runtime.md",
+    "docs/walk_forward_model.md",
+    "docs/project_resource_budgets.md",
     "project_extensions/README.md",
     "examples/README.md",
+)
+CORE_DOC_FILES = (
+    "ARCHITECTURE.md",
+    "CONTRIBUTING.md",
+    "EXTENSIONS.md",
+    "SECURITY.md",
+    "THIRD_PARTY_NOTICES.md",
+    *PUBLIC_DOC_FILES,
 )
 PUBLIC_EXAMPLE_PROJECTS = (
     "equity_cross_section",
@@ -94,6 +104,7 @@ PUBLIC_TEST_FILES = (
     "tests/test_public_operator_governance.py",
     "tests/test_public_release_gates.py",
     "tests/test_public_source_inventory.py",
+    "tests/test_release_metadata_ssot.py",
 )
 PUBLIC_TOOL_FILES = (
     *BUILD_SUPPORT_FILES,
@@ -242,7 +253,7 @@ def package_file_paths(project: Path) -> tuple[str, ...]:
 
 def core_release_paths(project: Path) -> tuple[str, ...]:
     root = _require_project(project)
-    required = (*CORE_ROOT_FILES, *package_file_paths(root))
+    required = (*CORE_ROOT_FILES, *CORE_DOC_FILES, *package_file_paths(root))
     missing = [path for path in required if not (root / path).is_file()]
     if missing:
         raise ValueError(f"正式发布核心文件缺失: {missing}")
@@ -501,6 +512,7 @@ def verify_sdist_inventory(project: Path, sdist: Path) -> dict[str, str]:
 __all__ = [
     "BUILD_SUPPORT_FILES",
     "CORE_ROOT_FILES",
+    "CORE_DOC_FILES",
     "UNIT_CORE_TEST_FILES",
     "allowlisted_source_dirty",
     "build_input_paths",

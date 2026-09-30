@@ -14,7 +14,7 @@ from ..admission import (
     AdmittedQueryPlan,
 )
 from ..errors import QueryIRInvalidError
-from ..query_ir import DateRangeV1, FilterOperator, InstantRangeV2, source_local_naive
+from ..query_ir import DateRangeV1, FilterOperator, FilterPredicate, InstantRangeV2, source_local_naive
 
 
 def quote_identifier(value: str) -> str:
@@ -194,6 +194,7 @@ def compile_duckdb_query(
             temporal_clauses.append(clause)
             params.extend(values)
     interval = temporal.effective_interval_selector
+    interval_clauses: list[str] = []
     if interval is not None:
         start = quote_identifier(interval.effective_from_field)
         end = quote_identifier(interval.effective_to_field)
@@ -209,7 +210,7 @@ def compile_duckdb_query(
         end_operator = ">=" if end_exclusive else (
             ">=" if interval.right_closed else ">"
         )
-        temporal_clauses.extend(
+        interval_clauses.extend(
             (
                 f"{start} {start_operator} {start_clock}",
                 f"({end} IS NULL OR {end} {end_operator} {end_clock})",
@@ -240,6 +241,11 @@ def compile_duckdb_query(
         )
         current = '"__revision"'
     if interval is not None:
+        ctes.append(
+            f'"__effective" AS (SELECT * FROM {current} WHERE '
+            f"{' AND '.join(interval_clauses)})"
+        )
+        current = '"__effective"'
         entity = ", ".join(quote_identifier(item) for item in interval.entity_fields)
         ctes.append(
             f'"__interval" AS (SELECT * FROM {current} QUALIFY '
@@ -247,9 +253,15 @@ def compile_duckdb_query(
             "THEN TRUE ELSE error('时态有效区间重叠') END)"
         )
         current = '"__interval"'
+    business_clauses, business_params = _predicate_clauses(
+        plan.query.filters,
+        {field: field for field in plan.temporal_selection.required_scan_fields},
+    )
+    params.extend(business_params)
+    business_where = "" if not business_clauses else f" WHERE {' AND '.join(business_clauses)}"
     sql = (
-        f"WITH {', '.join(ctes)} SELECT {public_projection} FROM {current} "
-        f"ORDER BY {ordering}"
+        f"WITH {', '.join(ctes)} SELECT {public_projection} FROM {current}"
+        f"{business_where} ORDER BY {ordering}"
     )
     if not materialized_snapshot:
         sql += " LIMIT ?"
@@ -331,7 +343,22 @@ def _source_filter_clauses(
         placeholders = ",".join("?" for _ in plan.query.universe.instruments)
         clauses.append(f"{instrument_column} IN ({placeholders})")
         params.extend(plan.query.universe.instruments)
-    for predicate in plan.query.filters:
+    # 只有对整个实体恒定的条件可先筛；业务值必须等可见版本确定后再判断。
+    predicates = tuple(
+        predicate for predicate in plan.query.filters
+        if predicate.field_id in plan.temporal_selection.stable_filter_fields
+    )
+    filter_clauses, filter_params = _predicate_clauses(predicates, columns)
+    return [*clauses, *filter_clauses], [*params, *filter_params]
+
+
+def _predicate_clauses(
+    predicates: tuple[FilterPredicate, ...],
+    columns: Mapping[str, str],
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    for predicate in predicates:
         column = quote_identifier(columns[predicate.field_id])
         if predicate.operator == FilterOperator.EQ:
             clauses.append(f"{column} = ?")

@@ -59,7 +59,9 @@ PartitionedDataset 和 ExternalArtifact 首次绑定时完成内容、footer、m
 `request_id + admitted plan hash + DatasetArtifactRef + 数据库只读指纹` 原子写入 run 内的
 节点恢复索引。后续 request 失败后，`retry-node` 或中断后的 `resume` 会逐项比较当前 plan 并用
 新的 run 内验证会话复验引用；只有相同且完整的 request 会跳过 provider。变化或损坏只淘汰
-对应项。全部完成后仍只提交一个正式 data ExternalArtifact/checkpoint，恢复索引不会被复制进去。
+对应项。恢复索引当前为 `data-request-partial-index-v2`；旧版本整体视为未完成请求并重新物化，
+不会复用缺失历史修订的旧事实。重算中断后，已经按当前语义完成的请求可继续逐项复用。
+全部完成后仍只提交一个正式 data ExternalArtifact/checkpoint，恢复索引不会被复制进去。
 
 `rerun-from` 会先验证父 run、checkpoint 和 ExternalArtifact，再把目标节点之前的正式工件导入
 child ExternalArtifactStore。目标节点及后继只消费这些导入工件；不会复制父 `artifact` 或
@@ -69,6 +71,26 @@ holdout 不会因为 child 输出目录变化而重新获得读取资格。根�
 继承并核对；父 invocation 缺失、血缘循环或任一层锚点冲突时，在 Runtime 节点启动前拒绝。
 
 ## 恢复选择
+
+checkpoint 的内容、manifest 和 `COMMITTED` 标记都在同盘 staging 写入并持久化后，
+才整体原子发布到正式目录。staging 或没有提交标记的未成功节点残留可以重算；
+已提交内容损坏、或成功节点丢失提交标记时拒绝恢复。
+
+`created`、`planned` 中断可通过 `resume` 按现有事件补齐启动，不重复创建 attempt。
+恢复前核对 owner 的 PID 和进程创建时间：活跃 owner 返回等待建议，不能接管或把其
+attempt 标记为 lost；进程退出或显式释放 owner 后才可恢复。心跳覆盖整个 Runtime 调用，
+节点间不会释放 owner。
+
+`rerun-from` 与失败 run 复用只复制成功且通过当前身份和内容复验的节点。
+失败、未开始的节点及其下游进入重算范围；指定节点及其下游仍强制重算。
+独立成功分支可复用，独立未开始分支正常执行；成功节点的 checkpoint 复验失败时明确拒绝。
+
+完成元数据保留 `node_completion_metadata[node_id]` 原始命名空间，聚合的工件摘要、
+证明摘要和计数使用 `node_id/字段名`，不同参数的同类节点不会互相覆盖。
+输出端口仍保存在 `outputs[node_id][port]`。元数据和完整收尾记录准备成功后才提交 run 成功事件。
+
+公共 `run`、`workspace run` 不接受 `--acceptance-proof`，旧 invocation 中的该字段也会
+在计算前明确拒绝。研究复现由 ResearchPackage 声明的项目 Verifier 承担。
 
 | 情况 | 命令 | 行为 |
 | --- | --- | --- |
@@ -162,13 +184,19 @@ admit 把已验证 bundle 和实现摘要写入计划闭包。run、resume、ret
 节点在排队时记录为 `waiting_for_resources`，取得租约并真正开始执行后才进入 `running`。事件同时记录申请向量、排队时间、取得租约时间和等待毫秒数，`inspect` 可以区分等待中断与执行中断。
 
 普通 run 也会在 run-root 原子维护 `runtime-liveness.json`。该文件记录当前 run/node/attempt、
-等待资源、执行、checkpoint 或 finalize 阶段、进程身份、最近心跳和预留资源；它只供诊断，
+等待资源、执行、checkpoint 或 finalize 阶段、进程身份、最近心跳和预留资源；它用于诊断和活跃 owner 接管判定，
 不进入事件 hash chain、checkpoint、Result、VerificationResult、恢复身份或跨运行复用身份。
+`starting` 覆盖计划加载和节点启动前阶段，准入完成前 `run_id` 可为 `null`；
+同一 owner 持续覆盖 Runtime 和 Result finalize，到本次调用返回或抛错才写入 `stopped`。
+同进程内重入和跨进程接管均须等待当前调用释放；进程存活由 PID 与进程创建时间共同判定。
 没有算子提供的真实总量时 `progress` 固定为 `null`，框架不按耗时猜百分比。
 
 `wall_seconds` 覆盖整个节点 attempt，不包含排队时间。Runtime 在取得资源后建立统一截止时间，逐分区 Worker 和 causal 键批只获得剩余秒数，不能为每次调用重新获得完整时限；项目 Worker 超时会被终止并清理进程树。当前内建同步 adapter 在返回边界核对截止时间，不能把它宣称为可抢占终止。
 
-默认路径不创建跨命令状态或租约。只有调用方显式提供共享 resource state dir 时，多个独立 CLI 才按各自节点声明申请跨进程 FIFO 额度；各维度之和未超过总容量时可以同时执行，超过任一维度时后到请求等待。等待超过显式 timeout 后拒绝，不改变金融语义。可选 RSS 遥测失败记录 `measurement_unavailable`，不能冒充已测得；需要清理失控 Worker 时仍保留进程树终止，无法递归观察时报告 `direct_process_only` 残留风险。资源观测只报告声明偏差，不会静默改写后续 reservation。资源观测 v4 不读取含 v3 观测的旧共享状态，升级后必须使用新的仓库外 state dir；旧四字段项目声明也必须补齐 `process_slots` 后重新 build、lint、admit 并新建 run。
+默认路径不创建跨命令状态或租约。只有调用方显式提供共享 resource state dir 时，多个独立 CLI 才按各自节点声明申请跨进程 FIFO 额度；各维度之和未超过总容量时可以同时执行，超过任一维度时后到请求等待。等待超过显式 timeout 后拒绝，不改变金融语义。启用共享治理时，最终资源采样覆盖 checkpoint 提交标记、目录发布与内容复验，再核对 Supervisor 与本 attempt 子进程的
+合计 RSS、scratch、进程数和耗时。通过后才记录 checkpoint 成功事件；超出预算或租约时记录失败，
+撤销本 attempt 刚发布的 checkpoint，避免恢复复用未通过资源门禁的输出；
+资源测量不可用时记录 `measurement_unavailable` 并阻断提交。需要清理失控 Worker 时仍保留进程树终止，无法递归观察时报告 `direct_process_only` 残留风险。资源观测保留实际测量值，不会静默改写后续 reservation。资源观测 v4 不读取含 v3 观测的旧共享状态，升级后必须使用新的仓库外 state dir；旧四字段项目声明也必须补齐 `process_slots` 后重新 build、lint、admit 并新建 run。
 
 ## Result 边界
 

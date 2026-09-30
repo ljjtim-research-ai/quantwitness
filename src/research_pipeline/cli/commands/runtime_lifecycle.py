@@ -17,6 +17,7 @@ from research_pipeline.runtime import (
 from research_pipeline.runtime.liveness import (
     process_identity_alive,
     read_runtime_liveness,
+    runtime_owner_alive,
 )
 from research_pipeline.runtime.resource_governor import read_resource_governor_state
 from research_pipeline.runtime.diagnostics import (
@@ -103,6 +104,11 @@ def _inspect_not_started_run(root: Path) -> dict[str, object]:
             "当前 invocation 身份无效，不能开始或恢复 Runtime"
         )
     liveness = read_runtime_liveness(root)
+    if runtime_owner_alive(liveness):
+        action, reason, next_command = (
+            "wait", "Runtime owner 仍存活，等待当前进程完成后再恢复",
+            _command("python", "-m", "research_pipeline", "inspect", "--run-root", str(root), "--json"),
+        )
     resource_pool = _resource_pool_projection(
         root / "operator-dag-invocation.json",
         run_id="",
@@ -196,7 +202,10 @@ def _inspect_started_run(
         if event.kind == "diagnostic" and event.node_id is not None
     }
     liveness = read_runtime_liveness(root)
-    if liveness is not None and liveness.get("run_id") != projection.run_id:
+    if (
+        liveness is not None and liveness.get("run_id") is not None
+        and liveness.get("run_id") != projection.run_id
+    ):
         raise RuntimeIntegrityError("Runtime 存活投影与事件 run identity 不一致")
     nodes = {}
     for node in dag.nodes:
@@ -273,6 +282,11 @@ def _inspect_started_run(
             else _invocation_result_store(operator_invocation)
         ),
     )
+    if runtime_owner_alive(liveness):
+        action, reason, next_command = (
+            "wait", "Runtime owner 仍存活，等待当前进程完成后再恢复",
+            _command("python", "-m", "research_pipeline", "inspect", "--run-root", str(root), "--json"),
+        )
     resource_pool = _resource_pool_projection(
         operator_invocation,
         run_id=str(projection.run_id),

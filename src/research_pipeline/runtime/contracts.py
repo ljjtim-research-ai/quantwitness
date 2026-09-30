@@ -8,6 +8,8 @@ from enum import Enum
 import re
 from typing import Any
 
+from research_pipeline.platform.resource_budget import ResourceBudget
+
 from .errors import RuntimeContractError
 
 
@@ -45,38 +47,6 @@ def _strict_bool(value: object, label: str) -> bool:
 class CheckpointPolicy(str, Enum):
     REQUIRED = "required"
     DISABLED = "disabled"
-
-
-@dataclass(frozen=True)
-class ResourceBudget:
-    memory_bytes: int
-    cpu_slots: int
-    temp_bytes: int
-    wall_seconds: int
-
-    def __post_init__(self) -> None:
-        for name, value in self.to_dict().items():
-            minimum = 0 if name == "temp_bytes" else 1
-            if (
-                not isinstance(value, int)
-                or isinstance(value, bool)
-                or value < minimum
-            ):
-                requirement = "非负整数" if name == "temp_bytes" else "正整数"
-                raise RuntimeContractError(f"资源预算 {name} 必须是{requirement}")
-
-    def to_dict(self) -> dict[str, int]:
-        return {
-            "memory_bytes": self.memory_bytes,
-            "cpu_slots": self.cpu_slots,
-            "temp_bytes": self.temp_bytes,
-            "wall_seconds": self.wall_seconds,
-        }
-
-    @classmethod
-    def from_dict(cls, payload: dict[str, Any]) -> ResourceBudget:
-        _require_fields(payload, {"memory_bytes", "cpu_slots", "temp_bytes", "wall_seconds"}, "ResourceBudget")
-        return cls(*(_strict_int(payload[key], key) for key in ("memory_bytes", "cpu_slots", "temp_bytes", "wall_seconds")))
 
 
 @dataclass(frozen=True)

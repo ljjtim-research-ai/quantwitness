@@ -176,9 +176,18 @@ try {
         [void](Invoke-AcceptanceCommand "package.init" $venvPython @(
             "-m", "research_pipeline", "package", "init", $package, "--json"
         ))
-        [void](Invoke-AcceptanceCommand "package.lint" $venvPython @(
+        $draftLintResult = Invoke-AcceptanceCommand "package.lint" $venvPython @(
             "-m", "research_pipeline", "package", "lint", "--package", $package, "--json"
-        ))
+        ) $false
+        $draftLint = $draftLintResult.Stdout | ConvertFrom-Json -ErrorAction Stop
+        if (
+            $draftLintResult.ExitCode -ne 1 -or
+            $draftLint.status -cne "fail" -or
+            $draftLint.error_code -cne "research_package_invalid" -or
+            $draftLint.message -cne "sources/sources.yaml.sources 必须是非空列表；请填写对应声明后重新运行 package lint"
+        ) {
+            throw "中性草稿 lint 必须以 exit=1 和 research_package_invalid JSON 拒绝空 sources"
+        }
 
         $recipeListResult = Invoke-AcceptanceCommand "recipe.list" $venvPython @(
             "-m", "research_pipeline", "recipe", "list", "--format", "json"

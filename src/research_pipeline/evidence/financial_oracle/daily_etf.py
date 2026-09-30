@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import date
 from typing import Mapping
 
-import pyarrow as pa
+from research_pipeline.domain import CorporateAction
 
 from research_pipeline.platform import typed_canonical_hash
 from research_pipeline.platform.market_rule_defaults import (
@@ -17,13 +16,8 @@ from research_pipeline.results import CANONICAL_SIMULATION_SCHEMA_IDS
 from ..errors import EvidenceContractError
 from ..oracle_workspace import OracleTable
 from .common import (
-    aware_datetime as _aware_datetime,
-    ceil_ratio as _ceil_ratio,
-    create_mapping_table as _mapping_table,
     date_value as _date_value,
     integer as _integer,
-    ordered_rows as _ordered_rows,
-    require_no_rows as _require_no_external_rows,
 )
 
 
@@ -50,11 +44,21 @@ def verify_daily_etf_financial_context(
         "simulation_result_hash",
         "source_ledger_hash",
         "context_hash",
+        "corporate_actions",
     }
     if set(context) != expected or context.get("contract_version") != (
-        "research-daily-etf-financial-context-v1"
+        "research-daily-etf-financial-context-v2"
     ):
-        raise EvidenceContractError("ETF 日频金融上下文 schema 无效")
+        raise EvidenceContractError("ETF 日频金融上下文必须使用 v2，并携带完整公司行动事实")
+    raw_actions = context.get("corporate_actions")
+    if not isinstance(raw_actions, list) or any(not isinstance(item, Mapping) for item in raw_actions):
+        raise EvidenceContractError("ETF 日频公司行动必须是列表")
+    try:
+        actions = tuple(CorporateAction.from_dict(item) for item in raw_actions)
+    except (ValueError, TypeError, KeyError) as exc:
+        raise EvidenceContractError(f"ETF 日频公司行动事实无效: {exc}") from exc
+    if len({item.action_id for item in actions}) != len(actions):
+        raise EvidenceContractError("ETF 日频公司行动身份重复或修订未冻结")
     unsigned = {key: value for key, value in context.items() if key != "context_hash"}
     if typed_canonical_hash(unsigned) != context.get("context_hash"):
         raise EvidenceContractError("ETF 日频金融上下文身份不一致")
@@ -198,6 +202,7 @@ def verify_daily_etf_financial_context(
             profile=profile,
             commission_ppm=commission_ppm,
             min_commission_units=min_commission_units,
+            corporate_actions=actions,
         )
         return
     _verify_daily_etf_fills_and_settlement(
@@ -206,6 +211,7 @@ def verify_daily_etf_financial_context(
         profile=profile,
         commission_ppm=commission_ppm,
         min_commission_units=min_commission_units,
+        corporate_actions=actions,
     )
 
 
@@ -216,128 +222,16 @@ def _verify_external_daily_etf_fills_and_settlement(
     profile: CnEtfDailyMarketRuleProfile,
     commission_ppm: int,
     min_commission_units: int,
+    corporate_actions: tuple[CorporateAction, ...] = (),
 ) -> None:
-    """把日频 ETF 跨行规则留在受预算约束的关系扫描中。"""
-
-    workspace = next(iter(canonical.values())).workspace
-    _mapping_table(
-        workspace,
-        name="daily_etf_classification",
-        rows=[
-            {
-                "instrument_id": code,
-                "settlement_days": profile.settlement_days_for(category),
-            }
-            for code, category in sorted(category_by_code.items())
-        ],
-        schema=pa.schema([
-            pa.field("instrument_id", pa.string()),
-            pa.field("settlement_days", pa.int64()),
-        ]),
-    )
-    fills = canonical["fills"].name
-    positions = canonical["positions"].name
-    start = profile.effective_start.isoformat()
-    end = profile.effective_end.isoformat()
-    available = profile.rule_available_at.isoformat()
-    transfer_ppm = profile.transfer_fee_ppm
-    sell_tax_ppm = profile.sell_tax_ppm
-    lot_size = profile.lot_size
-    expected_fee = f"""
-        greatest(
-          {min_commission_units:d},
-          ((CAST(f.notional_units AS HUGEINT) * {commission_ppm:d}
-             + 999999) // 1000000)
-        )
-        + ((CAST(f.notional_units AS HUGEINT) * {transfer_ppm:d}
-             + 999999) // 1000000)
-        + CASE WHEN f.side = 'sell'
-               THEN ((CAST(f.notional_units AS HUGEINT) * {sell_tax_ppm:d}
-                      + 999999) // 1000000)
-               ELSE 0 END
-    """
-    _require_no_external_rows(
-        workspace,
-        f"""
-        SELECT 1
-        FROM {fills} AS f
-        LEFT JOIN daily_etf_classification AS c
-          ON f.instrument_id = c.instrument_id
-        WHERE c.instrument_id IS NULL
-           OR f.session < DATE '{start}' OR f.session > DATE '{end}'
-           OR f.fill_time < TIMESTAMPTZ '{available}'
-           OR f.quantity IS NULL OR f.quantity < 1
-           OR f.quantity % {lot_size:d} != 0
-           OR f.notional_units IS NULL OR f.notional_units < 1
-           OR f.fee_units IS DISTINCT FROM ({expected_fee})
-        LIMIT 1
-        """,
-        "ETF 日频 fill 的分类、有效期、交易单位或费用不一致",
-    )
-    _require_no_external_rows(
-        workspace,
-        f"""
-        WITH ordered AS (
-          SELECT f.instrument_id, f.session, f.fill_time, f.fill_id,
-                 c.settlement_days,
-                 sum(CASE WHEN f.side = 'buy' THEN f.quantity ELSE 0 END)
-                   OVER history AS bought_through_current,
-                 sum(CASE WHEN f.side = 'buy' THEN f.quantity ELSE 0 END)
-                   OVER current_session AS bought_in_session_through_current,
-                 sum(CASE WHEN f.side = 'sell' THEN f.quantity ELSE 0 END)
-                   OVER history AS sold_through_current
-          FROM {fills} AS f
-          JOIN daily_etf_classification AS c
-            ON f.instrument_id = c.instrument_id
-          WINDOW history AS (
-            PARTITION BY f.instrument_id
-            ORDER BY f.session, f.fill_time, f.fill_id
-            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-          ), current_session AS (
-            PARTITION BY f.instrument_id, f.session
-            ORDER BY f.fill_time, f.fill_id
-            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-          )
-        )
-        SELECT 1 FROM ordered
-        WHERE sold_through_current > CASE
-          WHEN settlement_days = 1
-            THEN bought_through_current - bought_in_session_through_current
-          ELSE bought_through_current
-        END
-        LIMIT 1
-        """,
-        "ETF 日频卖出 fill 绕过 T+0/T+1 约束",
-    )
-    _require_no_external_rows(
-        workspace,
-        f"""
-        WITH bought_today AS (
-          SELECT instrument_id, session, sum(quantity) AS quantity
-          FROM {fills}
-          WHERE side = 'buy'
-          GROUP BY instrument_id, session
-        )
-        SELECT 1
-        FROM {positions} AS p
-        LEFT JOIN daily_etf_classification AS c
-          ON p.instrument_id = c.instrument_id
-        LEFT JOIN bought_today AS b
-          ON p.instrument_id = b.instrument_id AND p.session = b.session
-        WHERE c.instrument_id IS NULL
-           OR (
-             p.non_trade_quantity_change = 0
-             AND p.unsettled_quantity IS DISTINCT FROM CASE
-               WHEN c.settlement_days = 0 THEN 0 ELSE coalesce(b.quantity, 0)
-             END
-           )
-           OR (
-             p.non_trade_quantity_change != 0
-             AND p.unsettled_quantity < coalesce(b.quantity, 0)
-           )
-        LIMIT 1
-        """,
-        "ETF 日频持仓 bucket 与 T+0/T+1 规则不一致",
+    """外部表以有界批次按会话复核，仅保留当前持仓与尚未到账权益。"""
+    _verify_daily_etf_fills_and_settlement(
+        canonical=canonical,
+        category_by_code=category_by_code,
+        profile=profile,
+        commission_ppm=commission_ppm,
+        min_commission_units=min_commission_units,
+        corporate_actions=corporate_actions,
     )
 
 
@@ -400,92 +294,16 @@ def _verify_daily_etf_rule_entry(
 
 
 def _verify_daily_etf_fills_and_settlement(
-    *,
-    canonical: Mapping[str, list[dict[str, object]]],
-    category_by_code: Mapping[str, str],
-    profile: CnEtfDailyMarketRuleProfile,
-    commission_ppm: int,
-    min_commission_units: int,
+    *, canonical, category_by_code, profile, commission_ppm,
+    min_commission_units, corporate_actions=(),
 ) -> None:
-    fills = _ordered_rows(
-        canonical["fills"],
-        order_by=("session", "fill_time", "fill_id"),
+    from .daily_holdings import verify_daily_etf_holdings
+
+    verify_daily_etf_holdings(
+        canonical=canonical, category_by_code=category_by_code, profile=profile,
+        commission_ppm=commission_ppm, min_commission_units=min_commission_units,
+        corporate_actions=corporate_actions,
     )
-    bought: dict[tuple[str, date], int] = {}
-    sold_total: dict[str, int] = {}
-    bought_today: dict[tuple[str, date], int] = {}
-    for fill in fills:
-        code = str(fill["instrument_id"])
-        category = category_by_code.get(code)
-        if category is None:
-            raise EvidenceContractError("ETF 日频 fill 引用未分类标的")
-        session = _date_value(fill["session"], "fill.session")
-        fill_time = _aware_datetime(fill["fill_time"], "fill.fill_time")
-        if not (
-            profile.effective_start <= session <= profile.effective_end
-            and profile.rule_available_at <= fill_time
-        ):
-            raise EvidenceContractError("ETF 日频 fill 使用了无效或尚不可见的规则")
-        quantity = _integer(fill["quantity"], "fill.quantity", minimum=1)
-        if quantity % profile.lot_size:
-            raise EvidenceContractError("ETF 日频 fill 不符合受控交易单位")
-        notional = _integer(
-            fill["notional_units"], "fill.notional_units", minimum=1
-        )
-        commission = max(
-            min_commission_units,
-            _ceil_ratio(notional * commission_ppm, 1_000_000),
-        )
-        transfer = _ceil_ratio(
-            notional * profile.transfer_fee_ppm, 1_000_000
-        )
-        tax = (
-            _ceil_ratio(notional * profile.sell_tax_ppm, 1_000_000)
-            if str(fill["side"]) == "sell"
-            else 0
-        )
-        if int(fill["fee_units"]) != commission + transfer + tax:
-            raise EvidenceContractError("ETF 日频 fill 费用与研究假设不一致")
-        settlement_days = profile.settlement_days_for(category)
-        if str(fill["side"]) == "buy":
-            key = (code, session)
-            bought[key] = bought.get(key, 0) + quantity
-            bought_today[key] = bought_today.get(key, 0) + quantity
-        else:
-            eligible = sum(
-                value
-                for (current_code, bought_on), value in bought.items()
-                if current_code == code
-                and (
-                    bought_on < session
-                    if settlement_days == 1
-                    else bought_on <= session
-                )
-            ) - sold_total.get(code, 0)
-            if quantity > eligible:
-                raise EvidenceContractError("ETF 日频卖出 fill 绕过 T+0/T+1 约束")
-            sold_total[code] = sold_total.get(code, 0) + quantity
-    for position in canonical["positions"]:
-        code = str(position["instrument_id"])
-        category = category_by_code.get(code)
-        if category is None:
-            raise EvidenceContractError("ETF 日频持仓引用未分类标的")
-        session = _date_value(position["session"], "position.session")
-        unsettled = _integer(
-            position["unsettled_quantity"],
-            "position.unsettled_quantity",
-            minimum=0,
-        )
-        non_trade = int(position["non_trade_quantity_change"])
-        expected_buys = bought_today.get((code, session), 0)
-        if non_trade == 0:
-            expected_unsettled = (
-                0 if profile.settlement_days_for(category) == 0 else expected_buys
-            )
-            if unsettled != expected_unsettled:
-                raise EvidenceContractError("ETF 日频持仓桶与 T+0/T+1 规则不一致")
-        elif unsettled < expected_buys:
-            raise EvidenceContractError("ETF 日频非交易变化掩盖了当日未结算买入")
 
 
 def _sorted_string_list(value: object, field: str) -> tuple[str, ...]:

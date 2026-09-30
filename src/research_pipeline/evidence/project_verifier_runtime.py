@@ -9,6 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+
+import psutil
 from dataclasses import dataclass
 from typing import Mapping
 
@@ -19,6 +22,13 @@ from research_pipeline.extensions.verifier_bundle import (
 from research_pipeline.platform import canonical_json, typed_canonical_hash
 from research_pipeline.results import ResultSnapshot
 from research_pipeline.results.errors import ResultContractError
+from research_pipeline.platform.resource_budget import ResourceBudget
+from research_pipeline.platform.process_resources import (
+    _measure_attempt_tree_bytes,
+    _project_process_usage,
+    _terminate_process_tree,
+)
+from .oracle_workspace import FinancialOracleBudget
 
 
 PROJECT_VERIFIER_OUTPUT_VERSION = "project-verifier-output-v2"
@@ -134,8 +144,17 @@ def execute_project_verifier(
     snapshot: ResultSnapshot,
     expected_identity: Mapping[str, object],
     scratch_root: str | Path | None = None,
+    budget: ResourceBudget | None = None,
+    process_slots: int = 2,
 ) -> ProjectVerifierOutcome:
     """仅向项目 Verifier 暴露 Result 冻结身份中授权的表和支持工件。"""
+    default_budget = FinancialOracleBudget()
+    budget = budget or ResourceBudget(
+        default_budget.memory_bytes, 1, default_budget.temp_bytes, 300
+    )
+    if type(process_slots) is not int or process_slots < 2:
+        raise ResultContractError("project_verifier_process_slots_exceeded")
+    started = time.monotonic()
     manifest = verify_project_verifier_bundle(bundle_path)
     if manifest.identity() != dict(expected_identity):
         raise ResultContractError("项目 Verifier bundle 与 Result 冻结身份不一致")
@@ -160,6 +179,17 @@ def execute_project_verifier(
     scratch_parent = None if scratch_root is None else str(Path(scratch_root).resolve())
     with tempfile.TemporaryDirectory(prefix="rp-project-verifier-", dir=scratch_parent) as raw:
         root = Path(raw)
+        guard = _VerifierResources(root, budget, process_slots, started)
+        guard.check()
+        required_bytes = sum(
+            (snapshot.directory / relative_path).stat().st_size
+            for schema_id in manifest.authorized_schema_ids
+            for relative_path in snapshot.table_manifest(schema_id).files
+        ) + sum(len(snapshot.support_bytes[path]) for path in support_by_path)
+        if required_bytes > budget.temp_bytes:
+            raise ResultContractError("project_verifier_temp_exceeded")
+        if required_bytes > shutil.disk_usage(root).free:
+            raise ResultContractError("project_verifier_disk_space_exceeded")
         input_root = root / "input"
         input_root.mkdir()
         table_entries = []
@@ -171,7 +201,7 @@ def execute_project_verifier(
             for index, relative_path in enumerate(sorted(table.files)):
                 source = snapshot.directory / relative_path
                 target = table_root / f"part-{index:05d}.parquet"
-                shutil.copyfile(source, target)
+                _copy_verifier_input(source, target, guard)
                 files.append(target.relative_to(input_root).as_posix())
             table_entries.append({
                 "schema_id": schema_id,
@@ -182,7 +212,17 @@ def execute_project_verifier(
         for index, (source_path, item) in enumerate(sorted(support_by_path.items())):
             target = input_root / "support" / f"item-{index:05d}.bin"
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(snapshot.support_bytes[source_path])
+            guard.check()
+            try:
+                content = memoryview(snapshot.support_bytes[source_path])
+                with target.open("wb") as writer:
+                    for offset in range(0, len(content), 1024 * 1024):
+                        guard.check(check_disk=False)
+                        writer.write(content[offset:offset + 1024 * 1024])
+                del content
+            except OSError as exc:
+                raise ResultContractError("project_verifier_copy_failed") from exc
+            guard.check()
             support_entries.append({
                 "artifact_type": item.artifact_type,
                 "source_path": source_path,
@@ -212,31 +252,85 @@ def execute_project_verifier(
         output_path = root / "outcome.json"
         environment = dict(os.environ)
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                     "NUMEXPR_NUM_THREADS", "ARROW_NUM_THREADS"):
+            environment[name] = str(budget.cpu_slots)
+        guard.check()
+        process = subprocess.Popen(
+            [
+                sys.executable, "-B", "-m",
+                "research_pipeline.evidence.project_verifier_worker",
+                str(Path(bundle_path).resolve()), str(context_path),
+                str(input_root), str(output_path),
+            ],
+            env=environment, cwd=root,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
         try:
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-B",
-                    "-m",
-                    "research_pipeline.evidence.project_verifier_worker",
-                    str(Path(bundle_path).resolve()),
-                    str(context_path),
-                    str(input_root),
-                    str(output_path),
-                ],
-                check=True,
-                env=environment,
-                cwd=root,
-                timeout=300,
-                capture_output=True,
+            while process.poll() is None:
+                guard.check(process)
+                time.sleep(0.02)
+            guard.check()
+            if process.returncode != 0:
+                raise ResultContractError("project_verifier_worker_failed")
+        finally:
+            cleanup = _terminate_process_tree(
+                process, observed_descendants=guard.descendants
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-            raise ResultContractError("项目 Verifier 执行失败或超时") from exc
+        if cleanup != "complete":
+            raise ResultContractError("project_verifier_cleanup_failed")
         try:
             raw_outcome = json.loads(output_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ResultContractError("项目 Verifier 未生成有效输出") from exc
-    return _parse_outcome(raw_outcome, manifest, snapshot.bundle.result_id)
+        guard.check()
+        outcome = _parse_outcome(raw_outcome, manifest, snapshot.bundle.result_id)
+        guard.check()
+    return outcome
+
+
+class _VerifierResources:
+    """准备和执行共用一个父进程加当前 Worker 树的资源包络。"""
+
+    def __init__(self, root, budget, process_slots, started):
+        self.root = root
+        self.budget = budget
+        self.process_slots = process_slots
+        self.started = started
+        self.descendants = {}
+
+    def check(self, process=None, *, check_disk=True):
+        if time.monotonic() - self.started > self.budget.wall_seconds:
+            raise ResultContractError("project_verifier_timeout")
+        try:
+            rss, count = _project_process_usage(
+                None if process is None else process.pid, self.descendants,
+            )
+            disk_bytes = _measure_attempt_tree_bytes(self.root) if check_disk else 0
+        except (psutil.Error, OSError, RuntimeError) as exc:
+            raise ResultContractError("project_verifier_measurement_unavailable") from exc
+        if rss > self.budget.memory_bytes:
+            raise ResultContractError("project_verifier_memory_exceeded")
+        if count > self.process_slots:
+            raise ResultContractError("project_verifier_process_slots_exceeded")
+        if disk_bytes > self.budget.temp_bytes:
+            raise ResultContractError("project_verifier_temp_exceeded")
+
+
+def _copy_verifier_input(source, target, guard):
+    """复制块之间检查预算，准备失败不会进入 Worker 或发布阶段。"""
+    try:
+        with source.open("rb") as reader, target.open("wb") as writer:
+            while True:
+                guard.check(check_disk=False)
+                block = reader.read(1024 * 1024)
+                if not block:
+                    break
+                writer.write(block)
+            writer.flush()
+        guard.check()
+    except OSError as exc:
+        raise ResultContractError("project_verifier_copy_failed") from exc
 
 
 def _parse_outcome(

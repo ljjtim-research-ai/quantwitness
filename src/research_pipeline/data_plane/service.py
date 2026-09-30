@@ -23,10 +23,10 @@ from .execution_estimate import ExecutionEstimate
 from .factor_publication import require_factor_publication_unchanged
 
 
-DATA_PLANE_PROVIDER_VERSION = "duckdb-arrow-provider-v1"
-DATA_PLANE_COMPILER_VERSION = "duckdb-parameterized-sql-v1"
-MINUTE_DATA_PLANE_PROVIDER_VERSION = "duckdb-arrow-provider-minute-v2"
-MINUTE_DATA_PLANE_COMPILER_VERSION = "duckdb-parameterized-sql-minute-v2"
+DATA_PLANE_PROVIDER_VERSION = "duckdb-arrow-provider-v2"
+DATA_PLANE_COMPILER_VERSION = "duckdb-parameterized-sql-v2"
+MINUTE_DATA_PLANE_PROVIDER_VERSION = "duckdb-arrow-provider-minute-v3"
+MINUTE_DATA_PLANE_COMPILER_VERSION = "duckdb-parameterized-sql-minute-v3"
 
 
 def _implementation_versions(plan: AdmittedQueryPlan) -> tuple[str, str]:

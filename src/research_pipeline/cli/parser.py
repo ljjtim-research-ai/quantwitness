@@ -219,7 +219,6 @@ def _add_run(commands: argparse._SubParsersAction) -> None:
     _add_runtime_resource_arguments(run)
     run.add_argument("--root-seed", type=int, default=0)
     run.add_argument("--clock", required=True, help="显式带时区的固定 ISO 时钟")
-    run.add_argument("--acceptance-proof", help="可选 StudyReproductionProof；不参与平台准入")
     run.add_argument("--json", action="store_true")
 
 
@@ -495,7 +494,6 @@ def _add_workspace(commands: argparse._SubParsersAction) -> None:
     _add_runtime_resource_arguments(run)
     run.add_argument("--source-db", action="append", default=[])
     run.add_argument("--minute-data-root")
-    run.add_argument("--acceptance-proof")
     run.add_argument("--json", action="store_true")
     resume = subcommands.add_parser("resume", help="复用 execution 中已验证的 invocation/checkpoint")
     resume.add_argument("--workspace", required=True)

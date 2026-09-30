@@ -122,6 +122,11 @@ def operator_describe(operator_id: str) -> dict[str, object]:
 
 
 def artifact_describe(artifact_type: str) -> dict[str, object]:
+    from research_pipeline.platform.metric_contracts import (
+        build_mainline_metric_registry,
+        builtin_metric_output_path,
+    )
+
     manifest = _build_operator_manifest()
     availability_state, sealed = _discovery_availability()
     producers = []
@@ -149,6 +154,29 @@ def artifact_describe(artifact_type: str) -> dict[str, object]:
             for capability in definition.operator_spec.pit_capabilities
         }
     )
+    metric_registry = build_mainline_metric_registry()
+    metrics = [
+        definition
+        for definition in metric_registry.definitions
+        if definition.input_artifact_type == artifact_type
+    ]
+    result_schemas: dict[str, dict[str, object]] = {}
+    for definition in metrics:
+        schema = result_schemas.setdefault(definition.result_schema_id, {
+            "schema_id": definition.result_schema_id,
+            "path_prefix": builtin_metric_output_path(artifact_type),
+            "fields": [
+                {"name": name, "dtype": dtype}
+                for name, dtype in sorted(definition.output_schema.items())
+            ],
+            "metric_refs": [],
+        })
+        schema["metric_refs"].append(definition.metric_ref)
+    fields = [
+        {"schema_id": schema_id, **field}
+        for schema_id, schema in sorted(result_schemas.items())
+        for field in schema["fields"]
+    ]
     item = {
         "artifact_type": artifact_type,
         "artifact_version": artifact_type.rsplit(".", 1)[-1],
@@ -156,11 +184,13 @@ def artifact_describe(artifact_type: str) -> dict[str, object]:
         "consumers": consumers,
         "schema": {
             "field_source": (
+                "metric_definition.output_schema" if metrics else
                 "catalog.field-contract-v2"
                 if artifact_type == "data.columnar-bundle.v1"
                 else "producer_operator_output_contract"
             ),
             "unit_source": (
+                "metric_definition.unit" if metrics else
                 "catalog_field.unit"
                 if artifact_type == "data.columnar-bundle.v1"
                 else "producer_artifact_schema"
@@ -171,18 +201,33 @@ def artifact_describe(artifact_type: str) -> dict[str, object]:
                 else "producer_operator.pit_capabilities"
             ),
             "pit_capabilities": pit_capabilities,
-            "fields": [],
-            "fields_status": "resolve_from_declared_schema_source",
+            "fields": fields,
+            "fields_status": (
+                "metric_table_fields" if fields else "resolve_from_declared_schema_source"
+            ),
+            "result_tables": list(result_schemas.values()),
+            "dynamic_dataset_fields": (
+                {"source": "catalog.field-contract-v2", "required_input": "catalog_lock"}
+                if artifact_type == "data.columnar-bundle.v1" else None
+            ),
         },
+        "metrics": [
+            {**definition.payload(), "metric_ref": definition.metric_ref,
+             "definition_digest": definition.definition_digest}
+            for definition in metrics
+        ],
         "availability_state": availability_state,
         "sealed": sealed,
     }
     return _payload(
         "artifact.describe",
-        source_identity=manifest.manifest_hash,
+        source_identity=typed_canonical_hash({
+            "operator_manifest_hash": manifest.manifest_hash,
+            "metric_registry_digest": metric_registry.registry_digest,
+        }),
         items=(item,),
         next_commands=(
-            "python -m research_pipeline catalog field search <query> --format json",
+            "python -m research_pipeline catalog field search <query> --catalog-lock <持久Catalog-Lock目录> --format json",
         ),
     )
 
@@ -391,8 +436,8 @@ def catalog_search(
             f"未知 catalog search kind: {kind}",
             missing_requirements=("dataset_or_field",),
             next_commands=(
-                "python -m research_pipeline catalog dataset search <query> --format json",
-                "python -m research_pipeline catalog field search <query> --format json",
+                "python -m research_pipeline catalog dataset search <query> --catalog-lock <持久Catalog-Lock目录> --format json",
+                "python -m research_pipeline catalog field search <query> --catalog-lock <持久Catalog-Lock目录> --format json",
             ),
         )
     for item in blocked_items:

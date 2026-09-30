@@ -25,6 +25,8 @@ REQUIRED_DOCS = frozenset(
         "release.md",
         "research_package.md",
         "runtime.md",
+        "walk_forward_model.md",
+        "project_resource_budgets.md",
     }
 )
 

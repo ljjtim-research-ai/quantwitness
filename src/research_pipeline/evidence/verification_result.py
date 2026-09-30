@@ -11,6 +11,8 @@ from typing import Callable, Iterable, Mapping
 
 import pyarrow as pa
 
+from research_pipeline.platform.resource_budget import ResourceBudget
+
 from research_pipeline.platform import canonical_json, typed_canonical_hash
 from research_pipeline.platform.minute_operator_contracts import (
     MINUTE_TARGET_PAYLOAD_SCHEMA_ID,
@@ -840,6 +842,8 @@ def verify_result(
     output: str | Path | None = None,
     financial_oracle_budget: FinancialOracleBudget | None = None,
     verifier_bundle: str | Path | None = None,
+    project_verifier_budget: ResourceBudget | None = None,
+    project_verifier_process_slots: int = 2,
 ) -> VerifiedResultContext:
     """只从 ResultStore 独立重算门禁并生成 VerificationResult。"""
 
@@ -873,6 +877,13 @@ def verify_result(
             bundle_path=selected_bundle,
             snapshot=snapshot,
             expected_identity=verifier_identity,
+            budget=project_verifier_budget or ResourceBudget(
+                (financial_oracle_budget or FinancialOracleBudget()).memory_bytes,
+                1,
+                (financial_oracle_budget or FinancialOracleBudget()).temp_bytes,
+                300,
+            ),
+            process_slots=project_verifier_process_slots,
             scratch_root=(
                 None if financial_oracle_budget is None
                 else financial_oracle_budget.scratch_root

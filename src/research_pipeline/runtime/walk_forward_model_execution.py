@@ -15,6 +15,7 @@ import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 
 from research_pipeline.platform import canonical_json, typed_canonical_hash
+from research_pipeline.platform.canonical import typed_canonical_hash_streamed
 from research_pipeline.research.modeling import (
     CandidateFitRejected,
     ModelMainlineError,
@@ -80,6 +81,7 @@ def execute_model_split_artifact(
             "lineage_hash",
         ),
         predicate=(ds.field("label_end_time") < holdout_scan_time)
+        & (ds.field("available_time") <= holdout_scan_time)
         & (ds.field("horizon_sessions") == horizon_sessions),
         frame_budget=frame_budget,
         label="Walk-forward development labels",
@@ -141,7 +143,7 @@ def execute_model_split_artifact(
         if session <= last_development_session
     )
     split = build_walk_forward(
-        samples.loc[:, ["sample_id", "observation_time", "label_start_time", "label_end_time"]].rename(
+        samples.loc[:, ["sample_id", "observation_time", "decision_time", "label_start_time", "label_end_time", "label_available_time"]].rename(
             columns={"label_start_time": "label_start", "label_end_time": "label_end"}
         ),
         calendar=calendar,
@@ -273,6 +275,7 @@ def execute_model_preprocess_artifact(
             frame_budget.release_frame(evaluation_frame)
             preprocessor_rows.append({
                 "fold_id": fold.fold_id,
+                "fit_time": pd.to_datetime(validation_frame["decision_time"], utc=True).min().isoformat(),
                 "preprocessor_hash": artifact["preprocessor_hash"],
                 "fit_scope_certificate_hash": artifact["fit_scope_certificate_hash"],
                 "fit_binding_hash": artifact["fit_binding_hash"],
@@ -293,6 +296,7 @@ def execute_model_preprocess_artifact(
         status="model_preprocess_succeeded",
         extra={
             "split_manifest": metadata["split_manifest"],
+            "holdout_start": metadata["holdout_start"],
             "feature_columns": list(feature_columns),
             "semantics_hash": metadata.get("semantics_hash"),
             "root_seed": root_seed,
@@ -335,59 +339,62 @@ def execute_model_fit_artifact(
     fit_ledger = TrialLedger(manifest)
     candidate_ids = {item.parameter_hash: item.candidate_id for item in manifest.candidates}
     model_rows: list[dict[str, object]] = []
+    candidate_rows = {item.candidate_id: [] for item in manifest.candidates}
+    failures: dict[str, str] = {}
+    active_candidates = []
     for candidate in candidates:
         candidate_id = candidate_ids[typed_canonical_hash(candidate)]
-        fit_ledger.start(candidate_id)
         if candidate["model_id"] == "lightgbm" and not simple_gate:
-            fit_ledger.prune(candidate_id, reason_code="simple_model_gate_not_passed")
-            model_rows.append({
+            candidate_rows[candidate_id].append({
                 "candidate_id": candidate_id, "fold_id": "all", "status": "NOT_RUN",
                 "reason_code": "simple_model_gate_not_passed", "model_hash": None,
                 "model_json": None,
             })
-            continue
-        failed_reason: str | None = None
-        seen_folds: set[str] = set()
-        for fold_frame in _iter_table_frames(
-            preprocess_root,
-            "transformed_samples",
-            frame_budget=frame_budget,
+        else:
+            active_candidates.append((candidate_id, candidate))
+    seen_folds: set[str] = set()
+    if active_candidates:
+        for train in _iter_table_frames(
+            preprocess_root, "transformed_samples", frame_budget=frame_budget,
+            fold_role="train",
         ):
-            roles = set(fold_frame["fold_role"].astype(str))
-            if roles != {"train"}:
-                continue
-            fold_id = str(fold_frame["fold_id"].iloc[0])
+            fold_id = str(train["fold_id"].iloc[0])
             if fold_id in seen_folds:
                 raise ModelMainlineError(f"重复的训练 fold 分区: {fold_id}")
             seen_folds.add(fold_id)
-            train = fold_frame
             preprocessor = preprocessors.loc[preprocessors["fold_id"] == fold_id]
             if len(preprocessor) != 1:
                 raise ModelMainlineError("每个 fold 必须恰好有一个预处理工件")
             selected_columns = tuple(json.loads(preprocessor.iloc[0]["selected_columns_json"]))
-            try:
-                model = fit_model_candidate(
-                    train, candidate=candidate, target_kind=_text(parameters, "target_kind"),
-                    feature_columns=selected_columns, root_seed=root_seed,
-                    thread_count=thread_count, preflight_hash=str(preflight["preflight_hash"]),
-                )
-                model_rows.append({
-                    "candidate_id": candidate_id, "fold_id": fold_id, "status": "fitted",
-                    "reason_code": None, "model_hash": model["model_hash"],
-                    "model_json": canonical_json(model),
-                })
-            except CandidateFitRejected as exc:
-                reason_code = exc.reason_code
-                failed_reason = failed_reason or reason_code
-                model_rows.append({
-                    "candidate_id": candidate_id, "fold_id": fold_id, "status": "failed",
-                    "reason_code": reason_code,
-                    "model_hash": None, "model_json": None,
-                })
+            for candidate_id, candidate in active_candidates:
+                try:
+                    model = fit_model_candidate(
+                        train, candidate=candidate, target_kind=_text(parameters, "target_kind"),
+                        feature_columns=selected_columns, root_seed=root_seed,
+                        thread_count=thread_count, preflight_hash=str(preflight["preflight_hash"]),
+                    )
+                    candidate_rows[candidate_id].append({
+                        "candidate_id": candidate_id, "fold_id": fold_id, "status": "fitted",
+                        "reason_code": None, "model_hash": model["model_hash"],
+                        "model_json": canonical_json(model),
+                    })
+                except CandidateFitRejected as exc:
+                    failures.setdefault(candidate_id, exc.reason_code)
+                    candidate_rows[candidate_id].append({
+                        "candidate_id": candidate_id, "fold_id": fold_id, "status": "failed",
+                        "reason_code": exc.reason_code, "model_hash": None, "model_json": None,
+                    })
         if seen_folds != set(preprocessors["fold_id"].astype(str)):
             raise ModelMainlineError("训练 fold 分区集合与预处理工件不一致")
-        if failed_reason is not None:
-            fit_ledger.fail(candidate_id, reason_code=failed_reason)
+    # 拟合按 fold 共享输入；输出与账本仍按冻结候选顺序提交。
+    for candidate in candidates:
+        candidate_id = candidate_ids[typed_canonical_hash(candidate)]
+        fit_ledger.start(candidate_id)
+        model_rows.extend(candidate_rows[candidate_id])
+        if candidate_rows[candidate_id][0]["status"] == "NOT_RUN":
+            fit_ledger.prune(candidate_id, reason_code="simple_model_gate_not_passed")
+        elif candidate_id in failures:
+            fit_ledger.fail(candidate_id, reason_code=failures[candidate_id])
     return _write_artifact(
         output_root,
         {
@@ -427,48 +434,37 @@ def execute_model_predict_artifact(
     if model_metadata.get("preprocess_artifact_hash") != preprocess_metadata.get("artifact_hash"):
         raise ModelMainlineError("模型工件与预处理工件身份不一致")
     def prediction_partitions() -> Iterable[pd.DataFrame]:
-        for model_row in models.loc[
-            models["status"] == "fitted"
-        ].itertuples(index=False):
-            matched = False
-            for fold_frame in _iter_table_frames(
-                preprocess_root,
-                "transformed_samples",
-                frame_budget=frame_budget,
-            ):
-                fold_ids = set(fold_frame["fold_id"].astype(str))
-                roles = set(fold_frame["fold_role"].astype(str))
-                if fold_ids != {str(model_row.fold_id)} or roles != {"validation"}:
-                    continue
-                if matched:
-                    raise ModelMainlineError(
-                        f"重复的 validation fold 分区: {model_row.fold_id}"
-                    )
-                matched = True
-                model = json.loads(model_row.model_json)
-                predictions = predict_model(model, fold_frame)
+        fitted = models.loc[models["status"] == "fitted"]
+        seen_folds: set[str] = set()
+        for fold_frame in _iter_table_frames(
+            preprocess_root, "transformed_samples", frame_budget=frame_budget,
+            fold_role="validation",
+        ):
+            fold_id = str(fold_frame["fold_id"].iloc[0])
+            if fold_id in seen_folds:
+                raise ModelMainlineError(f"重复的 validation fold 分区: {fold_id}")
+            seen_folds.add(fold_id)
+            for model_row in fitted.loc[fitted["fold_id"].astype(str) == fold_id].itertuples(index=False):
+                predictions = predict_model(json.loads(model_row.model_json), fold_frame)
                 output = _prediction_frame(
-                    fold_frame,
-                    predictions,
-                    str(model_row.candidate_id),
-                    str(model_row.fold_id),
-                    "validation",
-                    str(model_row.model_hash),
+                    fold_frame, predictions, str(model_row.candidate_id),
+                    fold_id, "validation", str(model_row.model_hash),
                 )
-                frame_budget.reserve_frame(
-                    output,
-                    label=f"{model_row.candidate_id}/{model_row.fold_id} validation 预测",
-                )
+                frame_budget.reserve_frame(output, label=f"{model_row.candidate_id}/{fold_id} validation 预测")
                 yield output
                 frame_budget.release_frame(output)
-            if not matched:
-                raise ModelMainlineError(
-                    f"模型缺少 validation fold 分区: {model_row.fold_id}"
-                )
+        if not set(fitted["fold_id"].astype(str)) <= seen_folds:
+            raise ModelMainlineError("模型缺少 validation fold 分区")
 
     return _write_partitioned_artifact(
         output_root,
         partitioned_tables={"validation_predictions": prediction_partitions()},
+        partition_order={
+            "validation_predictions": {
+                (str(row.candidate_id), str(row.fold_id)): index
+                for index, row in enumerate(models.loc[models["status"] == "fitted"].itertuples(index=False))
+            },
+        },
         tables=lambda: {},
         status="model_validation_prediction_succeeded",
         extra={
@@ -529,6 +525,8 @@ def execute_model_fold_metrics_artifact(
                 objective=objective, target_kind=target_kind,
             ),
             "sample_count": len(frame),
+            "label_end_time": pd.to_datetime(frame["label_end_time"], utc=True).max().isoformat(),
+            "label_available_time": pd.to_datetime(frame["label_available_time"], utc=True).max().isoformat(),
         })
     metrics = pd.DataFrame(metric_rows)
     all_aggregate = metrics.groupby("candidate_id", as_index=False).agg(
@@ -590,105 +588,131 @@ def execute_model_selection_artifact(
         candidate_metrics, objective=objective, direction=_text(parameters, "direction"),
     )
     winner = str(selected["candidate_id"])
-    winner_models = models.loc[
-        (models["candidate_id"] == winner) & (models["status"] == "fitted")
-    ]
+    fold_metrics, _ = _load_table(metrics_root, "fold_metrics", frame_budget=frame_budget)
+    preprocessors, _ = _load_table(preprocess_root, "preprocessors", frame_budget=frame_budget)
+    fit_times = dict(zip(preprocessors["fold_id"].astype(str), pd.to_datetime(preprocessors["fit_time"], utc=True)))
+    metric_available = pd.to_datetime(fold_metrics["label_available_time"], utc=True)
+    metric_end = pd.to_datetime(fold_metrics["label_end_time"], utc=True)
+    final_selection_time = metric_available.max()
+    if final_selection_time > pd.Timestamp(preprocess_metadata["holdout_start"]):
+        raise ModelMainlineError("最终候选选择晚于 locked holdout 起点")
+    test_metric_rows: list[dict[str, object]] = []
+    fold_selection_rows: list[dict[str, object]] = []
+    fold_trial_rows: list[dict[str, object]] = []
+    final_ledger = _replay_ledger(manifest, models, candidate_metrics, objective)
+    selected_parameters = next(dict(item.parameters) for item in manifest.candidates if item.candidate_id == winner)
+    extra = {
+        "split_manifest_hash": preprocess_metadata["split_manifest"]["manifest_hash"],
+        "semantics_hash": preprocess_metadata.get("semantics_hash"),
+        "final_fit_contract": {
+            "preprocessing": model_metadata["preprocessing"],
+            "feature_selection_k": model_metadata["feature_selection_k"],
+            "target_kind": model_metadata["target_kind"],
+            "objective": model_metadata["objective"],
+            "research_identity_hash": model_metadata["research_identity_hash"],
+            "thread_count": int(model_metadata["preflight"]["thread_count"]),
+            "root_seed": model_metadata["root_seed"],
+        },
+    }
 
     def test_prediction_partitions() -> Iterable[pd.DataFrame]:
-        for model_row in winner_models.itertuples(index=False):
-            matched = False
-            for fold_frame in _iter_table_frames(
-                preprocess_root,
-                "transformed_samples",
-                frame_budget=frame_budget,
-            ):
-                fold_ids = set(fold_frame["fold_id"].astype(str))
-                roles = set(fold_frame["fold_role"].astype(str))
-                if fold_ids != {str(model_row.fold_id)} or roles != {"test"}:
-                    continue
-                if matched:
-                    raise ModelMainlineError(
-                        f"重复的 test fold 分区: {model_row.fold_id}"
-                    )
-                matched = True
-                predictions = predict_model(
-                    json.loads(model_row.model_json),
-                    fold_frame,
+        seen_folds: set[str] = set()
+        for fold_frame in _iter_table_frames(
+            preprocess_root, "transformed_samples", frame_budget=frame_budget,
+            fold_role="test",
+        ):
+            fold_id = str(fold_frame["fold_id"].iloc[0])
+            if fold_id in seen_folds:
+                raise ModelMainlineError(f"重复的 test fold 分区: {fold_id}")
+            seen_folds.add(fold_id)
+            selection_time = pd.to_datetime(fold_frame["decision_time"], utc=True).min()
+            # 全个 validation 分数可见后才能参与选择；未来 fold 的成败也不可回填。
+            visible_metrics = fold_metrics.loc[
+                (metric_available <= selection_time) & (metric_end < selection_time)
+            ]
+            aggregate = visible_metrics.groupby("candidate_id", as_index=False).agg(
+                stage=("stage", "first"), **{objective: (objective, "mean")},
+            )
+            visible_models = models.loc[
+                models["fold_id"].astype(str).map(
+                    lambda value: value == "all" or fit_times[value] <= selection_time
                 )
-                output = _prediction_frame(
-                    fold_frame,
-                    predictions,
-                    winner,
-                    str(model_row.fold_id),
-                    "test",
-                    str(model_row.model_hash),
-                )
-                frame_budget.reserve_frame(
-                    output,
-                    label=f"{winner}/{model_row.fold_id} test 预测",
-                )
-                yield output
-                frame_budget.release_frame(output)
-            if not matched:
-                raise ModelMainlineError(
-                    f"选中模型缺少 test fold 分区: {model_row.fold_id}"
-                )
+            ]
+            ledger = _replay_ledger(manifest, visible_models, aggregate, objective)
+            completed_ids = {key for key, state in ledger.states.items() if state == "completed"}
+            current_models = models.loc[
+                (models["fold_id"].astype(str) == fold_id) & (models["status"] == "fitted")
+            ]
+            eligible_ids = completed_ids & set(current_models["candidate_id"])
+            local_selected = select_by_validation(
+                aggregate.loc[aggregate["candidate_id"].isin(eligible_ids)],
+                objective=objective, direction=manifest.direction,
+            )
+            local_winner = str(local_selected["candidate_id"])
+            model_rows = current_models.loc[current_models["candidate_id"] == local_winner]
+            if len(model_rows) != 1:
+                raise ModelMainlineError("每个 test fold 必须绑定唯一已拟合模型")
+            model_row = model_rows.iloc[0]
+            predictions = predict_model(json.loads(model_row["model_json"]), fold_frame)
+            output = _prediction_frame(
+                fold_frame, predictions, local_winner, fold_id, "test", str(model_row["model_hash"]),
+            )
+            metric = score_model(
+                output["actual"].to_numpy(float), output["prediction"].to_numpy(float),
+                objective=objective, target_kind=_text(parameters, "target_kind"),
+            )
+            test_metric_rows.append({
+                "candidate_id": local_winner, "fold_id": fold_id, "stage": "test",
+                objective: metric, "sample_count": len(output),
+            })
+            frozen_ledger_hash = ledger.ledger_hash
+            ledger.record_final_evaluation(local_winner, stage="test", metric_value=metric)
+            fold_selection_rows.append({
+                "fold_id": fold_id, "selected_candidate_id": local_winner,
+                "selection_time": selection_time.isoformat(),
+                "validation_metric": float(local_selected[objective]),
+                "validation_fold_count": int((visible_metrics["candidate_id"] == local_winner).sum()),
+                "selection_ledger_hash": frozen_ledger_hash,
+                "trial_ledger_hash": ledger.ledger_hash,
+            })
+            fold_trial_rows.extend({"fold_id": fold_id, **event.__dict__} for event in ledger.events)
+            frame_budget.reserve_frame(output, label=f"{local_winner}/{fold_id} test 预测")
+            yield output
+            frame_budget.release_frame(output)
+        if seen_folds != set(preprocessors["fold_id"].astype(str)):
+            raise ModelMainlineError("test fold 分区集合与预处理工件不一致")
 
-    test_metric_rows = []
-    for prediction_frame in test_prediction_partitions():
-        fold_id = str(prediction_frame["fold_id"].iloc[0])
-        test_metric_rows.append({
-            "candidate_id": winner, "fold_id": fold_id, "stage": "test",
-            objective: score_model(
-                prediction_frame["actual"].to_numpy(float),
-                prediction_frame["prediction"].to_numpy(float),
-                objective=objective,
-                target_kind=_text(parameters, "target_kind"),
-            ),
-            "sample_count": len(prediction_frame),
-        })
-    if not test_metric_rows:
-        raise ModelMainlineError("选中候选没有可用 test 预测")
-    aggregate = candidate_metrics
-    ledger = _replay_ledger(manifest, models, aggregate, objective)
-    mean_test = float(pd.DataFrame(test_metric_rows)[objective].mean())
-    ledger.record_final_evaluation(winner, stage="test", metric_value=mean_test)
-    selected_parameters = next(dict(item.parameters) for item in manifest.candidates if item.candidate_id == winner)
-    selection = {
-        "selected_candidate_id": winner,
-        "selected_parameters": selected_parameters,
-        "validation_metric": float(selected[objective]),
-        "test_metric": mean_test,
-        "objective": objective,
-        "direction": _text(parameters, "direction"),
-        "search_manifest_hash": manifest.manifest_hash,
-        "trial_ledger_hash": ledger.ledger_hash,
-    }
-    selection["selection_hash"] = typed_canonical_hash(selection)
-    final_fit_contract = {
-        "preprocessing": model_metadata["preprocessing"],
-        "feature_selection_k": model_metadata["feature_selection_k"],
-        "target_kind": model_metadata["target_kind"],
-        "objective": model_metadata["objective"],
-        "research_identity_hash": model_metadata["research_identity_hash"],
-        "thread_count": int(model_metadata["preflight"]["thread_count"]),
-        "root_seed": model_metadata["root_seed"],
-    }
+    def selection_tables() -> Mapping[str, pd.DataFrame]:
+        if not test_metric_rows:
+            raise ModelMainlineError("没有可用的逐时点 test 预测")
+        selection = {
+            "selected_candidate_id": winner,
+            "selected_parameters": selected_parameters,
+            "validation_metric": float(selected[objective]),
+            "test_metric": float(pd.DataFrame(test_metric_rows)[objective].mean()),
+            "test_metric_scope": "walk_forward_frozen_candidates",
+            "selection_scope": "subsequent_locked_holdout",
+            "selection_time": final_selection_time.isoformat(),
+            "objective": objective, "direction": manifest.direction,
+            "search_manifest_hash": manifest.manifest_hash,
+            "trial_ledger_hash": final_ledger.ledger_hash,
+        }
+        selection["selection_hash"] = typed_canonical_hash(selection)
+        extra["selection"] = selection
+        return {
+            "selection": pd.DataFrame([{**selection, "selected_parameters_json": canonical_json(selected_parameters)}]),
+            "fold_selections": pd.DataFrame(fold_selection_rows),
+            "test_metrics": pd.DataFrame(test_metric_rows),
+            "trial_events": pd.DataFrame([event.__dict__ for event in final_ledger.events]),
+            "fold_trial_events": pd.DataFrame(fold_trial_rows),
+        }
+
     return _write_partitioned_artifact(
         output_root,
         partitioned_tables={"test_predictions": test_prediction_partitions()},
-        tables=lambda: {
-            "selection": pd.DataFrame([{**selection, "selected_parameters_json": canonical_json(selected_parameters)}]),
-            "test_metrics": pd.DataFrame(test_metric_rows),
-            "trial_events": pd.DataFrame([event.__dict__ for event in ledger.events]),
-        },
+        tables=selection_tables,
         status="model_selection_succeeded",
-        extra={
-            "selection": selection,
-            "split_manifest_hash": preprocess_metadata["split_manifest"]["manifest_hash"],
-            "semantics_hash": preprocess_metadata.get("semantics_hash"),
-            "final_fit_contract": final_fit_contract,
-        },
+        extra=extra,
     )
 
 
@@ -798,7 +822,7 @@ def execute_model_locked_holdout_artifact(
         holdout_loader=load_holdout_samples,
         development_ids=tuple(development_samples["sample_id"]),
         holdout_ids=tuple(holdout_index["sample_id"]),
-        holdout_start=pd.Timestamp(split_metadata["holdout_start"]).date().isoformat(),
+        holdout_start=str(split_metadata["holdout_start"]),
         holdout_end=str(split_metadata["holdout_end"]),
         feature_columns=tuple(split_metadata["feature_columns"]),
         selected_candidate=selected_parameters,
@@ -955,7 +979,7 @@ def _write_artifact(
         directory.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(directory / "part-00000.parquet", index=False)
         row_counts[name] = len(frame)
-        table_hashes[name] = typed_canonical_hash(_records(frame))
+        table_hashes[name] = typed_canonical_hash_streamed(_records(frame))
     payload = {
         "contract_version": WALK_FORWARD_MODEL_VERSION, "status": status,
         "row_counts": row_counts, "table_hashes": table_hashes, **dict(extra),
@@ -972,21 +996,40 @@ def _write_partitioned_artifact(
     tables: Callable[[], Mapping[str, pd.DataFrame]],
     status: str,
     extra: Mapping[str, object],
+    partition_order: Mapping[str, Mapping[tuple[str, str], int]] | None = None,
 ) -> dict[str, object]:
     root = Path(output_root)
     root.mkdir(parents=True, exist_ok=True)
     table_hashes: dict[str, str] = {}
     table_hash_modes: dict[str, str] = {}
+    table_partitions: dict[str, list[dict[str, object]]] = {}
     row_counts: dict[str, int] = {}
     for name, frames in sorted(partitioned_tables.items()):
         directory = root / name
         directory.mkdir(parents=True, exist_ok=True)
         partition_hashes: list[str] = []
+        descriptors: list[dict[str, object]] = []
         row_count = 0
         for index, frame in enumerate(frames):
+            if partition_order is not None and name in partition_order:
+                index = partition_order[name][(str(frame["candidate_id"].iloc[0]), str(frame["fold_id"].iloc[0]))]
             frame.to_parquet(directory / f"part-{index:05d}.parquet", index=False)
             row_count += len(frame)
-            partition_hashes.append(typed_canonical_hash(_records(frame)))
+            partition_hashes.append(typed_canonical_hash_streamed(_records(frame)))
+            descriptor = {
+                "path": f"part-{index:05d}.parquet", "row_count": len(frame),
+                "records_hash": partition_hashes[-1],
+            }
+            for field in ("fold_id", "fold_role"):
+                if field in frame:
+                    values = frame[field].unique()
+                    if len(values) != 1:
+                        raise ModelMainlineError(f"模型分区必须只包含一个 {field}")
+                    descriptor[field] = str(values[0])
+            descriptors.append(descriptor)
+        descriptors.sort(key=lambda item: item["path"])
+        table_partitions[name] = descriptors
+        partition_hashes = [item["records_hash"] for item in descriptors]
         if not partition_hashes:
             raise ModelMainlineError(f"模型 Runtime 分区表为空: {name}")
         row_counts[name] = row_count
@@ -997,13 +1040,14 @@ def _write_partitioned_artifact(
         directory.mkdir(parents=True, exist_ok=True)
         frame.to_parquet(directory / "part-00000.parquet", index=False)
         row_counts[name] = len(frame)
-        table_hashes[name] = typed_canonical_hash(_records(frame))
+        table_hashes[name] = typed_canonical_hash_streamed(_records(frame))
     payload = {
         "contract_version": WALK_FORWARD_MODEL_VERSION,
         "status": status,
         "row_counts": row_counts,
         "table_hashes": table_hashes,
         "table_hash_modes": table_hash_modes,
+        "table_partitions": table_partitions,
         **dict(extra),
     }
     payload["artifact_hash"] = typed_canonical_hash(payload)
@@ -1014,13 +1058,27 @@ def _write_partitioned_artifact(
     return payload
 
 
-def _read_artifact_metadata(root: str | Path) -> dict[str, object]:
+def _read_artifact_metadata(
+    root: str | Path, *, require_model_contract: bool = True,
+) -> dict[str, object]:
     try:
-        return json.loads(
+        metadata = json.loads(
             (Path(root) / "artifact-metadata.json").read_text(encoding="utf-8")
         )
     except (OSError, json.JSONDecodeError) as exc:
         raise ModelMainlineError("模型 Runtime 输入元数据不可读") from exc
+    if require_model_contract and metadata.get("contract_version") != WALK_FORWARD_MODEL_VERSION:
+        raise ModelMainlineError("模型 Runtime 输入合同版本不受支持，请重新运行上游节点")
+    for name, mode in metadata.get("table_hash_modes", {}).items():
+        if mode != "partition-records-v1":
+            continue
+        descriptors = metadata.get("table_partitions", {}).get(name)
+        if not isinstance(descriptors, list) or not descriptors or any(
+            not isinstance(item, dict) or not {"path", "records_hash", "row_count"} <= set(item)
+            for item in descriptors
+        ):
+            raise ModelMainlineError(f"模型 Runtime 输入缺少分区描述: {name}")
+    return metadata
 
 
 def _table_paths(root: str | Path, name: str) -> tuple[Path, ...]:
@@ -1037,7 +1095,9 @@ def _load_table(
     frame_budget: PandasFrameBudget,
 ) -> tuple[pd.DataFrame, Mapping[str, object]]:
     paths = _table_paths(root, name)
-    metadata = _read_artifact_metadata(root)
+    metadata = _read_artifact_metadata(
+        root, require_model_contract=name not in {"features", "labels"},
+    )
     try:
         frame_budget.require_parquet_materialization(
             paths,
@@ -1051,7 +1111,7 @@ def _load_table(
                 )
                 for path in paths
             ]
-            partition_hashes = [typed_canonical_hash(_records(frame)) for frame in frames]
+            partition_hashes = [typed_canonical_hash_streamed(_records(frame)) for frame in frames]
             frame = frame_budget.concat_reserved_frames(frames, label=f"模型表 {name}")
             actual_hash = typed_canonical_hash(partition_hashes)
         else:
@@ -1063,7 +1123,7 @@ def _load_table(
                 ),
                 label=f"模型表 {name}",
             )
-            actual_hash = typed_canonical_hash(_records(frame))
+            actual_hash = typed_canonical_hash_streamed(_records(frame))
     except (OSError, PandasFrameBudgetError) as exc:
         raise ModelMainlineError(str(exc)) from exc
     if actual_hash != metadata.get("table_hashes", {}).get(name):
@@ -1082,7 +1142,7 @@ def _load_label_slice(
     """只物化显式列和满足条件的 Label；完整表校验留给 opened 后的 loader。"""
 
     paths = _table_paths(root, "labels")
-    metadata = _read_artifact_metadata(root)
+    metadata = _read_artifact_metadata(root, require_model_contract=False)
     try:
         dataset = ds.dataset([str(path) for path in paths], format="parquet")
         frame = frame_budget.collect_arrow_batches(
@@ -1142,34 +1202,45 @@ def _iter_table_frames(
     name: str,
     *,
     frame_budget: PandasFrameBudget,
+    fold_role: str | None = None,
 ) -> Iterable[pd.DataFrame]:
     paths = _table_paths(root, name)
     metadata = _read_artifact_metadata(root)
     mode = metadata.get("table_hash_modes", {}).get(name)
     if mode != "partition-records-v1":
         frame, _ = _load_table(root, name, frame_budget=frame_budget)
-        yield frame
+        if fold_role is None or set(frame["fold_role"].astype(str)) == {fold_role}:
+            yield frame
         frame_budget.release_frame(frame)
         return
-    partition_hashes: list[str] = []
-    row_count = 0
+    descriptors = metadata["table_partitions"][name]
+    if [item["path"] for item in descriptors] != [path.name for path in paths]:
+        raise ModelMainlineError(f"模型 Runtime 输入分区发生漂移: {name}")
+    if typed_canonical_hash([item["records_hash"] for item in descriptors]) != metadata["table_hashes"][name]:
+        raise ModelMainlineError(f"模型 Runtime 输入表发生漂移: {name}")
+    if sum(item["row_count"] for item in descriptors) != metadata["row_counts"][name]:
+        raise ModelMainlineError(f"模型 Runtime 输入表行数发生漂移: {name}")
     try:
-        for path in paths:
+        for path, descriptor in zip(paths, descriptors):
+            if fold_role is not None and descriptor.get("fold_role") != fold_role:
+                continue
             frame = frame_budget.collect_arrow_batches(
                 pq.ParquetFile(path).iter_batches(batch_size=65_536),
                 label=f"模型分区 {name}/{path.name}",
             )
-            partition_hashes.append(typed_canonical_hash(_records(frame)))
-            row_count += len(frame)
-            yield frame
-            frame_budget.release_frame(frame)
+            try:
+                if typed_canonical_hash_streamed(_records(frame)) != descriptor["records_hash"]:
+                    raise ModelMainlineError(f"模型 Runtime 输入表发生漂移: {name}/{path.name}")
+                if len(frame) != descriptor["row_count"]:
+                    raise ModelMainlineError(f"模型 Runtime 输入表行数发生漂移: {name}/{path.name}")
+                for field in ("fold_id", "fold_role"):
+                    if field in descriptor and set(frame[field].astype(str)) != {descriptor[field]}:
+                        raise ModelMainlineError(f"模型 Runtime 分区 {field} 发生漂移")
+                yield frame
+            finally:
+                frame_budget.release_frame(frame)
     except (OSError, PandasFrameBudgetError) as exc:
         raise ModelMainlineError(str(exc)) from exc
-    if typed_canonical_hash(partition_hashes) != metadata.get("table_hashes", {}).get(name):
-        raise ModelMainlineError(f"模型 Runtime 输入表发生漂移: {name}")
-    declared_rows = metadata.get("row_counts", {}).get(name)
-    if declared_rows is not None and row_count != declared_rows:
-        raise ModelMainlineError(f"模型 Runtime 输入表行数发生漂移: {name}")
 
 
 def _preflight_table(root: str | Path, name: str) -> dict[str, object]:
@@ -1226,21 +1297,28 @@ def _prediction_frame(
         "label_end_time": frame["label_end_time"].map(
             lambda value: pd.Timestamp(value).isoformat()
         ).to_numpy(),
+        "label_available_time": frame["label_available_time"].map(
+            lambda value: pd.Timestamp(value).isoformat()
+        ).to_numpy(),
     })
 
 
-def _records(frame: pd.DataFrame) -> list[dict[str, object]]:
-    clean = frame.astype(object).where(pd.notna(frame), None)
-    records = clean.to_dict("records")
-    for row in records:
-        for key, value in tuple(row.items()):
-            if isinstance(value, pd.Timestamp) or hasattr(value, "isoformat"):
-                row[key] = value.isoformat()
-            elif isinstance(value, np.ndarray):
-                row[key] = value.tolist()
+def _records(frame: pd.DataFrame) -> Iterable[dict[str, object]]:
+    """逐行保持原 records 编码，不复制整表对象树。"""
+    columns = list(frame.columns)
+    for values in frame.itertuples(index=False, name=None):
+        row = {}
+        for key, value in zip(columns, values):
+            if isinstance(value, np.ndarray):
+                value = value.tolist()
+            elif value is None or (not isinstance(value, (list, tuple, dict)) and pd.isna(value)):
+                value = None
+            elif isinstance(value, pd.Timestamp) or hasattr(value, "isoformat"):
+                value = value.isoformat()
             elif isinstance(value, np.generic):
-                row[key] = value.item()
-    return records
+                value = value.item()
+            row[key] = value
+        yield row
 
 
 def _candidates(parameters: Mapping[str, object]) -> list[dict[str, object]]:

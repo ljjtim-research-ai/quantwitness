@@ -12,6 +12,8 @@
 - [列式数据平面](data_plane.md)
 - [ResearchPackage](research_package.md)
 - [Runtime 与恢复](runtime.md)
+- [滚动模型与样本外选择](walk_forward_model.md)
+- [项目执行与独立复核资源预算](project_resource_budgets.md)
 - [Result 与 VerificationResult](evidence.md)
 - [命令行](cli.md)
 - [运维](operations.md)

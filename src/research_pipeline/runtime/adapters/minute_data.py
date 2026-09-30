@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from research_pipeline.platform.metric_contracts import builtin_metric_output_path
+
 import shutil
 from typing import Mapping
 from research_pipeline.platform import canonical_json, typed_canonical_hash
@@ -11,7 +13,7 @@ from research_pipeline.domain import load_session_policy_bundle
 from research_pipeline.platform.metric_contracts import build_mainline_metric_registry
 from ..operator_graph_evidence import build_minute_observation_validity_facts
 from ..operator_runtime import OperatorRuntimeContext, RuntimeCompletionMetadata, RuntimeNodeOutputs, RuntimeNodeValue
-from .common import _capture, _environment, _external_result, _input_admitted_plans, _input_external_payload, _input_merged_data_bundle, _json_ready, _parameters
+from .common import _environment, _external_result, _input_admitted_plans, _input_external_payload, _input_merged_data_bundle, _json_ready, _parameters
 from .minute_io import _minute_root, _minute_scan_plan, _session_instruments
 
 
@@ -41,7 +43,6 @@ def execute_data_minute_scan_v1(context: OperatorRuntimeContext) -> RuntimeNodeV
         "source_snapshot_hash": dataset.reference_id,
         "data_bundle": data_bundle,
     }
-    _capture(context, "minute_data", payload)
     return _external_result(context, payload)
 
 
@@ -283,7 +284,7 @@ def execute_research_observation_minute_bars_v1(
     return _external_result(
         context,
         payload,
-        parquet_rows={"observation": metric_rows},
+        parquet_rows={builtin_metric_output_path("research.minute-observation.v1"): metric_rows},
         completion_metadata=RuntimeCompletionMetadata(
             artifact_hashes={"observation": typed_canonical_hash(payload)},
             counts={"observed_row_count": row_count},

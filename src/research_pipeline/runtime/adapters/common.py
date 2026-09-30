@@ -7,7 +7,7 @@ from datetime import date, datetime
 import json
 from pathlib import Path
 import shutil
-from typing import Mapping, MutableMapping
+from typing import Mapping
 from zoneinfo import ZoneInfo
 from research_pipeline.platform import canonical_json
 from research_pipeline.data_plane.research_data_bundle import merge_research_data_bundles
@@ -35,8 +35,6 @@ class ResearchRunEnvironment:
     resource_timeout_seconds: float | None
     strategy_spec_hashes: Mapping[str, str]
     operator_graph_strategy_hash: str
-    study_reproduction_proof: object | None
-    captured: MutableMapping[str, Mapping[str, object]]
 
 
 def _environment(context: OperatorRuntimeContext) -> ResearchRunEnvironment:
@@ -124,14 +122,6 @@ def _strategy_spec_hash(context: OperatorRuntimeContext, strategy_id: str) -> st
     if not isinstance(value, str):
         raise ValueError(f"Runtime 缺少已准入 StrategySpec: {strategy_id}")
     return value
-
-
-def _capture(
-    context: OperatorRuntimeContext,
-    name: str,
-    payload: Mapping[str, object],
-) -> None:
-    _environment(context).captured[name] = payload
 
 
 def _external_result(
