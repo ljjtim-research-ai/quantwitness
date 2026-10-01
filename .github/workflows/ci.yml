@@ -47,6 +47,7 @@ jobs:
           tests/test_framework_intrusion_gate.py
           tests/test_public_operator_governance.py
           tests/test_public_release_gates.py
+          tests/test_version_release_plan.py
           tests/test_release_envelope.py
           tests/test_release_gate_runner.py
           tests/test_capability_release_evidence.py
@@ -78,3 +79,36 @@ jobs:
           cd "$RUNNER_TEMP"
           PYTHONPATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/quantwitness-wheel-env/bin/python" -c 'import importlib.metadata as m, pathlib, research_pipeline, sys; assert pathlib.Path(research_pipeline.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()); assert m.version("pyarrow") == "21.0.0"'
           PYTHONPATH="$GITHUB_WORKSPACE" "$RUNNER_TEMP/quantwitness-wheel-env/bin/python" -m pytest -o pythonpath= -q "$GITHUB_WORKSPACE/tests/test_public_examples.py" "$GITHUB_WORKSPACE/tests/test_workspace.py" "$GITHUB_WORKSPACE/tests/test_workspace_flow.py" "$GITHUB_WORKSPACE/tests/test_package_diagnostics.py" "$GITHUB_WORKSPACE/tests/test_cli_summary.py" "$GITHUB_WORKSPACE/tests/test_process_budget_advice.py" "$GITHUB_WORKSPACE/tests/test_verifier_resource_diagnostics.py" "$GITHUB_WORKSPACE/tests/test_dsr_formula.py" "$GITHUB_WORKSPACE/tests/test_cli_failure_details.py" "$GITHUB_WORKSPACE/tests/test_dependency_distribution_identity.py" "$GITHUB_WORKSPACE/tests/test_dependency_identity_recovery.py"
+
+  release-request:
+    name: Record version change after CI
+    needs: public-boundary
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - name: Record version release request
+        env:
+          PREVIOUS_SHA: ${{ github.event.before }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: >-
+          python tools/plan_version_release.py
+          --previous-commit "$PREVIOUS_SHA"
+          --candidate-commit "$CANDIDATE_SHA"
+          --output "$RUNNER_TEMP/version-release-request.json"
+      - name: Upload version release request
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: version-release-request-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/version-release-request.json
+          if-no-files-found: error
+          retention-days: 7

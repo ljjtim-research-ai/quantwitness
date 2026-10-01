@@ -1,21 +1,78 @@
 name: publish
 
 "on":
-  release:
-    types: [published]
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-main
   cancel-in-progress: false
 
 jobs:
+  plan:
+    name: Check version release request
+    if: >-
+      ${{ github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_repository.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      publish: ${{ steps.plan.outputs.publish }}
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      candidate_commit: ${{ steps.plan.outputs.candidate_commit }}
+    steps:
+      - name: Checkout tested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.13"
+      - name: Download CI version request
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: version-release-request-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/release-request
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - name: Check version change
+        id: plan
+        env:
+          CANDIDATE_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: >-
+          python tools/plan_version_release.py
+          --request "$RUNNER_TEMP/release-request/version-release-request.json"
+          --candidate-commit "$CANDIDATE_SHA"
+          --github-output "$GITHUB_OUTPUT"
+          --notes-output "$RUNNER_TEMP/quantwitness-release-notes.md"
+      - name: Upload release notes
+        if: ${{ steps.plan.outputs.publish == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/quantwitness-release-notes.md
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     name: Build and verify release
-    if: ${{ !github.event.release.prerelease }}
+    needs: plan
+    if: ${{ needs.plan.outputs.publish == 'true' }}
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+      CANDIDATE_SHA: ${{ needs.plan.outputs.candidate_commit }}
     outputs:
       wheel_name: ${{ steps.release.outputs.wheel_name }}
       sdist_name: ${{ steps.release.outputs.sdist_name }}
@@ -24,7 +81,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ needs.plan.outputs.candidate_commit }}
           fetch-depth: 0
           persist-credentials: false
       - name: Set up Python
@@ -45,11 +102,11 @@ jobs:
           import tomllib
 
           version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
-          tag = os.environ["GITHUB_REF_NAME"]
+          tag = os.environ["RELEASE_TAG"]
           if tag != f"v{version}":
               raise SystemExit(f"Tag {tag!r} 与项目版本 {version!r} 不一致")
           PY
-          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
           git fetch --no-tags origin main
           git merge-base --is-ancestor HEAD origin/main
       - name: Check public source inventory
@@ -60,6 +117,7 @@ jobs:
           tests/test_current_documentation.py
           tests/test_public_source_inventory.py
           tests/test_public_release_gates.py
+          tests/test_version_release_plan.py
           tests/test_release_envelope.py
           tests/test_release_gate_runner.py
           tests/test_capability_release_evidence.py
@@ -96,7 +154,7 @@ jobs:
           "$python_bin" -m pip install "${{ steps.release.outputs.wheel }}[test]" "pyarrow==21.0.0"
           "$python_bin" -m pip check
           cd "$RUNNER_TEMP"
-          "$python_bin" -c 'import importlib.metadata as m, research_pipeline; assert m.version("quantwitness") == "${{ github.ref_name }}"[1:]'
+          "$python_bin" -c 'import importlib.metadata as m, os, research_pipeline; assert m.version("quantwitness") == os.environ["RELEASE_TAG"][1:]'
           "$RUNNER_TEMP/quantwitness-release-env/bin/quantwitness" --help
       - name: Upload Python distributions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -137,8 +195,8 @@ jobs:
           packages-dir: dist
 
   finalize-release:
-    name: Verify PyPI installation and attach release assets
-    needs: [build, publish-pypi]
+    name: Verify PyPI installation and create GitHub Release
+    needs: [plan, build, publish-pypi]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -150,7 +208,7 @@ jobs:
       - name: Verify clean PyPI installation
         shell: bash
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
         run: |
           python -m venv "$RUNNER_TEMP/quantwitness-pypi-env"
           python_bin="$RUNNER_TEMP/quantwitness-pypi-env/bin/python"
@@ -178,13 +236,24 @@ jobs:
         with:
           name: source-archive
           path: dist
-      - name: Attach verified release assets
+      - name: Download release notes
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: release-notes
+          path: release-metadata
+      - name: Create verified GitHub Release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          CANDIDATE_SHA: ${{ needs.plan.outputs.candidate_commit }}
           WHEEL_PATH: dist/${{ needs.build.outputs.wheel_name }}
           SDIST_PATH: dist/${{ needs.build.outputs.sdist_name }}
           SOURCE_ARCHIVE_PATH: dist/${{ needs.build.outputs.source_archive_name }}
-        run: gh release upload "$RELEASE_TAG" "$WHEEL_PATH" "$SDIST_PATH" "$SOURCE_ARCHIVE_PATH"
+        run: >-
+          gh release create "$RELEASE_TAG"
+          --target "$CANDIDATE_SHA"
+          --title "QuantWitness ${RELEASE_TAG#v}"
+          --notes-file release-metadata/quantwitness-release-notes.md
+          "$WHEEL_PATH" "$SDIST_PATH" "$SOURCE_ARCHIVE_PATH"

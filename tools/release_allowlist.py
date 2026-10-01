@@ -111,6 +111,7 @@ PUBLIC_TEST_FILES = (
     "tests/test_public_examples.py",
     "tests/test_public_operator_governance.py",
     "tests/test_public_release_gates.py",
+    "tests/test_version_release_plan.py",
     "tests/test_public_source_inventory.py",
     "tests/test_release_metadata_ssot.py",
     "tests/test_workspace.py",
@@ -139,6 +140,7 @@ PUBLIC_TEST_FILES = (
 PUBLIC_TOOL_FILES = (
     *BUILD_SUPPORT_FILES,
     "tools/public_source_inventory.py",
+    "tools/plan_version_release.py",
 )
 _FORBIDDEN_PARTS = {
     ".mypy_cache",

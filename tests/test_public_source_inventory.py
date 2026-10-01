@@ -35,6 +35,8 @@ def test_public_source_inventory_reuses_package_inventory() -> None:
         ".github/CODEOWNERS.template",
         ".github/workflows/ci.yml",
         ".github/workflows/publish.yml",
+        "tools/plan_version_release.py",
+        "tests/test_version_release_plan.py",
     } <= public
     for project_name in PUBLIC_EXAMPLE_PROJECTS:
         prefix = f"examples/{project_name}/"
