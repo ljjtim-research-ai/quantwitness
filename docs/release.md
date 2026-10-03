@@ -76,6 +76,26 @@ v1 的原始 METADATA/RECORD 摘要与 v2 不兼容；验证器拒绝 v1 锁，�
 
 工作流检查通过不代表 GitHub ruleset 或 required checks 已生效；首次公开前需在平台按批准的治理方案配置并验证。四项目闭环只证明合成研究，不证明交易费用、保证金或真实市场表现。
 
+## PyPI 正式发布
+
+`.github/workflows/publish.yml` 在 `main` 推送的 `ci` 工作流通过后检查版本请求。CI 记录本次推送前后的提交，发布工作流按这两个提交中的 `pyproject.toml` 比较版本：版本未变直接跳过；递增的 `X.Y.Z` 正式版本才进入构建。一次推送包含多个提交时，比较的是整次推送前后的版本，不是最后一个提交的父节点。预发布版本、版本回退及低于已有正式 Tag 的版本不进入发布。
+
+已有 `v<版本>` Tag 的版本跳过，不重复构建或上传。普通代码、文档、依赖调整只要版本未变，就不会发布 Release 或 PyPI；手工创建 Release 或推送 Tag 也不触发上传。构建固定使用通过 CI 的候选提交，而不是工作流启动时最新的 `main`。工作流重新检查公开源码、发布合同和隔离 wheel，只使用本次正式构建 JSON 回执中的 wheel 与 sdist；源码 zip 作为 GitHub Release 附件保留，不上传 PyPI。
+
+PyPI 使用 Trusted Publishing。PyPI 项目绑定 GitHub owner `ljjtim`、仓库 `QuantWitness`、工作流 `publish.yml` 和 Environment `pypi`；GitHub 的 `pypi` Environment 负责正式上传前的审批。发布任务只授予 `contents: read` 和 `id-token: write`，仓库不保存 PyPI API Token。上传失败不得使用 `skip-existing` 绕过；已经发布的版本不能用不同文件覆盖，修复后发布新版本。
+
+发布不需要在本机切换 GitHub 账号或配置 PyPI Token，也不需要手工创建 Tag 或 Release：
+
+1. 在版本 PR 中提高 `pyproject.toml` 的 `project.version`，例如从 `1.1.0` 改为 `1.1.1`，并在 `CHANGELOG.md` 写入非空的 `## 1.1.1` 章节。日期可紧随版本号，写法沿用现有变更记录。
+2. 合并到 `main`，记录候选提交及验收结果；受改动影响的发布证据需重新生成并复验。PR 检查本身不发布，合并后的 main CI 通过才生成发布请求。
+3. 在 **Actions → publish** 查看版本判定和构建结果。构建通过后，由 `pypi` Environment 的指定审批人在 **Review deployments** 中批准上传。
+4. 工作流上传 PyPI，在全新 Python 3.10 环境从正式 PyPI 安装该版本并检查版本、导入位置、依赖和 CLI。
+5. 安装核验通过后，工作流在已验收的候选提交上自动创建 `v<版本>` Tag 与 `QuantWitness <版本>` Release，发布说明只取 CHANGELOG 的对应章节，附上同一次构建的 wheel、sdist 和源码 zip。
+
+以 `publish` 工作流的版本判定、构建、PyPI 上传和 GitHub Release 四个任务全部通过为新版本发布完成标准；版本未变时，后面三个任务跳过是正常结果。发布队列串行运行，批准上传前保持一次仅有一个待发布版本。
+
+PyPI 上传失败时 Release 任务不会执行；安装核验或 Release 创建失败时，PyPI 版本可能已经存在。先查看失败任务，在原发布工作流中仅重跑失败任务，不重跑已成功的上传任务，也不靠普通提交重发该版本。工作流不覆盖已有 Tag、Release 或 PyPI 版本。临时环境问题可在原 CI 或发布工作流中重跑相应失败任务；源码需要修复时，用更高版本提交新的版本 PR。运行工件保留 7 天，依赖原工件的重跑应在保留期内完成。
+
 
 ## 当前候选的本地发布验收
 

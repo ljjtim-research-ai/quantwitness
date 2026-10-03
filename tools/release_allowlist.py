@@ -126,6 +126,7 @@ PUBLIC_GITHUB_FILES = (
     ".github/ISSUE_TEMPLATE/bug_report.yml",
     ".github/ISSUE_TEMPLATE/feature_request.yml",
     ".github/pull_request_template.md",
+    ".github/workflows/publish.yml",
 )
 PUBLIC_GOVERNANCE_FILES = (
     ".github/CODEOWNERS",
@@ -150,6 +151,7 @@ PUBLIC_TEST_FILES = (
     "tests/test_public_examples.py",
     "tests/test_public_operator_governance.py",
     "tests/test_public_release_gates.py",
+    "tests/test_version_release_plan.py",
     "tests/test_public_source_inventory.py",
     "tests/test_release_metadata_ssot.py",
     "tests/test_workspace.py",
@@ -235,6 +237,7 @@ PUBLIC_TOOL_FILES = (
     "tools/public_source_inventory.py",
     "tools/verify_rdagent_install.py",
     "tools/verify_ml_install.py",
+    "tools/plan_version_release.py",
 )
 _FORBIDDEN_PARTS = {
     ".mypy_cache",

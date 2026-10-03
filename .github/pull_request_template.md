@@ -1,3 +1,7 @@
+## 提交目标
+
+目标仓库为`ljjtim/QuantWitness`，base为`main`；head为自己的fork及功能分支。确认PR页面的目标仓库，不把fork内部验收PR作为正式投递。
+
 ## 行为变化
 
 说明触发条件、原行为和修改后的结果。

@@ -41,6 +41,9 @@ def test_public_source_inventory_reuses_package_inventory() -> None:
         "tools/verify_rdagent_install.py",
         "integrations/rdagent/docs/installation.md",
         "integrations/rdagent/MANIFEST.in",
+        ".github/workflows/publish.yml",
+        "tools/plan_version_release.py",
+        "tests/test_version_release_plan.py",
     } <= public
     for project_name in PUBLIC_EXAMPLE_PROJECTS:
         prefix = f"examples/{project_name}/"

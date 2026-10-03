@@ -2,6 +2,29 @@
 
 QuantWitness 接受缺陷修复、文档改进、项目扩展和经审查的通用能力贡献。提交前请先确认改动属于框架机制还是某个研究项目。
 
+## PR 提交到哪里
+
+正式贡献统一提交到 `ljjtim/QuantWitness` 的 `main`。自己的fork用于推送来源分支；fork内部PR只用于临时验证，不作为正式贡献入口。
+
+GitHub网页创建PR时，明确选择：
+
+- base repository：`ljjtim/QuantWitness`
+- base：`main`
+- head repository：自己的fork，例如`ljjtim-research-ai/quantwitness`
+- compare：包含本次修改的功能分支
+
+在独立公开源码仓库执行，下面以当前集成分支为例；其他贡献替换账号和分支名：
+
+```powershell
+git fetch origin main
+git push fork codex/qlib-real-portfolio-delivery
+gh pr create --repo ljjtim/QuantWitness --base main --head ljjtim-research-ai:codex/qlib-real-portfolio-delivery --title "Qlib 与 RD-Agent 集成及组合报告" --body-file pr-description.md
+```
+
+示例假定`origin`指向上游、`fork`指向自己的fork。执行前用`git remote -v`核对；若命名不同，使用自己的remote名称。`pr-description.md`保存行为变化、金融/PIT影响、实际验证和限制，放在仓库外并传入真实路径，不随源码提交。
+
+推送前处理与上游main的冲突，保留上游已有发布流程。创建后检查PR页面显示的目标仓库与分支，并以该PR当前提交的CI为准。PR创建、合并和版本发布分别处理；当前main的版本递增合并在CI成功后会触发既有发布流程，发起PR本身不会发布软件包。
+
 ## 开发环境
 
 ```powershell
