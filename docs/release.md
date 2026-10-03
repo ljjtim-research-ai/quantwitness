@@ -4,7 +4,7 @@
 
 开发安装使用 `python -m pip install ".[dev]"`；测试环境使用 `python -m pip install ".[test]"`。
 两者同时准备`setuptools>=68`、`build`和`wheel`，满足无隔离发行测试的本机构建依赖。
-这些 extras 不包括可选机器学习模型，按研究需求另装 `ml` 或 `ml-lightgbm`。
+这些 extras 不包括可选机器学习模型，按研究需求另装 `ml`（Qlib、XGBoost 与 Plotly）。
 
 ## 分发内容与命令适用范围
 
@@ -13,6 +13,8 @@ sdist 和源码 zip 均按显式清单附带当前公开操作文档、文档链
 本文的发布构建、最低版本验收、干净 wheel 验收及公开 CI 命令从独立公开源码仓库的根目录执行，也可在完整单仓的 `research_pipeline/` 下执行发布构建和验收。发布工具、`tests/test_release_metadata_ssot.py` 及可执行合成示例随独立公开源码仓库提供，不包含在 sdist 和源码 zip 中；压缩包中的示例说明用于查阅，执行示例须使用独立公开源码仓库。
 
 文档由 `tools/release_allowlist.py` 的 `CORE_DOC_FILES` 与 `MANIFEST.in` 显式列入，不递归收录历史文档。个人研究项目源码、真实研究数据、私有 Catalog 声明和 Lock、内部整改基线及维护脚本均不进入三类发行产物。需要 Catalog 的命令由调用方提供自己的持久 Lock。
+
+公开示例与可选集成的使用说明随核心文档一起分发，保持本地文档链接可读；对应示例脚本和可选集成代码仍需完整公开源码。日频现金节点的本地准入说明单独列入文档清单，内部发布证据不随包分发。
 
 ## 正式构建
 
@@ -34,6 +36,8 @@ python tools/build_release_artifacts.py --project . --output <不存在的仓库
 ```
 
 直接在完整工作树运行标准构建不承担正式 allowlist 筛选；正式交付使用上面的 staging 工具。历史 release 证据不随当前构建覆盖，工作树未提交时也不能把测试构建称为干净发布候选。BuildManifest 的源码检查支持不含私有 Catalog 的独立公开仓库，并继续拒绝未提交的包文件删除或修改。收据复验器从显式传入的 wheel METADATA 读取版本，与安装后的 CLI 版本精确比较；中性草稿 lint 记录必须为预期失败且 exit=1。
+
+完整交付还需按[独立使用验收](external-acceptance.md)保留同版本 Linux、远端 CI 和首次使用记录。
 
 ## 最低版本验收
 
@@ -71,6 +75,26 @@ v1 的原始 METADATA/RECORD 摘要与 v2 不兼容；验证器拒绝 v1 锁，�
 四个示例的项目 Worker 固定依赖 `pyarrow 21.0.0`；CI 的源码测试环境和隔离 wheel 环境均安装此版本、执行 `pip check`，再核对隔离环境的版本和 wheel 来源。该固定版本只约束示例验收，不收窄 `pyproject.toml` 面向用户的依赖范围。CI 的 wheel 路径来自本次构建回执，不扫描历史 `dist/`。
 
 工作流检查通过不代表 GitHub ruleset 或 required checks 已生效；首次公开前需在平台按批准的治理方案配置并验证。四项目闭环只证明合成研究，不证明交易费用、保证金或真实市场表现。
+
+## PyPI 正式发布
+
+`.github/workflows/publish.yml` 在 `main` 推送的 `ci` 工作流通过后检查版本请求。CI 记录本次推送前后的提交，发布工作流按这两个提交中的 `pyproject.toml` 比较版本：版本未变直接跳过；递增的 `X.Y.Z` 正式版本才进入构建。一次推送包含多个提交时，比较的是整次推送前后的版本，不是最后一个提交的父节点。预发布版本、版本回退及低于已有正式 Tag 的版本不进入发布。
+
+已有 `v<版本>` Tag 的版本跳过，不重复构建或上传。普通代码、文档、依赖调整只要版本未变，就不会发布 Release 或 PyPI；手工创建 Release 或推送 Tag 也不触发上传。构建固定使用通过 CI 的候选提交，而不是工作流启动时最新的 `main`。工作流重新检查公开源码、发布合同和隔离 wheel，只使用本次正式构建 JSON 回执中的 wheel 与 sdist；源码 zip 作为 GitHub Release 附件保留，不上传 PyPI。
+
+PyPI 使用 Trusted Publishing。PyPI 项目绑定 GitHub owner `ljjtim`、仓库 `QuantWitness`、工作流 `publish.yml` 和 Environment `pypi`；GitHub 的 `pypi` Environment 负责正式上传前的审批。发布任务只授予 `contents: read` 和 `id-token: write`，仓库不保存 PyPI API Token。上传失败不得使用 `skip-existing` 绕过；已经发布的版本不能用不同文件覆盖，修复后发布新版本。
+
+发布不需要在本机切换 GitHub 账号或配置 PyPI Token，也不需要手工创建 Tag 或 Release：
+
+1. 在版本 PR 中提高 `pyproject.toml` 的 `project.version`，例如从 `1.1.0` 改为 `1.1.1`，并在 `CHANGELOG.md` 写入非空的 `## 1.1.1` 章节。日期可紧随版本号，写法沿用现有变更记录。
+2. 合并到 `main`，记录候选提交及验收结果；受改动影响的发布证据需重新生成并复验。PR 检查本身不发布，合并后的 main CI 通过才生成发布请求。
+3. 在 **Actions → publish** 查看版本判定和构建结果。构建通过后，由 `pypi` Environment 的指定审批人在 **Review deployments** 中批准上传。
+4. 工作流上传 PyPI，在全新 Python 3.10 环境从正式 PyPI 安装该版本并检查版本、导入位置、依赖和 CLI。
+5. 安装核验通过后，工作流在已验收的候选提交上自动创建 `v<版本>` Tag 与 `QuantWitness <版本>` Release，发布说明只取 CHANGELOG 的对应章节，附上同一次构建的 wheel、sdist 和源码 zip。
+
+以 `publish` 工作流的版本判定、构建、PyPI 上传和 GitHub Release 四个任务全部通过为新版本发布完成标准；版本未变时，后面三个任务跳过是正常结果。发布队列串行运行，批准上传前保持一次仅有一个待发布版本。
+
+PyPI 上传失败时 Release 任务不会执行；安装核验或 Release 创建失败时，PyPI 版本可能已经存在。先查看失败任务，在原发布工作流中仅重跑失败任务，不重跑已成功的上传任务，也不靠普通提交重发该版本。工作流不覆盖已有 Tag、Release 或 PyPI 版本。临时环境问题可在原 CI 或发布工作流中重跑相应失败任务；源码需要修复时，用更高版本提交新的版本 PR。运行工件保留 7 天，依赖原工件的重跑应在保留期内完成。
 
 
 ## 当前候选的本地发布验收
