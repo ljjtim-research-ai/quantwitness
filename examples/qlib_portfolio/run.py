@@ -74,4 +74,4 @@ if __name__=="__main__":
     parser.add_argument("--input-config")
     args=parser.parse_args()
     for stage in (("prepare","lint","admit","run","verify","report") if args.stage=="all" else (args.stage,)):
-        print(json.dumps(execute(args.output,stage,args.mode,args.reuse_failed_run_root,args.require_reused_node,args.input_config),ensure_ascii=False,default=str),flush=True)
+        print(json.dumps(execute(args.output,stage,args.mode,args.reuse_failed_run_root,args.require_reused_node,args.input_config),ensure_ascii=True,default=str),flush=True)

@@ -159,7 +159,7 @@ def main() -> int:
         _restore(arguments.restore.resolve())
     else:
         receipt = verify_install(arguments.output.resolve())
-        print(json.dumps(receipt, ensure_ascii=False, indent=2))
+        print(json.dumps(receipt, ensure_ascii=True, indent=2))
     return 0
 
 
