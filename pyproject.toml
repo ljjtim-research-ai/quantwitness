@@ -34,8 +34,7 @@ dev = [
   "ruff>=0.12,<1",
   "tomli>=2; python_version < '3.11'",
 ]
-ml = ["scikit-learn"]
-ml-lightgbm = ["lightgbm"]
+ml = ["pyqlib==0.9.7", "xgboost>=3.2,<3.3", "plotly>=6,<7", "statsmodels>=0.15,<0.16"]
 
 [project.scripts]
 quantwitness = "research_pipeline.cli:main"
