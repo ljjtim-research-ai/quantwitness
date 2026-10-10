@@ -38,13 +38,12 @@ APPROVED_BUILTIN_SEMANTIC_IDENTITIES = MappingProxyType({
         "research.minute-simulation.v1",
         "research.minute-statistics.v1",
         "research.minute-targets.v1",
-        "research.model-fits.v1",
-        "research.model-fold-metrics.v1",
-        "research.model-locked-holdout.v1",
-        "research.model-preprocessed-folds.v1",
-        "research.model-selection.v1",
-        "research.model-split-manifest.v1",
-        "research.model-validation-predictions.v1",
+        "research.model-fits.v2",
+        "research.model-fold-metrics.v2",
+        "research.model-locked-holdout.v2",
+        "research.model-selection.v2",
+        "research.model-split-manifest.v2",
+        "research.model-validation-predictions.v2",
         "research.validity-facts.v1",
     }),
     "metric": frozenset({
@@ -53,6 +52,19 @@ APPROVED_BUILTIN_SEMANTIC_IDENTITIES = MappingProxyType({
         "statistics.adjusted_p@1.0.0",
     }),
     "result_schema": frozenset({
+        "research.shared-futures.context.v1",
+        "research.shared-futures.cash.v1",
+        "research.shared-futures.positions.v1",
+        "research.shared-futures.orders.v1",
+        "research.shared-futures.fills.v1",
+        "research.shared-futures.costs.v1",
+        "research.shared-futures.valuations.v1",
+        "research.shared-futures.reservations.v1",
+        "research.shared-futures.risks.v1",
+        "research.shared-futures.rolls.v1",
+        "research.futures-daily-context.v1",
+        "research.order-lifecycle.v1",
+        "research.qlib-model-inventory.v1",
         "data.adjustment-factor-snapshot.payload.v1",
         "data.columnar-bundle.metrics.v1",
         "research.bar-tca.daily.v1",
@@ -78,6 +90,9 @@ APPROVED_BUILTIN_SEMANTIC_IDENTITIES = MappingProxyType({
         "research.simulation.valuations.v1",
     }),
     "result_schema_set": frozenset({
+        "shared_futures:research.shared-futures.cash.v1@shared_futures/cash,research.shared-futures.context.v1@shared_futures/context,research.shared-futures.costs.v1@shared_futures/costs,research.shared-futures.fills.v1@shared_futures/fills,research.shared-futures.orders.v1@shared_futures/orders,research.shared-futures.positions.v1@shared_futures/positions,research.shared-futures.reservations.v1@shared_futures/reservations,research.shared-futures.risks.v1@shared_futures/risks,research.shared-futures.rolls.v1@shared_futures/rolls,research.shared-futures.valuations.v1@shared_futures/valuations",
+        "futures_daily_context:research.futures-daily-context.v1@simulation/futures-context-tables",
+        "order_lifecycle:research.order-lifecycle.v1@simulation/context-tables/order-lifecycle",
         "adjustment_snapshot:data.adjustment-factor-snapshot.payload.v1,"
         "research.minute-features.pre-anchor.v1,research.minute-labels.pre-anchor.v1",
         "bar_tca:research.bar-tca.daily.v1@simulation/tca/daily,"
@@ -96,11 +111,17 @@ APPROVED_BUILTIN_SEMANTIC_IDENTITIES = MappingProxyType({
         "research.minute-targets.payload.v1",
     }),
     "verifier": frozenset({
+        "result-semantic:shared_futures:shared-futures-financial-oracle-v1",
         "default:data.pit:verifier.data-pit.v1",
         "default:financial.tradability:verifier.financial-tradability.v2",
         "default:label.split:verifier.label-split.v2",
         "default:search.holdout:verifier.search-holdout.v1",
         "default:statistics:verifier.statistics.v2",
+        "model:data.pit:verifier.data-pit.v1",
+        "model:label.split:verifier.model-label-split.v1",
+        "model:search.holdout:verifier.model-search-holdout.v1",
+        "model:statistics:verifier.model-statistics.v1",
+        "model:financial.tradability:verifier.model-prediction-scope.v1",
         "minute:data.pit:verifier.minute-data-pit.v2",
         "minute:financial.tradability:verifier.minute-financial.v2",
         "minute:label.split:verifier.minute-label-split.v2",
@@ -119,6 +140,19 @@ class SemanticGovernanceError(ValueError):
 
 # 晋级记录只能经评审后显式加入；能力 baseline 和发现快照不能生成该授权。
 MAINLINE_SEMANTIC_PROMOTION_REVIEWS: tuple["SemanticPromotionReview", ...] = ()
+
+# 2026-10-03 维护者批准日频现金接口有界接入，通用语义晋级仍按原合同。
+DAILY_CASH_LOCAL_ARTIFACT_IDENTITIES = frozenset({
+    "data.daily-market.v1",
+    "research.portfolio-targets.v1",
+    "research.daily-simulation.v1",
+})
+
+
+# P8 共享期货账户仅获本地执行批准；发现身份不构成公共能力晋级。
+SHARED_FUTURES_LOCAL_ARTIFACT_IDENTITIES = frozenset({
+    "research.shared-futures-simulation.v1",
+})
 
 
 @dataclass(frozen=True)
@@ -154,6 +188,98 @@ class BuiltinSemanticRevision:
 MAINLINE_BUILTIN_SEMANTIC_REVISIONS = (
     BuiltinSemanticRevision(
         semantic_kind="verifier",
+        previous_identity="model:label.split:verifier.model-label-split.v1",
+        replacement_identity="model:label.split:verifier.model-label-split.v2",
+        reason="序列研究按原始特征和标签重建窗口资格并复核模型训练子集与GRU配置",
+        regression_test_ids=(
+            "test_real_gru_window_and_model_facts_pass_without_production_sampling",
+            "test_sequence_facts_reject_changed_evidence",
+            "test_window_file_fact_must_match_result_snapshot",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v5",
+        replacement_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v6",
+        reason="P3 生命周期支持分区独立复核，六表保持原成交摘要语义",
+        regression_test_ids=(
+            "test_formal_result_oracle_uses_sealed_lifecycle_after_run_root_removed",
+            "test_independent_oracle_rejects_lifecycle_corruption",
+            "test_new_result_cannot_drop_or_corrupt_lifecycle_support",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="model:search.holdout:verifier.model-search-holdout.v1",
+        replacement_identity="model:search.holdout:verifier.model-search-holdout.v2",
+        reason="序列研究按原始特征和标签重建窗口资格并复核模型训练子集与GRU配置",
+        regression_test_ids=(
+            "test_real_gru_window_and_model_facts_pass_without_production_sampling",
+            "test_sequence_facts_reject_changed_evidence",
+            "test_window_file_fact_must_match_result_snapshot",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v6",
+        replacement_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v7",
+        reason="分钟现货按当时可见的最新行情事件独立复核估值；日频期货按会话账本事实复核",
+        regression_test_ids=(
+            "test_futures_result_verifies_without_run_root",
+            "test_late_old_price_cannot_replace_latest_visible_event",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v7",
+        replacement_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v8",
+        reason="P6 显式分钟数量与价格限制、历史状态、可见修订及实际 PIT 消费绑定的独立复核",
+        regression_test_ids=(
+            "test_oracle_selects_pit_rule_at_consumption_time",
+            "test_p6_minute_public_package_chain",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="result-semantic:adjustment_snapshot:verifier.adjustment-snapshot.v1",
+        replacement_identity="result-semantic:adjustment_snapshot:verifier.adjustment-snapshot.v2",
+        reason="PIT 快照同时封存完整金融行动，独立校验 v2 合同和研究时钟可见性",
+        regression_test_ids=("test_verifier_consumes_complete_snapshot_payload_and_rejects_tampering",),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="minute:label.split:verifier.minute-label-split.v2",
+        replacement_identity="minute:label.split:verifier.minute-label-split.v3",
+        reason="分钟标签经济起点可已知，独立要求决策和起价均早于未来终价",
+        regression_test_ids=("test_minute_oracle_accepts_known_economic_entry", "test_minute_oracle_rejects_nonfuture_exit"),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="minute:statistics:verifier.minute-statistics.v2",
+        replacement_identity="minute:statistics:verifier.minute-statistics.v3",
+        reason="分钟标签经济起点可已知，独立要求决策和起价均早于未来终价",
+        regression_test_ids=("test_minute_oracle_accepts_known_economic_entry", "test_minute_oracle_rejects_nonfuture_exit"),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="minute:financial.tradability:verifier.minute-financial.v2",
+        replacement_identity="minute:financial.tradability:verifier.minute-financial.v3",
+        reason="分钟金融事实从正式六表与 TCA 身份重建，并绑定 Result 独立金融复核",
+        regression_test_ids=("test_p6_minute_public_package_chain",),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="model:financial.tradability:verifier.model-prediction-scope.v1",
+        replacement_identity="model:financial.tradability:verifier.model-financial-scope.v2",
+        reason="模型组合金融事实绑定正式 Result 的独立日频现金及 TCA 复核",
+        regression_test_ids=(
+            "test_model_financial_gate_consumes_independent_oracle",
+            "test_portfolio_cannot_hide_simulation_as_prediction_only",
+            "test_portfolio_cannot_pass_with_only_self_reported_facts",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
         previous_identity=(
             "default:financial.tradability:verifier.financial-tradability.v2"
         ),
@@ -164,6 +290,46 @@ MAINLINE_BUILTIN_SEMANTIC_REVISIONS = (
         regression_test_ids=(
             "test_close_to_close_account_return_window_is_supported",
             "test_verifier_recomputes_semantics_and_capacity_claim_ceiling",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v8",
+        replacement_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v9",
+        reason="P7 显式订单流独立复核提交可见性、持续订单、累计费用与预占事实",
+        regression_test_ids=(
+            "test_p7_minute_runtime_seals_explicit_context_and_support",
+            "test_p7_semantic_revisions_register_current_financial_verifiers",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v9",
+        replacement_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v10",
+        reason="P7A 独立重建外部资金流、提款预占、可见估值及时间加权收益",
+        regression_test_ids=(
+            "test_cashflows_complete_formal_package_and_recovery",
+            "test_compile_rejects_invalid_flow_before_worker_start",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v10",
+        replacement_identity="result-semantic:financial_oracle:result-bundle-financial-oracle-v11",
+        reason="P7B 独立重建融资债务、自然日利息、担保约束及信用净资产",
+        regression_test_ids=(
+            "test_credit_report_uses_net_opening_assets_and_does_not_deduct_interest_twice",
+            "test_credit_selection_is_rejected_before_execution",
+        ),
+    ),
+    BuiltinSemanticRevision(
+        semantic_kind="verifier",
+        previous_identity="minute:financial.tradability:verifier.minute-financial.v3",
+        replacement_identity="minute:financial.tradability:verifier.minute-financial.v4",
+        reason="分钟金融门禁接入显式订单决策语义与逐订单累计费用，旧目标上下文继续可读",
+        regression_test_ids=(
+            "test_p7_minute_runtime_preserves_target_context_version",
+            "test_p7_semantic_revisions_register_current_financial_verifiers",
         ),
     ),
 )
@@ -280,6 +446,10 @@ def validate_public_semantic_inventory(
     if len(review_by_identity) != len(review_items):
         raise SemanticGovernanceError("公共语义晋级记录重复")
     for identity in sorted(set(actual) - set(builtins)):
+        if semantic_kind == "artifact_type" and identity in (
+            DAILY_CASH_LOCAL_ARTIFACT_IDENTITIES | SHARED_FUTURES_LOCAL_ARTIFACT_IDENTITIES
+        ):
+            continue
         review = review_by_identity.get(identity)
         if review is None:
             raise SemanticGovernanceError(

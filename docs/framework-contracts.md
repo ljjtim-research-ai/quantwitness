@@ -1,4 +1,10 @@
-# QuantWitness
+# 框架约定：从研究输入到结果交付
+
+这是一份面向进阶使用者和扩展开发者的完整参考。它说明数据、算法、运行和结果之间必须满足的约定；第一次运行不必逐条读完，可以先看 [文档导航](index.md)。
+
+关键原则只有三个：按当时可见的数据研究，按已经固定的配置执行，让结果保留来源并接受独立检查。
+
+## 参数与行为说明
 
 QuantWitness 是面向个人研究者和 AI 协作者的量化研究编排框架，Python import 名保留为 `research_pipeline`。它强调 PIT、防前视、可复现、typed DAG、不可变 Result、独立 VerificationResult 和项目扩展隔离；它不是交易执行平台，也不承诺任意研究都能直接运行。
 
@@ -209,7 +215,7 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 
 能力状态只以 [`src/research_pipeline/capabilities.json`](../src/research_pipeline/capabilities.json) 为机器真相源。`planned` 只能发现，`local_only` 不能写成已经独立发布验收。
 
-完整能力表见[当前能力状态](index.md#能力状态)。
+完整能力表见[当前能力状态](index.md#精确能力状态)。
 
 ## 文档
 
@@ -223,3 +229,12 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 - [现行文档索引](index.md)
 
 历史验收和退役设计可以留在仓库中取证，但不属于当前操作入口。
+
+Qlib 模型链采用六节点；模型与处理器是同一候选/fold 的文件工件。ResultSpec 选定模型 inventory 时封存其明确引用文件，恢复不依赖训练工作目录。HTML 研究报告使用 Qlib 诊断算法，并保留来源、方法和验证状态。
+
+## 归档来源身份
+
+封存来源使用 CLI plan v6，冻结完整 input_snapshot_manifest；对应 invocation v14 保存显式
+清单路径并在恢复时与计划内容核对。原数据库来源继续使用原合同，历史运行不自动迁移。
+归档来源准入证据包含原工件引用和当前归档物理绑定，进入原有 admission/DAG 身份链；
+节点缓存不能跨来源变更复用。数据和分钟适配器的源码身份包含 archived_inputs 实现。

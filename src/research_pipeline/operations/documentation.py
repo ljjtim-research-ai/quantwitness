@@ -25,10 +25,20 @@ REQUIRED_DOCS = frozenset(
         "minute_rule_provenance.md",
         "operations.md",
         "release.md",
+        "external-acceptance.md",
         "research_package.md",
         "runtime.md",
         "walk_forward_model.md",
+        "qlib-model-results.md",
+        "qlib-report.md",
+        "qlib-expressions.md",
+        "qlib-factor-baselines.md",
+        "qlib-portfolio-risk.md",
         "project_resource_budgets.md",
+        "spot_account.md",
+        "explicit_orders.md",
+        "shared_futures.md",
+        "native_backtest_acceptance.md",
     }
 )
 

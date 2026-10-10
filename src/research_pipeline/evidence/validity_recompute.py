@@ -532,6 +532,15 @@ def _recompute_issue_map(
             issues["data.pit"].add("pit.source_revision_missing")
         if not _is_sha256(item.get("availability_policy_hash")):
             issues["data.pit"].add("pit.availability_policy_missing")
+    if "model_diagnostics" in facts:
+        from .model_validity import recompute_model_validity_issues
+
+        model_issues = recompute_model_validity_issues(
+            facts, bar_tca_expectations=bar_tca_expectations,
+        )
+        for gate, codes in model_issues.items():
+            issues[gate].update(codes)
+        return issues
     split = _mapping(facts["label_split"], "label_split")
     if observation_only:
         if split != {
@@ -845,7 +854,11 @@ def _recompute_issue_map(
                     "financial.minute_simulation_unsupported"
                 )
             issues["financial.tradability"].update(
-                recompute_minute_simulation_issues(minute_simulation)
+                recompute_minute_simulation_issues(
+                    minute_simulation, financial_facts=financial,
+                    bar_tca_expectations=bar_tca_expectations,
+                    require_bar_tca_oracle=require_bar_tca_oracle,
+                )
             )
     bar_tca = financial.get("bar_tca")
     if bar_tca is not None:
@@ -1235,6 +1248,12 @@ def recompute_gate_results(
             "minute_manifest_observation_v1",
         }
     )
+    financial = facts.get("financial_tradability")
+    prediction_only = (
+        "model_diagnostics" in facts
+        and isinstance(financial, Mapping)
+        and financial.get("applicability") == "not_applicable"
+    )
     return tuple(
         ValidityGateResult.build(
             gate_id=gate_id,
@@ -1243,7 +1262,7 @@ def recompute_gate_results(
             not_applicable=(
                 not issue_map[gate_id]
                 and (
-                    (analysis_only and gate_id == "financial.tradability")
+                    ((analysis_only or prediction_only) and gate_id == "financial.tradability")
                     or (
                         (
                             observation_only

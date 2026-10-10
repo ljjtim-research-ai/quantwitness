@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, localcontext
 import hashlib
 import json
 import math
@@ -739,7 +739,7 @@ def _verify_external_tca(
         raise EvidenceContractError("Bar TCA oracle input schema 无效")
     policy_hash = typed_canonical_hash(dict(policy))
     implementation_digest = typed_canonical_hash({
-        "formula": "formal-fill-attribution-with-optional-visible-liquidity-v2",
+        "formula": "formal-fill-attribution-with-explicit-cash-scale-v3",
         "impact_model": policy.get("impact_model"),
         "rounding": policy.get("rounding_rule"),
         "contract_version": policy.get("contract_version"),
@@ -800,7 +800,8 @@ def _verify_external_tca(
              OR f.side IS DISTINCT FROM c.side
              OR CAST(f.fill_time AS TIMESTAMPTZ) IS DISTINCT FROM c.fill_time
              OR f.quantity IS DISTINCT FROM c.quantity
-             OR f.execution_price_units IS DISTINCT FROM c.execution_price_units
+             OR CAST(f.execution_price_units AS HUGEINT) * CAST(power(10, c.price_scale) AS HUGEINT)
+                  IS DISTINCT FROM CAST(c.execution_price_units AS HUGEINT) * {10 ** int(policy["price_scale"])}
              OR f.formal_fee_units IS DISTINCT FROM c.fee_units
              OR f.source_fill_hash IS DISTINCT FROM c.source_fill_hash
           LIMIT 1
@@ -815,9 +816,10 @@ def _verify_external_tca(
         f"SELECT count(DISTINCT source_ledger_hash), min(source_ledger_hash) "
         f"FROM {formal.fills}"
     ).fetchone()
-    if ledger_hashes is None or ledger_hashes[0] != 1 or (
-        str(ledger_hashes[1]) != str(oracle_input.get("source_ledger_hash"))
-    ):
+    if ledger_hashes is None or (len(external_canonical["fills"]) > 0 and (
+        ledger_hashes[0] != 1
+        or str(ledger_hashes[1]) != str(oracle_input.get("source_ledger_hash"))
+    )):
         raise EvidenceContractError("Bar TCA source ledger 身份不闭合")
     source_simulation_hash = str(oracle_input.get("source_simulation_hash"))
     if source_simulation_hash != str(simulation_manifest.get("result_hash")):
@@ -1097,7 +1099,7 @@ def verify_tca(
         raise EvidenceContractError("Bar TCA oracle 行 schema 无效")
     policy_hash = typed_canonical_hash(dict(policy))
     implementation_digest = typed_canonical_hash({
-        "formula": "formal-fill-attribution-with-optional-visible-liquidity-v2",
+        "formula": "formal-fill-attribution-with-explicit-cash-scale-v3",
         "impact_model": policy.get("impact_model"),
         "rounding": policy.get("rounding_rule"),
         "contract_version": policy.get("contract_version"),
@@ -1129,14 +1131,16 @@ def verify_tca(
     ):
         raise EvidenceContractError("Bar TCA oracle fills 与 canonical fills 集合不一致")
     ledger_hashes = {str(row.get("source_ledger_hash")) for row in formal_fills}
-    if len(ledger_hashes) != 1 or ledger_hashes != {str(oracle_input.get("source_ledger_hash"))}:
+    if formal_fills and ledger_hashes != {str(oracle_input.get("source_ledger_hash"))}:
         raise EvidenceContractError("Bar TCA source ledger 身份不闭合")
     for fill_id, formal in oracle_fills.items():
         canonical_fill = canonical_fills[fill_id]
+        if int(formal["execution_price_units"]) * 10 ** int(canonical_fill["price_scale"]) != int(canonical_fill["execution_price_units"]) * 10 ** int(policy["price_scale"]):
+            raise EvidenceContractError("Bar TCA oracle fill 成交价与 canonical fill 不一致")
         mapping = {
             "order_id": "order_id", "instrument_id": "instrument_id", "asset_class": "asset_class",
             "side": "side", "fill_time": "fill_time", "quantity": "quantity",
-            "execution_price_units": "execution_price_units", "formal_fee_units": "fee_units",
+            "formal_fee_units": "fee_units",
             "source_fill_hash": "source_fill_hash",
         }
         for formal_field, canonical_field in mapping.items():
@@ -1286,6 +1290,8 @@ def _recompute_tca_fills(
         shortfall = direction * (
             int(fill["execution_price_units"]) - int(order["decision_price_units"])
         ) * int(fill["quantity"]) * multiplier
+        if policy["bar_frequency"] == "daily":
+            shortfall = int(Decimal(shortfall).scaleb(2 - int(policy["price_scale"])).quantize(Decimal(1), rounding=ROUND_HALF_UP))
         computed = fill.get("arrival_price_units") is not None and fill.get("visible_capacity") is not None
         participation = spread = impact = exceeded = None
         if computed:
@@ -1306,6 +1312,9 @@ def _recompute_tca_fills(
             impact_delta = _price_bps(int(fill["arrival_price_units"]), impact_bps)
             spread = spread_delta * quantity * multiplier
             impact = impact_delta * quantity * multiplier
+            if policy["bar_frequency"] == "daily":
+                spread = int(Decimal(spread).scaleb(2 - int(policy["price_scale"])).quantize(Decimal(1), rounding=ROUND_CEILING))
+                impact = int(Decimal(impact).scaleb(2 - int(policy["price_scale"])).quantize(Decimal(1), rounding=ROUND_CEILING))
             exceeded = participation > int(policy["participation_cap_ppm"])
         result[fill_id] = {
             "source_fill_id": fill_id,
