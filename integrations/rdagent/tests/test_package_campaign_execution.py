@@ -62,6 +62,46 @@ def test_existing_result_only_runs_missing_verification_and_report(published):
     assert calls == ["package"]
 
 
+@pytest.mark.parametrize("other_failure", [None, "statistics", "gate", "integrity", "reproducibility"])
+def test_completed_negative_verification_remains_candidate_feedback(published, monkeypatch, other_failure):
+    kwargs, execution, result, calls = published
+    from research_pipeline.application import evidence_lifecycle
+    import research_pipeline.evidence as evidence
+    verified = evidence.load_verified_result_context()
+    findings = ["formula.value_mismatch", "simulation_claim_ceiling:research_observation"]
+    verified.verification.status = "fail"
+    verified.verification.limitations = findings
+    verified.verification.integrity_status = "fail" if other_failure == "integrity" else "pass"
+    verified.verification.reproducibility_status = "fail" if other_failure == "reproducibility" else "pass"
+    verified.verification.gate_records = (SimpleNamespace(status="fail" if other_failure == "gate" else "pass"),)
+    if other_failure == "statistics":
+        findings.append("statistics.mismatch")
+    monkeypatch.setattr(evidence, "load_verified_result_context", lambda *a, **kw: verified)
+    original = evidence_lifecycle._execute
+
+    def command(args):
+        outcome = original(args)
+        if args.command == "verify":
+            outcome["status"] = "fail"
+        return outcome
+
+    monkeypatch.setattr(evidence_lifecycle, "_execute", command)
+    if other_failure is not None:
+        with pytest.raises(package_execution.PackageExecutionInterrupted) as captured:
+            package_execution._execute_package(**kwargs)
+        assert captured.value.package_execution_feedback["verification_status"] == "fail"
+        return
+    first = package_execution._execute_package(**kwargs)
+    assert first["command_status"] == first["execution_status"] == "succeeded"
+    assert first["verification_status"] == "fail"
+    assert first["diagnostics"] == findings
+    assert first["result_ref"] == str(result)
+    assert calls == ["package", "verify", "report"]
+    calls.clear()
+    assert package_execution._execute_package(**kwargs) == first
+    assert calls == ["package"]
+
+
 def test_published_result_without_reference_uses_inspect_not_runtime(published, monkeypatch):
     kwargs, execution, result, calls = published
     (execution / "run/result-ref.json").rename(execution / "result-reference.retained")

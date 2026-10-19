@@ -95,7 +95,8 @@ def _execute_package(*, root, workspace_id, allocation_label, base_package,
                     source_archive_root, input_snapshot_manifest, verifier_bundle, binding):
     from research_pipeline.workspace import initialize_workspace
     from research_pipeline.application.workspace_flow import (
-        execute_workspace, workspace_arguments, normalize_runtime_options,
+        WorkspaceVerificationFailedError, execute_workspace, workspace_arguments,
+        normalize_runtime_options,
     )
     from .worker import find_or_allocate, failure_diagnostics
 
@@ -128,7 +129,22 @@ def _execute_package(*, root, workspace_id, allocation_label, base_package,
             verification_process_slots=binding.get("verification_process_slots", 3),
             **normalize_runtime_options(binding["runtime_options"]),
         )
-        outcome = execute_workspace(args, allocation_handler=allocation_handler)
+        try:
+            outcome = execute_workspace(args, allocation_handler=allocation_handler)
+        except WorkspaceVerificationFailedError as exc:
+            from research_pipeline.evidence import load_verified_result_context
+            outcome = exc.failure_payload
+            verified = load_verified_result_context(
+                outcome["verification_result"], result_store=outcome["result_store"])
+            findings = [item for item in verified.verification.limitations
+                        if not str(item).startswith("simulation_claim_ceiling:")]
+            if (not findings or any(not str(item).startswith("formula.") for item in findings)
+                    or verified.verification.integrity_status != "pass"
+                    or verified.verification.reproducibility_status != "pass"
+                    or any(gate.status not in {"pass", "not_applicable"}
+                           for gate in verified.verification.gate_records)):
+                raise
+            # 公式否定结论交给候选修复，其他验证失败仍保留原 execution 等待处理。
         feedback.update(command_status="succeeded", execution_status=outcome["execution_status"],
             verification_status=outcome["verification_status"], result_ref=outcome["result_directory"],
             verification_ref=outcome["verification_result"], claim_level=outcome["claim_level"])
