@@ -1,4 +1,10 @@
-# Result 与 VerificationResult
+# 读懂结果包和独立检查单
+
+Result 回答“算出了什么、用什么算的”；VerificationResult 回答“按哪些规则检查、发现了什么问题”。报告把两者展示给人看。
+
+运行成功不等于验证通过。先检查验证状态，再阅读数值和覆盖范围。自定义公式还需要对应的独立检查实现，不能靠文件完整性检查证明经济结论正确。
+
+## 参数与行为说明
 
 研究与独立验证的公开产物保持两层；只读消费层可以另外生成独立 AnalysisResult：
 
@@ -20,6 +26,14 @@ diagnostic 分支、且不是正式结论祖先的 Feature/Label 不封存。Fea
 正式因果输出缺少 Parquet、核心字段、唯一行键或时间关系不成立时，Result finalize 或
 `verify` 失败。表身份按来源节点、端口、Artifact 类型和路径共同区分，不能因路径相同误删
 另一张正式时间表。
+
+### 序列模型的封存与复核
+
+选中Qlib序列模型清单时，Result收录配置、模型对象、Processor、显式权重，以及模型使用的`sequence/context.parquet`、`targets.parquet`和`members.parquet`。所有文件必须属于该清单引用的已提交工件。三份固定窗口文件可作为模型支持文件，普通Parquet研究表仍使用ResultSpec表声明。
+
+独立复核只读取配置、窗口Parquet和holdout账本，不反序列化模型或重新训练。研究级原始Feature、Label、完整末端、上下文、成员和排除记录必须逐行绑定Result。验证器从原始输入重建窗口资格，检查实际样本的证券、会话、决策时间和目标值，再核对每个模型的历史输入是其train/valid末端的精确子集。GRU配置复核固定Qlib/Torch版本、输入维度、CPU和单条batch、实际参数、窗口声明及negative_mse曲线。
+
+正式ResearchPackage接受显式完整窗口的GRU候选，公开示例的development/model模式同时绑定原始Feature、Label及四张序列表。缺少窗口声明、窗口长度不一致或非raw标签的序列评价在准入阶段拒绝；Result独立验证进一步核对实际样本与封存模型。
 
 ## 金融与统计口径
 
@@ -106,7 +120,7 @@ Operator 自报的行数不能替代独立复算。
 
 门禁按 ResearchPackage、算子图和 claim 触发。真正不适用时记录稳定 `N/A` 原因；缺材料、未执行或不认识的原因不能冒充 `N/A`。
 
-金融 verifier 可以共用表 schema，但不复用生产仿真的守恒、摘要或 TCA 计算。当前 v5 以稳定 Arrow 批次读取 canonical/TCA，并把排序、连接和跨行汇总交给受 memory/temp 配额约束的只读 DuckDB；日频 ETF 的费用、T+0/T+1 和持仓桶也走同一受限扫描。它不再使用固定 512 MiB 来源大小门，也不把完整表展开成 Python 行。资源不足会使整次 `verify` 失败且不写 VerificationResult，不会降级或抽样。未提供参数时使用 1 GiB 进程预算和 8 GiB 临时盘预算；进程预算会先扣除当前解释器与 Arrow 批处理余量，再分配给 DuckDB。
+金融 verifier 可以共用表 schema，但不复用生产仿真的守恒、摘要或 TCA 计算。当前 v11 以稳定 Arrow 批次读取 canonical/TCA，并把排序、连接和跨行汇总交给受 memory/temp 配额约束的只读 DuckDB；日频 ETF 的费用、T+0/T+1 和持仓桶也走同一受限扫描。它不再使用固定 512 MiB 来源大小门，也不把完整表展开成 Python 行。资源不足会使整次 `verify` 失败且不写 VerificationResult，不会降级或抽样。未提供参数时使用 1 GiB 进程预算和 8 GiB 临时盘预算；进程预算会先扣除当前解释器与 Arrow 批处理余量，再分配给 DuckDB。
 
 固定规模验收 Result 的未压缩列块为 586,133,815 字节、共 285,011 行；全新 verifier 进程会同时记录整个进程树 RSS、实际读取字节、临时盘峰值和耗时。该本地证据说明当前受支持 fixture 能在显式预算内完成，不把它外推为任意 allocator 或任意 Result 形状的数学硬上界。
 
@@ -116,6 +130,8 @@ ETF 日频 Result 还必须封存 `simulation/daily-context.json`。该支持文
 从同一已验证 Result snapshot 复验 profile 等于当前受控事实源，并重算交易单位、逐 fill
 费用、债券 ETF T+0、股票 ETF T+1 和未结算持仓桶。profile 本身只到
 `research_observation/local_only`；佣金是用户研究假设，不冒充交易所规则。
+
+日频融资沿同一支持文件使用 `research-daily-cash-financial-context-v4`，封存信用协议、逐合同本金、自然日计息、融资关联、偿还、担保和风险命令。独立信用 oracle 与订单、现货账户及资金流 oracle 协作，从原始事件重建；不能以生产快照中的债务聚合代替复算。六表信用估值模型为 `cash_plus_positions_and_credit_liabilities_v1`，会话调整在原权益调整上减去本金及应计未付利息。借还本金不属于外部入出金，利息不混入成交费用或 TCA；报告与导出均消费同一Result的净资产及收益序列。输入和适用范围见[现货及信用账户](spot_account.md)。
 
 ## 消费
 
@@ -196,3 +212,5 @@ holdout 的正式事实随 Result 保存为 `plan → prepared → opened → te
 ## 结论边界
 
 VerificationResult 失败时，可用 `report` 或 `export-result` 定位原因，但不能进入 Dashboard。修对应数据、算法或 claim 后产生新 run；不得手改 Result 或验证文件。`planned`/`local_only` 能力、未运行真实数据或缺独立验收时，文档必须保留相应上限。
+
+共享期货账户以 `research.shared-futures.*.v1` 九张金融表及单行 context 表封存原始声明与市场事件。独立复核检查共享权益、方向桶、冻结、风险与换月，HTML报告支持 `shared-futures-portfolio-report-v1` 请求；见[共享期货账户](shared_futures.md)。

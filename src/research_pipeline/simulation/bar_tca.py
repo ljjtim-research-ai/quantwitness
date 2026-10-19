@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from decimal import Decimal, ROUND_HALF_UP, localcontext
+from decimal import ROUND_CEILING, Decimal, ROUND_HALF_UP, localcontext
 import hashlib
 import json
 import os
@@ -115,7 +115,7 @@ class BarTcaPolicy:
     @property
     def implementation_digest(self) -> str:
         return typed_canonical_hash({
-            "formula": "formal-fill-attribution-with-optional-visible-liquidity-v2",
+            "formula": "formal-fill-attribution-with-explicit-cash-scale-v3",
             "impact_model": self.impact_model,
             "rounding": self.rounding_rule,
             "contract_version": self.contract_version,
@@ -783,8 +783,6 @@ def run_bar_tca(
     _require_hash(source_ledger_hash, "source_ledger_hash")
     ordered_orders = tuple(sorted(orders, key=lambda item: item.order_id))
     ordered_fills = tuple(sorted(formal_fills, key=lambda item: item.source_fill_id))
-    if not ordered_orders:
-        raise SimulationContractError("Bar TCA 至少需要一个正式订单")
     if len({item.order_id for item in ordered_orders}) != len(ordered_orders):
         raise SimulationContractError("Bar TCA 正式 order_id 重复")
     if len({item.source_fill_id for item in ordered_fills}) != len(ordered_fills):
@@ -902,6 +900,8 @@ def _attribute_fill(
         * fill.quantity
         * policy.contract_multiplier
     )
+    if policy.bar_frequency == "daily":
+        shortfall = int(Decimal(shortfall).scaleb(2 - policy.price_scale).quantize(Decimal(1), rounding=ROUND_HALF_UP))
     computed = fill.arrival_price_units is not None and fill.visible_capacity is not None
     participation = None
     spread = None
@@ -922,6 +922,9 @@ def _attribute_fill(
         impact_delta = _price_bps_units(int(fill.arrival_price_units), impact_bps)
         spread = spread_delta * fill.quantity * policy.contract_multiplier
         impact = impact_delta * fill.quantity * policy.contract_multiplier
+        if policy.bar_frequency == "daily":
+            spread = int(Decimal(spread).scaleb(2 - policy.price_scale).quantize(Decimal(1), rounding=ROUND_CEILING))
+            impact = int(Decimal(impact).scaleb(2 - policy.price_scale).quantize(Decimal(1), rounding=ROUND_CEILING))
     return BarTcaFill(
         source_fill_id=fill.source_fill_id,
         source_fill_hash=fill.source_fill_hash,
@@ -1040,11 +1043,12 @@ def write_bar_tca_artifact(
         }
         files: dict[str, str] = {}
         schemas: dict[str, str] = {}
+        arrow_schemas = _bar_tca_arrow_schemas()
         for name, rows in tables.items():
             directory = staging / name
             directory.mkdir()
             path = directory / "part-00000.parquet"
-            table = pa.Table.from_pylist(rows)
+            table = pa.Table.from_pylist(rows, schema=arrow_schemas[name])
             pq.write_table(table, path)
             files[f"{name}/part-00000.parquet"] = _sha256(path)
             schemas[name] = typed_canonical_hash(str(table.schema))

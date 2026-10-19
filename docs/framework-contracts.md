@@ -1,4 +1,10 @@
-# QuantWitness
+# 框架约定：从研究输入到结果交付
+
+这是一份面向进阶使用者和扩展开发者的完整参考。它说明数据、算法、运行和结果之间必须满足的约定；第一次运行不必逐条读完，可以先看 [文档导航](index.md)。
+
+关键原则只有三个：按当时可见的数据研究，按已经固定的配置执行，让结果保留来源并接受独立检查。
+
+## 参数与行为说明
 
 QuantWitness 是面向个人研究者和 AI 协作者的量化研究编排框架，Python import 名保留为 `research_pipeline`。它强调 PIT、防前视、可复现、typed DAG、不可变 Result、独立 VerificationResult 和项目扩展隔离；它不是交易执行平台，也不承诺任意研究都能直接运行。
 
@@ -63,7 +69,7 @@ python -m research_pipeline package init work/my_research --json
 python -m research_pipeline package expand-variants --base work/my_research --manifest work/variants.yaml --output-root work/variants --json
 python -m research_pipeline package lint --package work/my_research --catalog-lock <搜索结果.catalog_context.lock_reference> --json
 python -m research_pipeline package admit --package work/my_research --catalog-lock <搜索结果.catalog_context.lock_reference> --data-db <source:prod只读DuckDB> --output work/plan --json
-python -m research_pipeline run --plan work/plan --data-db <只读DuckDB> --artifact-root work/artifacts --handoff-out work/handoff.json --run-root work/run --result-store work/results --clock 2026-01-01T00:00:00+08:00 --root-seed 0 --json
+python -m research_pipeline run --plan work/plan --data-db <只读DuckDB> --artifact-root work/artifacts --run-root work/run --result-store work/results --clock 2026-01-01T00:00:00+08:00 --root-seed 0 --json
 python -m research_pipeline verify --result <Result目录> --result-store work/results --output work/verification-result.json --json
 python -m research_pipeline report --verification-result work/verification-result.json --result-store work/results --output work/verification-report.md --format markdown --json
 ```
@@ -147,7 +153,7 @@ revision 漂移都在准入或计划复核时失败。当前正式发布范围�
 模板只影响新生成的 package。已经生成的 package 不自动迁移；上述合同变化后，
 应使用项目自有模板或手工修改声明，重新 `package lint`、`package admit` 并新建 run。
 FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容；
-`research-runtime-checkpoint-v1/v2` 也不能恢复。受影响研究必须重新 admit 并新建 run，不能
+`research-runtime-checkpoint-v1/v2/v3` 也不能恢复。受影响研究必须重新 admit 并新建 run，不能
 转换或手改旧 plan/checkpoint。
 
 ## 每一步校验由谁消费
@@ -179,6 +185,7 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 
 - 研究数据库始终只读；框架不会发布或改写数据库。
 - 财报按公告/可见日，成分、行业、ST、停牌、复权和市场规则按历史快照或有效区间对齐。
+- 分钟复权快照和 pre 决策锚点由证据层从封存行动与价格独立重建；金额换算、行动版本选择、参考价舍位和 factor 公式不调用生产实现。验证算法为 `verifier.adjustment-snapshot.v3`，现有来源、PIT 和完整载荷核对继续执行。
 - 盘中研究只使用当时已完成的 bar；标签不能成为特征祖先。正式日频 Label 按
   `label_end_time + horizon_sessions` 写成同质 Parquet row group，模型 split 在首次扫描目标列前
   读取 footer 验证该边界；逻辑过滤不能替代物理边界。holdout 只支持“冻结唯一候选后确认”
@@ -209,7 +216,7 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 
 能力状态只以 [`src/research_pipeline/capabilities.json`](../src/research_pipeline/capabilities.json) 为机器真相源。`planned` 只能发现，`local_only` 不能写成已经独立发布验收。
 
-完整能力表见[当前能力状态](index.md#能力状态)。
+完整能力表见[当前能力状态](index.md#精确能力状态)。
 
 ## 文档
 
@@ -223,3 +230,14 @@ FeatureSetArtifact、LabelArtifact 以及 Runtime 的旧 v1 合同不再兼容�
 - [现行文档索引](index.md)
 
 历史验收和退役设计可以留在仓库中取证，但不属于当前操作入口。
+
+Qlib 模型链采用六节点；模型与处理器是同一候选/fold 的文件工件。ResultSpec 选定模型 inventory 时封存其明确引用文件，恢复不依赖训练工作目录。HTML 研究报告使用 Qlib 诊断算法，并保留来源、方法和验证状态。
+
+## 归档来源身份
+
+封存来源使用 CLI plan v6，冻结完整 input_snapshot_manifest；对应 invocation v14 保存显式
+清单路径并在恢复时与计划内容核对。原数据库来源继续使用原合同，历史运行不自动迁移。
+归档来源准入证据包含原工件引用和当前归档物理绑定，进入原有 admission/DAG 身份链；
+节点缓存不能跨来源变更复用。数据和分钟适配器的源码身份包含 archived_inputs 实现。
+
+模型最终确认按稳定研究系列管理已打开区间。正式 locked-holdout 节点显式提供 `research_series_json`；变体和数据版本变化不消除系列暴露。打开前在系列级进程锁内重检闭区间重叠，`opened` 后失败仍消耗，完整旧账本及系列证据封存到 Result。独立验证使用 `verifier.model-search-holdout.v3`，操作见[研究系列](holdout-series.md)。

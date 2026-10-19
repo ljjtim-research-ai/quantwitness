@@ -41,6 +41,9 @@ _MIB = 1024 * 1024
 _GIB = 1024 * _MIB
 # 明确登记共同变化的算子族；不从导入或调用图推断实现身份。
 _ADAPTER_MODULES_BY_SYMBOL = {
+    "execute_finance_simulation_shared_futures_daily_v1": "research_pipeline.runtime.adapters.shared_futures",
+    "execute_finance_simulation_shared_futures_intraday_v1": "research_pipeline.runtime.adapters.shared_futures",
+    "execute_finance_simulation_daily_cash_v1": "research_pipeline.runtime.adapters.daily_cash",
     "execute_data_catalog_admission_v1": "research_pipeline.runtime.adapters.validity",
     "execute_data_columnar_materialize_v1": "research_pipeline.application.grid_data",
     "execute_data_minute_adjustment_snapshot_v1": "research_pipeline.runtime.adapters.minute_adjustment",
@@ -50,13 +53,12 @@ _ADAPTER_MODULES_BY_SYMBOL = {
     "execute_research_bars_minute_resample_v1": "research_pipeline.runtime.adapters.minute_data",
     "execute_research_features_intraday_v1": "research_pipeline.runtime.adapters.minute_research",
     "execute_research_labels_intraday_v1": "research_pipeline.runtime.adapters.minute_research",
-    "execute_research_model_fit_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_fold_metrics_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_locked_holdout_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_predict_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_preprocess_fit_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_selection_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_split_manifest_v1": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_fit_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_fold_metrics_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_locked_holdout_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_predict_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_selection_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_split_manifest_v2": "research_pipeline.runtime.adapters.model",
     "execute_research_observation_minute_bars_v1": "research_pipeline.runtime.adapters.minute_data",
     "execute_research_signals_intraday_v1": "research_pipeline.runtime.adapters.minute_research",
     "execute_research_statistics_minute_v1": "research_pipeline.runtime.adapters.minute_statistics",
@@ -81,14 +83,65 @@ _COMMON_ADAPTER_DEPENDENCIES = (
 _MINUTE_IO_DEPENDENCIES = (
     "research_pipeline.runtime.adapters.minute_io",
     "research_pipeline.data_plane.minute_scan",
+    "research_pipeline.data_plane.archived_inputs",
     "research_pipeline.data_plane.minute_resampling",
     "research_pipeline.data_plane.partitioned_artifacts",
     "research_pipeline.domain.session_calendar",
     "research_pipeline.research.minute_operators",
 )
 _ADAPTER_FAMILY_DEPENDENCIES = {
+    "research_pipeline.runtime.adapters.shared_futures": (
+        *_MINUTE_IO_DEPENDENCIES,
+        "research_pipeline.domain.shared_futures",
+        "research_pipeline.domain.shared_futures_result",
+        "research_pipeline.domain.sessions",
+        "research_pipeline.domain.trading",
+        "research_pipeline.domain.values",
+        "research_pipeline.domain.order_stream",
+        "research_pipeline.simulation.target_execution",
+        "research_pipeline.simulation.execution_clock",
+        "research_pipeline.simulation.events",
+        "research_pipeline.simulation.execution_market",
+        "research_pipeline.simulation.shared_futures",
+        "research_pipeline.simulation.shared_futures_ledger",
+        "research_pipeline.simulation.engine",
+        "research_pipeline.simulation.broker",
+        "research_pipeline.simulation.orders",
+        "research_pipeline.simulation.costs",
+        "research_pipeline.simulation.margin",
+        "research_pipeline.simulation.ledger",
+        "research_pipeline.simulation.shared_futures_result",
+        "research_pipeline.platform.shared_futures_contracts",
+    ),
+    "research_pipeline.runtime.adapters.daily_cash": (
+        "research_pipeline.simulation.broker",
+        "research_pipeline.simulation.engine",
+        "research_pipeline.simulation.execution_clock",
+        "research_pipeline.simulation.target_execution",
+        "research_pipeline.simulation.orders",
+        "research_pipeline.simulation.order_lifecycle",
+
+        "research_pipeline.runtime.qlib_portfolio_execution",
+        "research_pipeline.simulation.daily_financial_context",
+        "research_pipeline.simulation.event_loop",
+        "research_pipeline.simulation.intent_port",
+        "research_pipeline.simulation.ledger",
+        "research_pipeline.simulation.costs",
+        "research_pipeline.simulation.matching",
+        "research_pipeline.simulation.execution_market",
+        "research_pipeline.simulation.market_rules",
+        "research_pipeline.simulation.tradability",
+        "research_pipeline.domain.trading",
+        "research_pipeline.research.dataframe_budget",
+    ),
     "research_pipeline.runtime.adapters.model": (
+        "research_pipeline.runtime.model_fit_parallel",
+        "research_pipeline.research.validation.search_manifest",
         "research_pipeline.runtime.walk_forward_model_execution",
+        "research_pipeline.runtime.model_sequence",
+        "research_pipeline.research.modeling.sequence",
+        "research_pipeline.research.modeling.inputs",
+        "research_pipeline.research.dataframe_budget",
         "research_pipeline.research.validation.holdout",
     ),
     "research_pipeline.runtime.adapters.validity": (
@@ -116,6 +169,14 @@ _ADAPTER_FAMILY_DEPENDENCIES = {
         "research_pipeline.data_plane.minute_adjustment",
     ),
     "research_pipeline.runtime.adapters.minute_simulation": (
+        "research_pipeline.simulation.broker",
+        "research_pipeline.simulation.engine",
+        "research_pipeline.simulation.execution_clock",
+        "research_pipeline.simulation.target_execution",
+        "research_pipeline.simulation.intent_port",
+        "research_pipeline.simulation.orders",
+        "research_pipeline.simulation.order_lifecycle",
+
         *_MINUTE_IO_DEPENDENCIES,
         "research_pipeline.data_plane.minute_adjustment",
         "research_pipeline.domain.minute_rule_snapshots",
@@ -124,6 +185,15 @@ _ADAPTER_FAMILY_DEPENDENCIES = {
         "research_pipeline.simulation.bar_tca",
         "research_pipeline.simulation.events",
         "research_pipeline.simulation.minute_execution",
+        "research_pipeline.simulation.minute_orders",
+        "research_pipeline.simulation.matching",
+        "research_pipeline.simulation.execution_market",
+        "research_pipeline.simulation.market_rules",
+        "research_pipeline.simulation.costs",
+        "research_pipeline.simulation.minute_rules",
+        "research_pipeline.simulation.settlement",
+        "research_pipeline.simulation.result_collector",
+        "research_pipeline.simulation.valuation",
         "research_pipeline.simulation.result_contract",
         "research_pipeline.runtime.bar_tca_adapter",
     ),
@@ -137,6 +207,7 @@ _ADAPTER_FAMILY_DEPENDENCIES = {
     "research_pipeline.application.grid_data": (
         "research_pipeline.application.grid_data_contract",
         "research_pipeline.data_plane.service",
+        "research_pipeline.data_plane.archived_inputs",
         "research_pipeline.data_plane.admitted_plan_codec",
         "research_pipeline.data_plane.dataset_artifacts",
         "research_pipeline.data_plane.execution_budget",
@@ -144,6 +215,12 @@ _ADAPTER_FAMILY_DEPENDENCIES = {
         "research_pipeline.data_plane.errors",
         "research_pipeline.platform.metric_contracts",
     ),
+}
+
+
+# 仅实际调用该独立重算的入口绑定此依赖，不扩散到同文件的统计入口。
+_ADAPTER_IMPLEMENTATION_DEPENDENCIES = {
+    "research.validity.minute.v1": ("research_pipeline.evidence.minute_validity",),
 }
 
 
@@ -189,28 +266,15 @@ def _bar_tca_parameters(
 
 
 def _walk_forward_model_parameters() -> tuple[ParameterSpec, ...]:
-    """模型阶段共享的冻结候选、预处理、目标和确定性合同。"""
+    """Qlib 候选、目标及确定性合同。"""
     return (
         _parameter("candidate_jsons", ParameterType.STRING_LIST),
-        _choice_parameter(
-            "target_kind", ParameterType.STRING, ("regression", "classification")
-        ),
-        _choice_parameter(
-            "objective",
-            ParameterType.STRING,
-            ("neg_mean_squared_error", "neg_mean_absolute_error", "accuracy"),
-        ),
+        _choice_parameter("target_kind", ParameterType.STRING, ("regression",)),
+        _choice_parameter("objective", ParameterType.STRING, ("neg_mean_squared_error", "neg_mean_absolute_error")),
         _choice_parameter("direction", ParameterType.STRING, ("maximize", "minimize")),
         _parameter("search_id", ParameterType.STRING),
         _parameter("search_frozen_at", ParameterType.STRING),
-        _choice_parameter(
-            "preprocessing",
-            ParameterType.STRING,
-            ("median_standardize_v1", "median_only_v1"),
-        ),
-        _parameter("feature_selection_k", ParameterType.INTEGER),
         _parameter("research_identity_hash", ParameterType.STRING),
-        _parameter("simple_model_gate_passed", ParameterType.BOOLEAN),
         _parameter("thread_count", ParameterType.INTEGER),
     )
 
@@ -295,6 +359,7 @@ def _runtime_adapter_ref(
                 (
                     *_COMMON_ADAPTER_DEPENDENCIES,
                     *_ADAPTER_FAMILY_DEPENDENCIES[module_name],
+                    *_ADAPTER_IMPLEMENTATION_DEPENDENCIES.get(implementation_id, ()),
                     *implementation_modules,
                 )
             )

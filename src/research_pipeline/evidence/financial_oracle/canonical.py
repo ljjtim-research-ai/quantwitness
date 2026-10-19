@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Mapping, Sequence
+from decimal import Decimal, ROUND_HALF_UP
 
 from research_pipeline.results import CANONICAL_SIMULATION_SCHEMA_IDS
 
@@ -19,9 +20,13 @@ from .common import (
 
 def verify_canonical_tables(
     tables: Mapping[str, Sequence[dict[str, object]]],
+    *, frequency: str = "minute",
+    account_adjustments: Mapping[str, int] | None = None,
+    credit_adjustments: Mapping[str, int] | None = None,
 ) -> None:
     if all(isinstance(rows, _OracleTable) for rows in tables.values()):
-        _verify_external_canonical_tables(tables)
+        _verify_external_canonical_tables(tables, frequency=frequency, account_adjustments=account_adjustments,
+                                          credit_adjustments=credit_adjustments)
         return
     orders = tables["orders"]
     fills = tables["fills"]
@@ -48,7 +53,13 @@ def verify_canonical_tables(
         quantity = _integer(fill["quantity"], "fill.quantity", minimum=1)
         price = _integer(fill["execution_price_units"], "fill.execution_price_units", minimum=1)
         multiplier = _integer(fill["contract_multiplier"], "fill.contract_multiplier", minimum=1)
-        if _integer(fill["notional_units"], "fill.notional_units", minimum=0) != price * quantity * multiplier:
+        scale = _integer(fill["price_scale"], "fill.price_scale", minimum=0)
+        if scale > 9:
+            raise EvidenceContractError("canonical fill 价格精度超出范围")
+        expected_notional = price * quantity * multiplier
+        if frequency == "daily":
+            expected_notional = int(Decimal(expected_notional).scaleb(2 - scale).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+        if _integer(fill["notional_units"], "fill.notional_units", minimum=0) != expected_notional:
             raise EvidenceContractError("canonical fill 成交额不守恒")
         _integer(fill["fee_units"], "fill.fee_units", minimum=0)
         fill_quantity[order_key] = fill_quantity.get(order_key, 0) + quantity
@@ -78,13 +89,17 @@ def verify_canonical_tables(
     expected_fees = {key: int(row["fee_units"]) for key, row in fill_by_key.items()}
     if fee_by_fill != expected_fees:
         raise EvidenceContractError("canonical costs 与 fills 正式费用不闭合")
-    _verify_cash(fills, cash)
+    _verify_cash(fills, cash, account_opening=account_adjustments is not None or credit_adjustments is not None)
     _verify_positions(fills, positions)
-    _verify_valuations(positions, cash, valuations)
+    _verify_valuations(positions, cash, valuations, account_adjustments=account_adjustments,
+                       credit_adjustments=credit_adjustments)
 
 
 def _verify_external_canonical_tables(
     tables: Mapping[str, Sequence[dict[str, object]]],
+    *, frequency: str = "minute",
+    account_adjustments: Mapping[str, int] | None = None,
+    credit_adjustments: Mapping[str, int] | None = None,
 ) -> None:
     """用可 spill 的关系扫描复核六表，不保留全量 Python 主键或行。"""
 
@@ -103,6 +118,17 @@ def _verify_external_canonical_tables(
     cash = external["cash"].name
     costs = external["costs"].name
     valuations = external["valuations"].name
+    adjustment_sql = "NULL"
+    adjustments = credit_adjustments if credit_adjustments is not None else account_adjustments
+    if adjustments is not None:
+        from datetime import date
+        cases = []
+        for session, adjustment in adjustments.items():
+            day = date.fromisoformat(session).isoformat()
+            if type(adjustment) is not int:
+                raise EvidenceContractError("账户估值调整必须是整数")
+            cases.append(f"WHEN v.session = DATE '{day}' THEN {adjustment}")
+        adjustment_sql = "CASE " + " ".join(cases) + " ELSE NULL END" if cases else "NULL"
     for name, fields, label in (
         (orders, ("portfolio_id", "order_id"), "orders"),
         (fills, ("portfolio_id", "fill_id"), "fills"),
@@ -117,6 +143,10 @@ def _verify_external_canonical_tables(
     ):
         _unique(_OracleTable(workspace, name, 0), fields, label)
 
+    notional_expression = "CAST(f.execution_price_units AS HUGEINT) * CAST(f.quantity AS HUGEINT) * CAST(f.contract_multiplier AS HUGEINT)"
+    if frequency == "daily":
+        denominator = "CAST(power(10, f.price_scale) AS HUGEINT)"
+        notional_expression = f"((({notional_expression}) * 200 + {denominator}) // (2 * {denominator}))"
     _require_no_external_rows(
         workspace,
         f"""
@@ -132,12 +162,11 @@ def _verify_external_canonical_tables(
            OR f.session IS DISTINCT FROM o.session
            OR f.quantity IS NULL OR f.quantity < 1
            OR f.execution_price_units IS NULL OR f.execution_price_units < 1
+           OR f.price_scale IS NULL OR f.price_scale < 0 OR f.price_scale > 9
            OR f.contract_multiplier IS NULL OR f.contract_multiplier < 1
            OR f.notional_units IS NULL OR f.notional_units < 0
            OR CAST(f.notional_units AS HUGEINT) !=
-              CAST(f.execution_price_units AS HUGEINT)
-              * CAST(f.quantity AS HUGEINT)
-              * CAST(f.contract_multiplier AS HUGEINT)
+              {notional_expression}
            OR f.fee_units IS NULL OR f.fee_units < 0
            OR f.realized_pnl_units IS NULL
         LIMIT 1
@@ -245,7 +274,7 @@ def _verify_external_canonical_tables(
         )
         SELECT 1
         FROM sequenced
-        WHERE opening_cash_units IS NULL OR opening_cash_units < 1
+        WHERE opening_cash_units IS NULL OR opening_cash_units < {0 if adjustments is not None else 1}
            OR opening_count != 1
            OR trade_cash_change_units IS DISTINCT FROM expected_trade
            OR total_cash_units IS DISTINCT FROM expected_total
@@ -349,11 +378,13 @@ def _verify_external_canonical_tables(
              OR v.source_state_hash IS DISTINCT FROM c.source_state_hash
              OR v.valuation_model IS NULL
              OR v.valuation_model NOT IN (
-                  'cash_plus_position_market_value', 'futures_settlement_equity'
+                  {"'cash_plus_positions_and_credit_liabilities_v1'" if credit_adjustments is not None else "'cash_plus_position_market_value', 'futures_settlement_equity', 'cash_plus_positions_and_account_rights_v1'"}
                 )
              OR v.nav_units IS DISTINCT FROM CASE
                   WHEN v.valuation_model = 'cash_plus_position_market_value'
                     THEN c.total_cash_units + coalesce(p.market_value, 0)
+                  WHEN v.valuation_model IN ('cash_plus_positions_and_account_rights_v1', 'cash_plus_positions_and_credit_liabilities_v1')
+                    THEN c.total_cash_units + coalesce(p.market_value, 0) + ({adjustment_sql})
                   ELSE c.total_cash_units
                 END
           LIMIT 1
@@ -370,6 +401,7 @@ def _verify_external_canonical_tables(
 def _verify_cash(
     fills: list[dict[str, object]],
     cash: list[dict[str, object]],
+    *, account_opening: bool = False,
 ) -> None:
     trade_changes: dict[tuple[str, str], int] = {}
     asset_classes: dict[str, set[str]] = {}
@@ -390,7 +422,7 @@ def _verify_cash(
         previous: int | None = None
         opening: int | None = None
         for row in sorted(rows, key=lambda item: (_iso(item["valuation_time"]), str(item["snapshot_id"]))):
-            current_opening = _integer(row["opening_cash_units"], "cash.opening", minimum=1)
+            current_opening = _integer(row["opening_cash_units"], "cash.opening", minimum=0 if account_opening else 1)
             if opening is None:
                 opening = current_opening
                 previous = opening
@@ -463,6 +495,8 @@ def _verify_valuations(
     positions: list[dict[str, object]],
     cash: list[dict[str, object]],
     valuations: list[dict[str, object]],
+    *, account_adjustments: Mapping[str, int] | None = None,
+    credit_adjustments: Mapping[str, int] | None = None,
 ) -> None:
     cash_by_key = {_key(row, "portfolio_id", "snapshot_id"): row for row in cash}
     value_by_key: dict[tuple[str, str], int] = {}
@@ -481,8 +515,20 @@ def _verify_valuations(
         )):
             raise EvidenceContractError("canonical valuation 与 cash 身份不一致")
         expected = int(cash_row["total_cash_units"])
-        if row["valuation_model"] == "cash_plus_position_market_value":
+        if credit_adjustments is not None:
+            if row["valuation_model"] != "cash_plus_positions_and_credit_liabilities_v1":
+                raise EvidenceContractError("信用账户不能使用未扣信用负债的估值模型")
+            session = str(row["session"])[:10]
+            if session not in credit_adjustments or type(credit_adjustments[session]) is not int:
+                raise EvidenceContractError("信用净值缺少独立复核的权益与债务调整")
+            expected += value_by_key.get(key, 0) + credit_adjustments[session]
+        elif row["valuation_model"] == "cash_plus_position_market_value":
             expected += value_by_key.get(key, 0)
+        elif row["valuation_model"] == "cash_plus_positions_and_account_rights_v1":
+            session = str(row["session"])[:10]
+            if account_adjustments is None or session not in account_adjustments:
+                raise EvidenceContractError("账户净值缺少独立复核的权益与负债调整")
+            expected += value_by_key.get(key, 0) + account_adjustments[session]
         elif row["valuation_model"] != "futures_settlement_equity":
             raise EvidenceContractError("canonical valuation_model 不受支持")
         if int(row["nav_units"]) != expected:

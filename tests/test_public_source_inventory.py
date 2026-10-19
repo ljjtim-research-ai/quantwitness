@@ -18,6 +18,7 @@ from public_source_inventory import (  # noqa: E402
 )
 from release_allowlist import (  # noqa: E402
     PUBLIC_EXAMPLE_PROJECTS,
+    PUBLIC_INTEGRATION_FILES,
     package_file_paths,
     public_source_paths,
 )
@@ -34,6 +35,59 @@ def test_public_source_inventory_reuses_package_inventory() -> None:
         "THIRD_PARTY_NOTICES.md",
         ".github/CODEOWNERS.template",
         ".github/workflows/ci.yml",
+        ".github/ISSUE_TEMPLATE/bug_report.yml",
+        ".github/ISSUE_TEMPLATE/feature_request.yml",
+        ".github/pull_request_template.md",
+        "tools/verify_rdagent_install.py",
+        "integrations/rdagent/docs/installation.md",
+        "integrations/rdagent/MANIFEST.in",
+        ".github/workflows/publish.yml",
+        "tools/plan_version_release.py",
+        "tests/test_version_release_plan.py",
+        "docs/qlib-expressions.md",
+        "tests/test_qlib_sequence_windows.py",
+        "tests/test_qlib_gru_contract.py",
+        "tests/test_qlib_gru_integration.py",
+        "tests/test_qlib_lstm_contract.py",
+        "tests/test_qlib_lstm_integration.py",
+        "tests/test_qlib_transformer_contract.py",
+        "tests/test_qlib_transformer_integration.py",
+        "src/research_pipeline/research/modeling/generated.py",
+        "src/research_pipeline/research/modeling/generated_definition.py",
+        "src/research_pipeline/evidence/generated_model_validity.py",
+        "integrations/rdagent/src/quantwitness_rdagent/model_research.py",
+        "integrations/rdagent/src/quantwitness_rdagent/model_loop.py",
+        "integrations/rdagent/src/quantwitness_rdagent/native_model_research.py",
+        "integrations/rdagent/src/quantwitness_rdagent/model_research_evidence.py",
+        "integrations/rdagent/examples/model_research/prepare.py",
+        "integrations/rdagent/docs/model-research.md",
+        "examples/qlib_portfolio/extension/factor_baselines.py",
+        "examples/qlib_portfolio/extension/factor_baseline_oracle.py",
+        "project_extensions/qlib_portfolio_risk/optimizer.py",
+        "examples/qlib_risk/prepare.py",
+        "src/research_pipeline/research/modeling/gru.py",
+        "src/research_pipeline/research/modeling/inputs.py",
+        "src/research_pipeline/runtime/model_sequence.py",
+        "src/research_pipeline/evidence/model_sequence_validity.py",
+        "src/research_pipeline/packages/model_sequence_admission.py",
+        "tests/test_model_sequence_validity.py",
+        "tests/test_qlib_sequence_example.py",
+        "tests/test_qlib_rolling_horizons.py",
+        "tests/test_qlib_horizon_example.py",
+        "tests/test_qlib_horizon_group.py",
+        "tests/test_qlib_sequence_admission.py",
+        "src/research_pipeline/research/modeling/sequence.py",
+        "src/research_pipeline/evidence/sequence_validity.py",
+        "examples/qlib_portfolio/extension/expressions.py",
+        "examples/qlib_portfolio/horizons.py",
+        "integrations/rdagent/docs/factor-research.md",
+        "integrations/rdagent/examples/factor_research/prepare.py",
+        "integrations/rdagent/src/quantwitness_rdagent/native_research.py",
+        "integrations/rdagent/src/quantwitness_rdagent/native_backend.py",
+        "integrations/rdagent/src/quantwitness_rdagent/factor_loop.py",
+        "integrations/rdagent/src/quantwitness_rdagent/factor_research.py",
+        "integrations/rdagent/src/quantwitness_rdagent/research_knowledge.py",
+        "integrations/rdagent/src/quantwitness_rdagent/direction_selection.py",
     } <= public
     for project_name in PUBLIC_EXAMPLE_PROJECTS:
         prefix = f"examples/{project_name}/"
@@ -74,6 +128,30 @@ def test_public_source_export_copies_exact_inventory(tmp_path: Path) -> None:
     assert payload["status"] == "pass"
     assert tuple(payload["paths"]) == expected
     assert actual == expected
+
+
+def test_rdagent_public_source_contains_all_runtime_modules() -> None:
+    source = ROOT / "integrations/rdagent/src/quantwitness_rdagent"
+    modules = {path.relative_to(ROOT).as_posix() for path in source.rglob("*.py")}
+    assert modules <= set(PUBLIC_INTEGRATION_FILES)
+    assert "integrations/rdagent/docs/formula-reproduction.md" in PUBLIC_INTEGRATION_FILES
+    example = ROOT / "integrations/rdagent/examples/volume_concentration"
+    example_sources = {path.relative_to(ROOT).as_posix() for path in example.rglob("*")
+                       if path.is_file() and path.suffix in {".py", ".md", ".yaml"}}
+    assert example_sources <= set(PUBLIC_INTEGRATION_FILES)
+    assert "integrations/rdagent/src/quantwitness_rdagent/request_builder.py" in PUBLIC_INTEGRATION_FILES
+    for name in ("package_campaign", "prediction_campaign"):
+        example = ROOT / "integrations/rdagent/examples" / name
+        expected = {path.relative_to(ROOT).as_posix() for path in example.rglob("*")
+                    if path.is_file() and path.suffix in {".py", ".md", ".yaml"}}
+        assert expected <= set(PUBLIC_INTEGRATION_FILES)
+
+
+def test_public_qlib_example_sources_are_complete():
+    example = ROOT / "examples/qlib_portfolio"
+    expected = {path.relative_to(ROOT).as_posix() for path in example.rglob("*")
+                if path.is_file() and path.suffix in {".py", ".md", ".yaml"}}
+    assert expected <= set(public_source_paths(ROOT))
 
 
 def test_public_checkout_rejects_extra_tracked_file(tmp_path: Path) -> None:
@@ -127,3 +205,17 @@ def test_internal_project_references_are_rejected_in_public_documents() -> None:
     )
     assert _INTERNAL_REFERENCE.search("research_packages/references/study/")
     assert not _INTERNAL_REFERENCE.search("project_extensions/README.md")
+
+
+def test_public_test_helper_imports_are_included():
+    """发行测试不能引用未随公开源码交付的本仓库测试helper。"""
+    import ast
+    paths = set(public_source_paths(ROOT))
+    for relative in sorted(paths):
+        if not relative.startswith("tests/") or not relative.endswith(".py"):
+            continue
+        tree = ast.parse((ROOT / relative).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("test_"):
+                dependency = "tests/" + node.module.replace(".", "/") + ".py"
+                assert dependency in paths, (relative, dependency)

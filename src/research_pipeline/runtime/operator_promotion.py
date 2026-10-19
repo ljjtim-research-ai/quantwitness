@@ -41,20 +41,19 @@ BUILTIN_ARTIFACT_TYPE_IDENTITIES = frozenset({
     "research.minute-simulation.v1",
     "research.minute-statistics.v1",
     "research.minute-targets.v1",
-    "research.model-fits.v1",
-    "research.model-fold-metrics.v1",
-    "research.model-locked-holdout.v1",
-    "research.model-preprocessed-folds.v1",
-    "research.model-selection.v1",
-    "research.model-split-manifest.v1",
-    "research.model-validation-predictions.v1",
+    "research.model-fits.v2",
+    "research.model-fold-metrics.v2",
+    "research.model-locked-holdout.v2",
+    "research.model-selection.v2",
+    "research.model-split-manifest.v2",
+    "research.model-validation-predictions.v2",
     "research.validity-facts.v1",
 })
 
 
 # 公共定义集合经审查固定；有意修改实现需同步复核本常量。
 BUILTIN_OPERATOR_DEFINITION_SET_HASH = (
-    "8a69f5105d675f1a6b622ddd2a638d103908c28b567fd3a17e5ee23ebbcee77f"
+    "ef8b60cdf66d0c38e18ac71e45098707fe2f6009fb3a3ebdef59ad6518ce4d0e"
 )
 
 
@@ -123,44 +122,38 @@ BUILTIN_OPERATOR_IDENTITIES: frozenset[OperatorIdentity] = frozenset(
         ),
         (
             "research.model.fit",
-            "1.0.0",
-            "research.model.fit.v1",
+            "2.0.0",
+            "research.model.fit.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.fold-metrics",
-            "1.0.0",
-            "research.model.fold-metrics.v1",
+            "2.0.0",
+            "research.model.fold-metrics.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.locked-holdout",
-            "1.0.0",
-            "research.model.locked-holdout.v1",
+            "2.0.0",
+            "research.model.locked-holdout.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.predict",
-            "1.0.0",
-            "research.model.predict.v1",
-            "research_pipeline.runtime.walk_forward_model_execution",
-        ),
-        (
-            "research.model.preprocess-fit",
-            "1.0.0",
-            "research.model.preprocess-fit.v1",
+            "2.0.0",
+            "research.model.predict.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.selection",
-            "1.0.0",
-            "research.model.selection.v1",
+            "2.0.0",
+            "research.model.selection.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.split-manifest",
-            "1.0.0",
-            "research.model.split-manifest.v1",
+            "2.0.0",
+            "research.model.split-manifest.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
@@ -222,8 +215,37 @@ LEGACY_OPERATOR_DEFINITION_HASHES: Mapping[OperatorIdentity, str] = MappingProxy
     {}
 )
 
-# 新增公共业务算子只能在这里持有已批准的 OperatorPromotionReview；当前没有。
+# 通用晋级记录与一次性的 local_only 人工准入分别保存。
 MAINLINE_OPERATOR_PROMOTION_REVIEWS: tuple[OperatorPromotionReview, ...] = ()
+
+DAILY_CASH_LOCAL_APPROVAL = MappingProxyType({
+    "operator_identity": (
+        "finance.simulation.daily-cash", "1.0.0",
+        "finance.simulation.daily-cash.v1",
+        "research_pipeline.runtime.qlib_portfolio_execution",
+    ),
+    "definition_hash": "1bf79376276192d456979dd5d8c26e1fe7b96eb69dba2ab752867b44b51b018c",
+    "approved_at": "2026-10-03",
+    "approval_ref": "release/daily-cash-local-admission.md",
+    "maximum_state": "local_only",
+    "heterogeneous_reuse_confirmed": False,
+})
+
+
+SHARED_FUTURES_LOCAL_DEFINITION_HASHES = MappingProxyType({'daily': '5baa3ed25343f700d55847c32522ead13baac162ecbccec4992af28a53c32281', 'intraday': 'd61ac1e53073cc92e726a834c29f423e46fac54038b51f92f5a8f57431e206c1'})
+
+SHARED_FUTURES_LOCAL_APPROVALS = tuple(MappingProxyType({
+    "operator_identity": (
+        f"finance.simulation.shared-futures.{frequency}", "1.0.0",
+        f"finance.simulation.shared-futures.{frequency}.v1",
+        "research_pipeline.simulation.shared_futures",
+    ),
+    "definition_hash": SHARED_FUTURES_LOCAL_DEFINITION_HASHES[frequency],
+    "approved_at": "2026-10-09",
+    "approval_ref": "release/shared-futures-local-admission.md",
+    "maximum_state": "local_only",
+    "heterogeneous_reuse_confirmed": False,
+}) for frequency in ("daily", "intraday"))
 
 
 def operator_identity(definition: OperatorDefinition) -> OperatorIdentity:
@@ -246,6 +268,28 @@ def operator_mainline_governance(
         return {
             "mainline_classification": BUILTIN_CLASSIFICATION,
             "promotion_status": "not_required",
+        }
+    if identity == DAILY_CASH_LOCAL_APPROVAL["operator_identity"]:
+        if definition.definition_hash != DAILY_CASH_LOCAL_APPROVAL["definition_hash"]:
+            raise ExtensionError("日频现金 local_only 人工准入定义已漂移，需重新评审")
+        return {
+            "mainline_classification": "local_only",
+            "promotion_status": "approved_local_only",
+            "maximum_state": "local_only",
+            "approval_ref": DAILY_CASH_LOCAL_APPROVAL["approval_ref"],
+            "heterogeneous_reuse_confirmed": False,
+        }
+    approval = next((item for item in SHARED_FUTURES_LOCAL_APPROVALS
+                     if item["operator_identity"] == identity), None)
+    if approval is not None:
+        if definition.definition_hash != approval["definition_hash"]:
+            raise ExtensionError("共享期货 local_only 人工准入定义已漂移，需重新评审")
+        return {
+            "mainline_classification": "local_only",
+            "promotion_status": "approved_local_only",
+            "maximum_state": "local_only",
+            "approval_ref": approval["approval_ref"],
+            "heterogeneous_reuse_confirmed": False,
         }
     disposition = LEGACY_OPERATOR_DISPOSITIONS.get(identity)
     if disposition is not None:

@@ -8,84 +8,19 @@ from decimal import Decimal, InvalidOperation
 from typing import Mapping, Sequence
 from zoneinfo import ZoneInfo
 
-from research_pipeline.domain import CorporateAction, MarketRuleSnapshot, Price
-from research_pipeline.domain.time import require_aware_datetime
-from research_pipeline.domain.trading import InstrumentKey, instrument_key_from_legacy
-from research_pipeline.platform import typed_canonical_hash
+from research_pipeline.domain import CorporateAction, Price
 
 from .events import FinancialEvent
 from .ledger import SpotLedgerState, reduce_spot
 from .orders import Order, SimulationContractError
-from .corporate_actions import compile_corporate_action
+from .corporate_actions import CorporateActionRecordPosition, compile_corporate_action
+from .costs import cash_price_amount_units
+from .market_rules import CashMarketPolicy
+from .matching import match_cash_order
+from .execution_market import OpeningSnapshot
 
 
 _CASH_DAILY_TIMEZONE = ZoneInfo("Asia/Shanghai")
-
-
-@dataclass(frozen=True)
-class CashMarketPolicy:
-    market: str
-    rule: MarketRuleSnapshot
-    lot_size: int
-    settlement_days: int
-    commission_ppm: int
-    min_commission_units: int
-    sell_tax_ppm: int
-    transfer_fee_ppm: int
-    slippage_units_per_share: int = 0
-    cash_shortage_policy: str = "reject_v1"
-
-    def __post_init__(self) -> None:
-        if self.market not in {"cn_stock", "cn_etf"}:
-            raise SimulationContractError("现货 policy market 无效")
-        if self.lot_size < 1 or self.settlement_days not in {0, 1}:
-            raise SimulationContractError("lot/settlement policy 无效")
-        if min(self.commission_ppm, self.min_commission_units, self.sell_tax_ppm, self.transfer_fee_ppm) < 0:
-            raise SimulationContractError("费用 policy 不能为负")
-        if self.slippage_units_per_share < 0:
-            raise SimulationContractError("每股滑点不能为负")
-        if self.cash_shortage_policy not in {"reject_v1", "clip_current_lot_continue_v1"}:
-            raise SimulationContractError("现金不足 policy 无效")
-
-    @property
-    def policy_hash(self) -> str:
-        return typed_canonical_hash(self.to_dict())
-
-    def to_dict(self) -> dict[str, object]:
-        return {
-            "market": self.market,
-            "rule_hash": self.rule.content_hash,
-            "lot_size": self.lot_size,
-            "settlement_days": self.settlement_days,
-            "commission_ppm": self.commission_ppm,
-            "min_commission_units": self.min_commission_units,
-            "sell_tax_ppm": self.sell_tax_ppm,
-            "transfer_fee_ppm": self.transfer_fee_ppm,
-            "slippage_units_per_share": self.slippage_units_per_share,
-            "cash_shortage_policy": self.cash_shortage_policy,
-        }
-
-
-@dataclass(frozen=True)
-class OpeningSnapshot:
-    instrument_hash: str
-    open_price: Price
-    high_limit: Price
-    low_limit: Price
-    paused: bool
-    visible_capacity: int
-    available_time: datetime
-    adjustment: str = "none"
-
-    def __post_init__(self) -> None:
-        require_aware_datetime(self.available_time, "available_time")
-        if self.visible_capacity < 0:
-            raise SimulationContractError("visible_capacity 不能为负")
-        if self.adjustment != "none":
-            raise SimulationContractError("成交必须使用未复权价格")
-        identities = {(item.scale, item.currency) for item in (self.open_price, self.high_limit, self.low_limit)}
-        if len(identities) != 1:
-            raise SimulationContractError("开盘和涨跌停价格精度/币种不一致")
 
 
 @dataclass(frozen=True)
@@ -110,62 +45,26 @@ def execute_cash_order(
     snapshot: OpeningSnapshot,
     state: SpotLedgerState,
     execution_at: datetime | None = None,
+    cash_scale: int | None = None,
 ) -> CashExecutionResult:
-    order_market = getattr(order.instrument, "asset_class", None) or getattr(
-        order.instrument,
-        "market",
-        None,
+    candidate = match_cash_order(
+        order, policy=policy, snapshot=snapshot, state=state,
+        execution_at=execution_at, cash_scale=cash_scale,
     )
-    if order_market != policy.market or state.group.market != policy.market:
-        raise SimulationContractError("订单、policy 与 execution group 市场不一致")
-    if order.instrument.currency != state.group.currency:
-        raise SimulationContractError("订单、execution group 币种不一致")
-    if state.group.currency != snapshot.open_price.currency:
-        raise SimulationContractError("订单组与价格币种不一致")
+    if candidate.filled_quantity == 0:
+        return CashExecutionResult(state, (), 0, candidate.reason_code, policy.rule.content_hash)
+    execution_price = candidate.execution_price
+    filled = candidate.filled_quantity
+    notional_units = candidate.notional_units
+    fee = candidate.fee_units
     fill_time = order.submitted_at if execution_at is None else execution_at
-    if fill_time < order.submitted_at:
-        raise SimulationContractError("execution_at 早于订单提交")
-    if snapshot.available_time > fill_time:
-        raise SimulationContractError("开盘快照在成交时尚不可见")
-    execution_price = _execution_price(order.side, snapshot.open_price, policy)
-    reason = _reject_reason(order, policy, snapshot, state, execution_price)
-    if reason is not None:
-        return CashExecutionResult(state, (), 0, reason, policy.rule.content_hash)
-    capacity = min(order.quantity, snapshot.visible_capacity)
-    filled = capacity // policy.lot_size * policy.lot_size
-    if (order.side == "sell" and order.quantity % policy.lot_size
-            and _sell_remainder_allowed(order, policy)):
-        sellable = next((item.sellable for item in state.positions if item.instrument_hash == snapshot.instrument_hash), 0)
-        remainder = sellable % policy.lot_size
-        # 一次成交可以带走全部零股；容量不足时只成交整手，不能拆分余额。
-        if remainder and capacity >= remainder:
-            filled = max(filled, (capacity - remainder) // policy.lot_size * policy.lot_size + remainder)
-    if filled <= 0:
-        return CashExecutionResult(state, (), 0, "capacity_exceeded", policy.rule.content_hash)
-    if order.side == "buy":
-        requested_cost = execution_price.notional(filled).units
-        requested_cost += _fee_units(policy, "buy", requested_cost)
-        if requested_cost > state.available_cash_units:
-            if policy.cash_shortage_policy == "reject_v1":
-                return CashExecutionResult(state, (), 0, "insufficient_cash", policy.rule.content_hash)
-            filled = _max_affordable_quantity(
-                available_cash_units=state.available_cash_units,
-                requested=filled,
-                lot_size=policy.lot_size,
-                price=execution_price,
-                policy=policy,
-            )
-            if filled <= 0:
-                return CashExecutionResult(state, (), 0, "insufficient_cash", policy.rule.content_hash)
-    notional = execution_price.notional(filled)
-    fee = _fee_units(policy, order.side, notional.units)
     events: list[FinancialEvent] = []
     base = {"effective_time": fill_time, "session": fill_time.date().isoformat(), "group_id": state.group.group_id, "rule_hash": policy.rule.content_hash, "parent_id": order.order_id}
     if order.side == "buy":
-        events.append(FinancialEvent(f"{order.order_id}:reserve", "cash_reserved", payload=(("cash_units", notional.units + fee),), **base))
+        events.append(FinancialEvent(f"{order.order_id}:reserve", "cash_reserved", payload=(("cash_units", notional_units + fee),), **base))
     else:
         events.append(FinancialEvent(f"{order.order_id}:reserve", "position_reserved", payload=(("instrument_hash", snapshot.instrument_hash), ("quantity", filled)), **base))
-    events.append(FinancialEvent(f"{order.order_id}:fill", "fill", payload=tuple(sorted({"fee_units": fee, "instrument_hash": snapshot.instrument_hash, "notional_units": notional.units, "quantity": filled, "side": order.side}.items())), **base))
+    events.append(FinancialEvent(f"{order.order_id}:fill", "fill", payload=tuple(sorted({"fee_units": fee, "instrument_hash": snapshot.instrument_hash, "notional_units": notional_units, "quantity": filled, "side": order.side, **({"execution_price_units": execution_price.units, "price_scale": execution_price.scale} if cash_scale is not None else {})}.items())), **base))
     if order.side == "buy" and policy.settlement_days == 0:
         events.append(FinancialEvent(f"{order.order_id}:settle", "settlement", payload=(("cash_units", 0), ("instrument_hash", snapshot.instrument_hash), ("quantity", filled)), **base))
     current = state
@@ -179,6 +78,9 @@ def settle_cash_daily_open(
     *,
     effective_time: datetime,
     rule_hash: str,
+    protected_quantities: Mapping[str, int] | None = None,
+    managed_receivables: frozenset[str] = frozenset(),
+    managed_position_entitlements: frozenset[str] = frozenset(),
 ) -> tuple[SpotLedgerState, tuple[FinancialEvent, ...]]:
     """结算上一交易会话的现金、普通持仓和到期公司行动权益。"""
 
@@ -209,6 +111,8 @@ def settle_cash_daily_open(
         )
         if trade_unsettled < 0:
             raise SimulationContractError("待上市权益超过未结算持仓")
+        if protected_quantities is not None:
+            trade_unsettled = max(0, trade_unsettled - protected_quantities.get(lot.instrument_hash, 0))
         if trade_unsettled:
             events.append(FinancialEvent(
                 f"settle-{session}-{lot.instrument_hash}",
@@ -221,7 +125,7 @@ def settle_cash_daily_open(
                 **base,
             ))
     for receivable in state.cash_receivables:
-        if receivable.due_date <= effective_time.date():
+        if receivable.due_date <= effective_time.date() and receivable.receivable_id not in managed_receivables:
             events.append(FinancialEvent(
                 f"settle-{session}-{receivable.receivable_id}",
                 "settlement",
@@ -233,7 +137,7 @@ def settle_cash_daily_open(
                 **base,
             ))
     for entitlement in state.position_entitlements:
-        if entitlement.due_date <= effective_time.date():
+        if entitlement.due_date <= effective_time.date() and entitlement.entitlement_id not in managed_position_entitlements:
             events.append(FinancialEvent(
                 f"settle-{session}-{entitlement.entitlement_id}",
                 "settlement",
@@ -256,6 +160,7 @@ def apply_cash_corporate_actions(
     *,
     effective_time: datetime,
     rule_hash: str,
+    record_positions: Mapping[tuple[str, date], CorporateActionRecordPosition] | None = None,
 ) -> tuple[SpotLedgerState, tuple[FinancialEvent, ...]]:
     """只应用生效且在当时已经可见的公司行动。"""
 
@@ -274,14 +179,22 @@ def apply_cash_corporate_actions(
             ),
             0,
         )
-        if held <= 0:
+        if held <= 0 and action.contract_version == 1:
             continue
+        lot = next((item for item in current.positions if item.instrument_hash == action.instrument_hash), None)
+        if action.contract_version == 2 and action.kind in {"split", "reverse_split"} and any(
+            item.instrument_hash == action.instrument_hash for item in current.position_entitlements
+        ):
+            raise SimulationContractError("拆并股前尚有未结算公司行动权益，缺少承接依据")
         compiled = compile_corporate_action(
             action,
             held_quantity=held,
             effective_time=effective_time,
             group_id=current.group.group_id,
             rule_hash=rule_hash,
+            record_position=(record_positions or {}).get((action.instrument_hash, action.record_date)),
+            position_buckets={name: 0 if lot is None else getattr(lot, name)
+                              for name in ("sellable", "unsettled", "frozen")},
         )
         for event in compiled:
             current = reduce_spot(current, event)
@@ -291,19 +204,19 @@ def apply_cash_corporate_actions(
 
 def cash_daily_nav_units(
     state: SpotLedgerState,
-    price_units_by_instrument: Mapping[str, int],
+    price_by_instrument: Mapping[str, Price],
 ) -> int:
     """以显式未复权价格计算日频现货账户净值。"""
 
-    values = state.total_cash_units
+    values = state.total_cash_units - state.payable_tax_units
     for lot in state.positions:
+        if lot.sellable + lot.unsettled + lot.frozen == 0:
+            continue
         try:
-            price_units = price_units_by_instrument[lot.instrument_hash]
+            price = price_by_instrument[lot.instrument_hash]
         except KeyError as exc:
             raise SimulationContractError("日频估值缺少持仓价格") from exc
-        if type(price_units) is not int or price_units < 0:
-            raise SimulationContractError("日频估值价格必须是非负整数单位")
-        values += (lot.sellable + lot.unsettled + lot.frozen) * price_units
+        values += cash_price_amount_units(price, lot.sellable + lot.unsettled + lot.frozen, cash_scale=2)
     return values
 
 
@@ -326,7 +239,7 @@ def cash_target_quantity(
     *,
     nav_units: int,
     target_weight: object,
-    price_units: int,
+    price: Price,
     lot_size: int,
 ) -> int:
     """用同一整数手数规则把权重目标转换为股数/份额。"""
@@ -338,8 +251,7 @@ def cash_target_quantity(
     if (
         type(nav_units) is not int
         or nav_units < 0
-        or type(price_units) is not int
-        or price_units <= 0
+        or not isinstance(price, Price)
         or type(lot_size) is not int
         or lot_size <= 0
         or not weight.is_finite()
@@ -347,7 +259,7 @@ def cash_target_quantity(
         or weight > 1
     ):
         raise SimulationContractError("现金目标数量参数无效")
-    quantity = int(Decimal(nav_units) * weight / Decimal(price_units))
+    quantity = int(Decimal(nav_units).scaleb(-2) * weight / price.decimal)
     return quantity // lot_size * lot_size
 
 
@@ -375,81 +287,6 @@ def cash_rebalance_deltas(
         if desired.get(code, 0) > current.get(code, 0)
     )
     return tuple(sorted(rows, key=lambda item: (item[1] != "sell", item[0])))
-
-
-def _sell_remainder_allowed(order: Order, policy: CashMarketPolicy) -> bool:
-    """使用显式历史规则，或沪深交易所自 2006 年交易规则明确的整手零股政策。"""
-    declared = dict(policy.rule.parameters).get("sell_remainder_allowed")
-    if declared is not None:
-        return declared is True
-    return (
-        (order.instrument if isinstance(order.instrument, InstrumentKey) else instrument_key_from_legacy(order.instrument)).venue in {"XSHG", "XSHE"}
-        and policy.lot_size == 100
-        and order.submitted_at.date() >= date(2006, 7, 1)
-    )
-
-
-def _reject_reason(order: Order, policy: CashMarketPolicy, snapshot: OpeningSnapshot, state: SpotLedgerState, execution_price: Price) -> str | None:
-    remainder = order.quantity % policy.lot_size
-    if remainder:
-        sellable = next((item.sellable for item in state.positions if item.instrument_hash == snapshot.instrument_hash), 0)
-        if order.side != "sell" or not _sell_remainder_allowed(order, policy) or remainder != sellable % policy.lot_size:
-            return "invalid_lot"
-    if snapshot.paused:
-        return "suspended"
-    if order.side == "buy" and execution_price.units >= snapshot.high_limit.units:
-        return "limit_up_buy_blocked"
-    if order.side == "sell" and execution_price.units <= snapshot.low_limit.units:
-        return "limit_down_sell_blocked"
-    if order.limit_price is not None:
-        if order.side == "buy" and execution_price.units > order.limit_price.units:
-            return "limit_price_not_reached"
-        if order.side == "sell" and execution_price.units < order.limit_price.units:
-            return "limit_price_not_reached"
-    if order.side == "sell":
-        sellable = next((item.sellable for item in state.positions if item.instrument_hash == snapshot.instrument_hash), 0)
-        if sellable < order.quantity:
-            return "t1_sell_blocked" if policy.settlement_days == 1 else "insufficient_position"
-    return None
-
-
-def _execution_price(side: str, reference: Price, policy: CashMarketPolicy) -> Price:
-    direction = 1 if side == "buy" else -1
-    units = reference.units + direction * policy.slippage_units_per_share
-    if units <= 0:
-        raise SimulationContractError("滑点后的成交价格必须为正")
-    return Price(units, reference.scale, reference.currency)
-
-
-def _max_affordable_quantity(
-    *,
-    available_cash_units: int,
-    requested: int,
-    lot_size: int,
-    price: Price,
-    policy: CashMarketPolicy,
-) -> int:
-    low, high = 0, requested // lot_size
-    while low < high:
-        middle = (low + high + 1) // 2
-        quantity = middle * lot_size
-        notional = price.notional(quantity).units
-        if notional + _fee_units(policy, "buy", notional) <= available_cash_units:
-            low = middle
-        else:
-            high = middle - 1
-    return low * lot_size
-
-
-def _fee_units(policy: CashMarketPolicy, side: str, notional_units: int) -> int:
-    commission = max(policy.min_commission_units, _ceil_ratio(notional_units * policy.commission_ppm, 1_000_000))
-    transfer = _ceil_ratio(notional_units * policy.transfer_fee_ppm, 1_000_000)
-    tax = _ceil_ratio(notional_units * policy.sell_tax_ppm, 1_000_000) if side == "sell" else 0
-    return commission + transfer + tax
-
-
-def _ceil_ratio(numerator: int, denominator: int) -> int:
-    return (numerator + denominator - 1) // denominator
 
 
 __all__ = [

@@ -68,6 +68,11 @@ def _build_minute_scan_plan_for_request(
         allowed_root=_minute_root(context),
         budget=budget,
     )
+    archived = _environment(context).manifest.get("input_snapshot_manifest")
+    if archived is not None:
+        from research_pipeline.data_plane.archived_inputs import validate_archived_minute_scan
+
+        validate_archived_minute_scan(archived, request_id, plan, _minute_root(context))
     if plan.query_max_rows > int(parameters["max_returned_rows"]):
         raise ValueError("分钟 QueryIR 返回行预算超过算子声明")
     if plan.minute_capability_manifest_hash != parameters["scope_binding_hash"]:
@@ -579,6 +584,7 @@ def _commit_partitioned_minute_rows(
 
 
 _MINUTE_ADJUSTMENT_CONTEXT_KEYS = (
+    "financial_corporate_actions",
     "adjustment_snapshot_identity_hash",
     "adjustment_candidates",
     "adjustment_effective_times",

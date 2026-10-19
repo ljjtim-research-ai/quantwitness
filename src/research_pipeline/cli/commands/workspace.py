@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from research_pipeline.workspace import (
     WorkspaceError,
     allocate_execution,
@@ -23,11 +25,18 @@ def execute(args) -> int:
 
 def _execute(args) -> dict[str, object]:
     if args.workspace_command == "init":
+        parameters = {}
+        for assignment in getattr(args, "parameter", []):
+            key, separator, value = assignment.partition("=")
+            if not separator or key in parameters:
+                raise WorkspaceError("--parameter 使用不重复的 NODE.PARAM=JSON")
+            parameters[key] = json.loads(value)
         config = initialize_workspace(
             args.root,
             workspace_id=args.workspace_id,
             allow_existing=args.allow_existing,
             from_package=getattr(args, "from_package", None),
+            parameters=parameters,
         )
         return {"workspace_id": config.workspace_id, "root": str(config.root), "status": "initialized"}
     if args.workspace_command == "execute":
@@ -78,6 +87,7 @@ def _execute(args) -> dict[str, object]:
             resource_timeout_seconds=args.resource_timeout_seconds,
             resource_stale_seconds=args.resource_stale_seconds,
             source_db=source_dbs,
+            input_snapshot_manifest=getattr(args, "input_snapshot_manifest", None),
             minute_data_root=args.minute_data_root,
             reuse_run_root=args.reuse_run_root,
             require_reused_node=args.require_reused_node,

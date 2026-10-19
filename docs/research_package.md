@@ -1,4 +1,10 @@
-# ResearchPackage
+# 研究包：把研究问题写成可执行说明
+
+ResearchPackage 可以理解成一份实验配方：研究什么、用哪些数据、按什么步骤计算、如何评价以及需要什么输出。它把这些约定放在四份 YAML 文件中，方便检查、复用和交给别人继续研究。
+
+自动创建的草稿仍需要填写。下面说明文件布局和必须明确的内容。
+
+## 参数与行为说明
 
 ResearchPackage 是研究意图的唯一声明入口。它包含四个文件：
 
@@ -59,6 +65,8 @@ python -m research_pipeline package lint --package <package目录> --json
 ```
 
 完整包的 lint 一次完成不需要数据库的纯检查：严格 schema、QueryIR、typed ports、DAG 无环、参数、ResultSpec、指标可达性、来源和 OperatorDefinition 已声明的资源预算。输出 `execution_ready=false`，并给出缺失项和下一条 admit 命令；草稿 lint 以 `issues` 一次报告独立可判断的缺口，包含 code、file、field、message、action；YAML 解析失败不伪造依赖检查结果。诊断不产生半完整研究包，也不授予执行资格。
+
+同一次包处理复用四份 YAML 的解析内容，lint、严格加载、编译准备和准入仍分别执行各自的检查。下一次命令重新读取文件；参数变体和来源导入修改声明后重新加载。返回的研究声明保持不可变，不会被其他阶段改写。
 
 ## admit
 

@@ -22,7 +22,7 @@ def build_data_event_daily_operator_definitions() -> tuple[OperatorDefinition, .
                 _parameter("execution_estimates_hash", ParameterType.STRING),
             ),
             resource_profile={
-                "memory_bytes": 256 * _MIB,
+                "memory_bytes": _GIB,
                 "cpu_slots": 1,
                 "temp_bytes": 64 * _MIB,
                 "wall_seconds": 300,
@@ -50,6 +50,10 @@ def build_data_event_daily_operator_definitions() -> tuple[OperatorDefinition, .
             module_name="research_pipeline.data_plane.service",
             symbol_name="materialize_dataset_plan",
             implementation_scope="core",
+            dependency_modules=(
+                "research_pipeline.data_plane.snapshots",
+                "research_pipeline.data_plane.snapshot_layout",
+            ),
         ),
         _definition(
             "research.validity.data-observation",
@@ -58,7 +62,7 @@ def build_data_event_daily_operator_definitions() -> tuple[OperatorDefinition, .
             outputs=(("validity", "research.validity-facts.v1"),),
             parameters=(),
             resource_profile={
-                "memory_bytes": 256 * _MIB,
+                "memory_bytes": _GIB,
                 "cpu_slots": 1,
                 "temp_bytes": 256 * _MIB,
                 "wall_seconds": 300,
