@@ -63,6 +63,7 @@ where = ["src"]
   "session_policies/*.json",
   "rule_snapshots/minute_reference_rules.json",
   "rule_snapshots/minute_reference_rules.v5.json",
+  "rule_snapshots/minute_reference_rules.v6.json",
 ]
 "research_pipeline.evidence" = ["result_dispositions.v1.json", "financial_oracle/README.md"]
 
