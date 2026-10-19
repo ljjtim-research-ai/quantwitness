@@ -275,6 +275,7 @@ PUBLIC_TEST_FILES = (
     "tests/test_gate_c_evidence.py",
     "tests/test_generic_lifecycle.py",
     "tests/test_result_bundle.py",
+    "tests/archived_observation_support.py",
     "tests/test_financial_checkpoint_recovery.py",
     "tests/test_financial_values.py",
     "tests/test_cn_stock_simulation.py",

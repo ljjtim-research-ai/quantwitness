@@ -36,7 +36,7 @@ def execute(root, stage, mode="model", reuse_failed_run_root=None, require_reuse
         args=["run","--plan",str(root/"plan"),"--input-snapshot-manifest",bundle["input_snapshot_manifest"],
             "--artifact-root",str(root/"artifacts"),"--run-root",str(root/"run"),
             "--result-store",str(root/"results"),"--clock",bundle["fixed_clock"],"--root-seed",str(SEED),"--workers","1",
-            "--resource-memory-bytes",str(12*1024**3),"--resource-cpu-slots","4","--resource-process-slots","8",
+            "--resource-memory-bytes",str(16*1024**3),"--resource-cpu-slots","4","--resource-process-slots","10",
             "--resource-scratch-bytes",str(64*1024**3),"--resource-timeout-seconds","300","--resource-state-dir",str(Path(resource_state_dir).resolve() if resource_state_dir else root/"resources"),"--json"]
         if reuse_failed_run_root:
             args.extend(["--reuse-failed-run-root", str(reuse_failed_run_root)])

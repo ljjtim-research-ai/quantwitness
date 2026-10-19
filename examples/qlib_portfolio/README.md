@@ -23,6 +23,8 @@ python examples/qlib_portfolio/run.py --mode model --sequence-step-len 3 --outpu
 
 窗口长度至少为2，必须同时满足日历、完整特征和可见时间要求。两个候选共用合格末端；原始Feature、Label及context、targets、members、exclusions随Result封存并独立核对。示例GRU、LSTM和Transformer使用CPU、单样本批次、两轮训练和原始收益标签，适合验证流程；模型参数可在准备阶段生成的研究包中按完整合同声明。序列选项当前仅支持`development`和`model`，不支持`portfolio`。通用序列模型合同见[序列模型说明](../../docs/walk_forward_model.md#序列模型与完整窗口)。
 
+示例串行运行显式声明16 GiB内存、4个CPU槽、10个进程槽和64 GiB临时空间，覆盖当前模型节点的准入预算；声明上限不代表实际占用。
+
 输出目录必须未使用且位于源码仓库外。准备、准入和运行结果分别保存在同一目录的`package/`、`plan/`、`run/`与`results/`；正式独立验证写入`verification.json`，报告写入`report.md`。只查看命令退出码不足以判断研究完成，必须检查Result finalized和VerificationResult的`status=pass`。
 
 可用`--stage prepare|lint|admit|run|resume|verify|report`分阶段执行。恢复使用原目录与原冻结声明。`run`阶段也支持`--reuse-failed-run-root`与重复的`--require-reused-node`，在修改下游声明后要求已成功节点及上游严格复用；涉及最终holdout时必须显式要求复用`model_holdout`，不能把已消费的最终评价重新执行。同一次执行继续使用原输出目录；同一研究问题的全部变体还必须复用相同的研究系列ID、持久根目录和问题说明。系列声明不能在resume、verify或其他继续阶段重新提供。

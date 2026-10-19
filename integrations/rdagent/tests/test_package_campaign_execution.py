@@ -14,7 +14,7 @@ def published(tmp_path, monkeypatch):
     from research_pipeline.application import workspace_flow, research_package, evidence_lifecycle
     import research_pipeline.evidence as evidence
     from test_result_bundle import _finalize
-    from test_archived_inputs import build_archived_observation_fixture
+    from archived_observation_support import build_archived_observation_fixture
     paths = build_archived_observation_fixture(tmp_path / "fixture")
     root = tmp_path / "candidate"
     package = Path(__file__).resolve().parents[3] / "examples/equity_cross_section/package"
@@ -163,7 +163,7 @@ def test_verification_memory_bytes_is_forwarded_to_verify(published, monkeypatch
     assert verify.verification_memory_bytes == 4 * 1024 ** 3
 
 def test_real_isolated_rd_package_uses_workspace_flow(tmp_path):
-    from test_archived_inputs import build_archived_observation_fixture
+    from archived_observation_support import build_archived_observation_fixture
     from quantwitness_rdagent.package_execution import execute_package
     paths = build_archived_observation_fixture(tmp_path / "fixture")
     root = tmp_path / "candidate"
