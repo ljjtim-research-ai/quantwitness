@@ -144,7 +144,6 @@ def test_minimum_supported_python_installs_test_extras_and_runs_smoke(minimum_in
     for name in (
         "test_runtime_checkpoint.py",
         "test_simulation_semantics.py",
-        "validity_facts_support.py",
     ):
         shutil.copyfile(ROOT / "tests" / name, smoke / name)
     for _, python, _, environment, directory in installs:
@@ -161,6 +160,13 @@ def test_release_build_has_no_setup_or_handwritten_metadata_source():
     for field in ("Metadata-Version:", "Requires-Python:", "Requires-Dist:", "[console_scripts]"):
         assert field not in source
     assert '"setup.py"' not in source
+
+
+def test_runtime_version_matches_distribution_version():
+    from research_pipeline import __version__
+
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert __version__ == project["project"]["version"]
 
 
 @pytest.mark.parametrize("field,replacement", [

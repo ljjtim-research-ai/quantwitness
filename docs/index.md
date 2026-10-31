@@ -1,63 +1,71 @@
-# research_pipeline 现行文档
+# 文档导航
 
-本索引只列当前主链的操作资料。未列出的 Markdown 可以作为历史或专项研究材料保留，但不构成当前命令、能力或准入依据。
+研究主链是声明 → 准备与准入 → 执行 → Result → 报告或开发反馈。普通 Workspace execute 完成一次准备与准入，独立 package lint 用于主动诊断。
 
-项目扩展的多文件流式 ABI、输出/state writer、`causal_plan` 正式 Feature/Label 用法与
-当前不支持的时间来源见[项目扩展合同](../project_extensions/README.md)。
+## 开始研究
 
-- [框架合同](framework-contracts.md)：完整流程、数据与金融口径、校验职责、扩展与恢复边界
-- [Workspace 合成研究入门](workspace-quickstart.md)：源码获取、首份验证报告、失败诊断、恢复与变体比较
-- [创建自己的研究](getting-started.md)：填写 ResearchPackage 并接入自有数据
-- [AI 工作协议](ai_workflow.md)
-- [架构与边界](architecture.md)
-- [Catalog 与 PIT 准入](catalog.md)
-- [列式数据平面](data_plane.md)
-- [ResearchPackage](research_package.md)
-- [Runtime 与恢复](runtime.md)
-- [滚动模型与样本外选择](walk_forward_model.md)
-- [项目执行与独立复核资源预算](project_resource_budgets.md)
-- [Result 与 VerificationResult](evidence.md)：金融口径、准确性与验证边界
-- [命令行](cli.md)
-- [运维](operations.md)
-- [安装与发布构建](release.md)
-- [分钟参考规则来源边界](minute_rule_provenance.md)
+1. [第一项合成研究](workspace-quickstart.md)：准备输入、执行、报告、参数变体与恢复。
+2. [创建自己的研究](getting-started.md)：问题、样本、数据可见性、算法与指标。
+3. [基本数据接入](catalog.md)：字段、物理来源、Catalog Lock 和可见日期。
+4. [Result 与研究结论](evidence.md)：正式输出、声明限制、直接报告、比较与导出。
+5. [LEAN 首次回测](../examples/lean_quickstart/README.md)：Windows 独立安装、合成日线与一分钟、正式结果与报告。
 
-仓库根目录的 [架构边界](../ARCHITECTURE.md)、[项目扩展](../EXTENSIONS.md)、
-[参与贡献](../CONTRIBUTING.md)、[安全报告](../SECURITY.md)、
-[第三方材料边界](../THIRD_PARTY_NOTICES.md) 和 [Apache License 2.0](../LICENSE)
-共同定义公开项目的代码、协作与分发边界。
+## AI 研究
 
-## 当前流程
+[AI 研究指南](ai_workflow.md)说明人的决定、提案器和正式执行的职责。
 
-```text
-capabilities / operator / artifact / recipe / catalog 发现
-  → package init
-  → package lint
-  → package admit
-  → run / inspect / resume / retry-node / rerun-from
-  → Result
-  → verify
-  → VerificationResult
-  → report / compare / analysis / export-result / Dashboard
-```
+| 目标 | 文档 |
+| --- | --- |
+| PDF 公式复现 | [公式复现](../integrations/rdagent/docs/formula-reproduction.md) |
+| 合成教学案例 | [成交量集中度](../integrations/rdagent/examples/volume_concentration/README.md) |
+| 受控参数循环 | [开发研究循环](../integrations/rdagent/docs/research-campaign.md) |
+| 因子、模型和联合探索 | [因子](../integrations/rdagent/docs/factor-research.md) · [模型](../integrations/rdagent/docs/model-research.md) · [联合](../integrations/rdagent/docs/joint-research.md) |
+| 可选环境 | [RD-Agent](../integrations/rdagent/README.md) · [安装验收](../integrations/rdagent/docs/installation.md) |
 
-## 能力状态
+开发反馈来自成功 Result 的开发指标，最终 test/holdout 不参与循环选择。固定公式先确认定义并进行算法测试。
 
-能力状态以 [`../src/research_pipeline/capabilities.json`](../src/research_pipeline/capabilities.json) 为唯一机器来源。
+## 模型、组合与交易
 
-<!-- CAPABILITIES_TABLE:START -->
-| capability | 状态 | 命令 | 证据 / 信任 | 边界说明 |
-| --- | --- | --- | --- | --- |
-| `catalog.lock` | `local_only` | `catalog` | `local_acceptance` / `local_only` | Catalog 编译、锁定和漂移检查由显式来源文件驱动；公开仓库不附带个人 Catalog 或独立发布验收记录。 |
-| `research_package.plan` | `local_only` | `package lint`<br>`package admit` | `local_acceptance` / `local_only` | ResearchPackage 只能声明受控合同，不接受自由 SQL、动态模块或项目 runner。lint 一次返回声明、算子、指标、结果和准入缺口；admit 从显式只读数据源生成漂移/PIT 闭包并在发布/加载时校验准入事实。 |
-| `runtime.recovery` | `local_only` | `resume`<br>`retry-node`<br>`inspect`<br>`rerun-from`<br>`run --reuse-run-root`<br>`run --require-reused-node`<br>`run --reuse-failed-run-root`<br>`workspace run --reuse-run-root`<br>`workspace run --require-reused-node`<br>`workspace run --reuse-failed-run-root` | `local_acceptance` / `local_only` | resume、retry-node、inspect 和 rerun-from 消费当前 invocation、计划内算子闭包和已验证 checkpoint；run 与 workspace run 共用复用参数和正式运行校验；--reuse-run-root 只按显式顺序接受现行节点局部身份下已成功发布 Result 的完成态 run，并机会式复用 pure/cacheable 节点。配合 --require-reused-node 时，指定节点及其必要上游允许不是 pure/cacheable，但必须在 Worker 启动前全部通过节点局部身份、输入、checkpoint、typed 输出和 ExternalArtifact 内容复验，且不得回退执行。run --reuse-failed-run-root 只接受一个显式失败终态 run，要求新旧 DAG、节点身份环境、clock 和 seed 完全一致，只把状态为成功且完整复验通过的 checkpoint 复制进目标 run，再从首个未成功节点继续。两种跨运行来源不能混用，不扫描磁盘或依赖裸 ResultStore。同一次 execute 复用 Supervisor 已冻结的工件验证结果，新的 resume 进程、rerun child 或新 run 必须重新完整验证。多请求 data 节点另以 run 内 partial index 逐项复验已提交 DatasetArtifactRef，只重做失效 request；partial 不进入正式输出。旧计划仍可 inspect/resume/retry，但不能开启跨运行复用。该边界仍为 local_only。 |
-| `evidence.consume` | `local_only` | `verify`<br>`report`<br>`export-result`<br>`compare`<br>`analysis run`<br>`analysis compare` | `local_acceptance` / `local_only` | verify 直接从自包含 Result 生成结构化 VerificationResult；report、compare、analysis、export-result 和 Dashboard 不依赖 run-root。analysis run 只消费 status=pass 的 VerificationResult，要求外部请求显式声明表列、窗口、值语义、频率、单位、费用口径和处理政策，只投影日期和值两列并生成独立 AnalysisResult，不修改 Result、VerificationResult 或 claim。analysis compare 只对同规格、同实际窗口和同 claim 事实的 AnalysisResult 排名，任一必要事实不一致时不输出部分排名。直接 compare 仍只比较已验证指标事实并明示未检查 package 合同；package compare 由 delivery 唯一检查 metric/claim 合同。export-result 仅复制并复核已验证 Result，不重新执行研究。该合同尚未通过独立发布验收，因此保持 local_only。 |
-| `evidence.validity_recompute` | `local_only` | `verify` | `local_acceptance` / `local_only` | 独立 verify 从已封存的 canonical 六表与 Bar TCA 四表复核金融守恒、费用与 lineage；金融 oracle 使用有界 Arrow 批次和受配额 DuckDB 扫描，篡改或资源不足均阻止生成 VerificationResult。公开源码提供合同测试，不附带个人真实数据 Result 或独立发布验收；能力保持 local_only，不代表策略盈利、实盘成交或可交易性。 |
-| `operator_graph.generic_run` | `local_only` | `run`<br>`resume`<br>`retry-node`<br>`inspect` | `local_acceptance` / `local_only` | 正式 run 由 Runtime v2 调度，节点返回按端口索引的 typed refs，checkpoint 绑定全部端口；成功后唯一 finalize 自包含 Result，再由独立 verify 生成 VerificationResult。该边界尚缺独立发布验收，因此仍是 local_only。 |
-| `research.walk_forward_model` | `local_only` | `package admit`<br>`run` | `local_acceptance` / `local_only` | 公共模型七阶段保留 purge/embargo、fold 内预处理、validation 选模、test 与唯一候选 locked holdout；输入 Feature/Label 必须由当前研究包提供。split 先检查 Label row group 与时间可见性，再读取开发目标；holdout 打开后失败仍消耗访问资格。本地验证不代表真实策略、可交易性或已发布模型结论。 |
-| `minute_line.complete` | `local_only` | `run` | `local_acceptance` / `local_only` | 四类中国市场资产可按当前 Catalog、已完成分钟 bar、PIT 快照与历史规则进入同一研究主链；随包规则仅覆盖文档列明的参考标的及窗口，范围外无默认规则。公开源码提供合同与合成示例，不附带真实分钟数据或研究结果；能力保持 local_only，不代表全历史、全品种或实盘可交易。 |
-| `minute_line.real_data_smoke` | `local_only` | `run` | `local_acceptance` / `local_only` | 公开包提供四资产分钟输入和只读 Result/VerificationResult 合同，不附带供应商原始数据或个人真实运行收据。真实数据观察须由使用者在自己的来源、窗口和规则下重新执行并独立验证；当前能力只到 local_only，不宣称供应商历史版本精确重放或分钟交易仿真。 |
-| `simulation.bar_tca` | `local_only` | `package admit`<br>`run` | `local_acceptance` / `local_only` | Bar TCA 只消费统一 SimulationResult 的正式订单与成交和账本身份，不二次撮合。分钟路径要求决策时可见基准、已完成执行 bar、可见容量与正式 fill，缺任何必要事实均失败关闭。随包参考规则只有有界中国市场标的窗口；公开源码不包含个人真实研究结果，能力保持 local_only。 |
-| `capability.discovery` | `local_only` | `capabilities --format json`<br>`operator list/describe/scaffold/validate/build`<br>`artifact describe`<br>`recipe list/describe/scaffold`<br>`catalog dataset/field search`<br>`package lint`<br>`package expand-variants` | `local_acceptance` / `local_only` | capabilities 命令逐字段读取本清单；operator、artifact、catalog 和 package lint 的发现结果来自正式 registry、schema、Catalog Lock 或 package compiler。package expand-variants 只覆盖基包中已存在的 node 参数，原子生成普通完整包，不接受深层 YAML 合并、模板、Python 或 SQL。当前没有获准的公共 recipe，使用 package init 创建通用起点；项目完整拓扑由 ResearchPackage 声明。operator scaffold 生成可验证的最小项目算子；正式 Feature/Label 需必填 causal_plan，且来源必须可由已准入请求证明。validate/build 只复验显式源码闭包，不扫描目录或自动安装。 |
-| `resource.governance` | `local_only` | `run --resource-state-dir` | `local_acceptance` / `local_only` | 数据节点预算先编译为 DuckDB、batch/writer 与进程余量；当前 provider 支持包络下限为 256 MiB，低于下限在对象统计和扫描前拒绝。完整矩阵消费者用 footer 做数据页前的明显超界拒绝；内部 worker 默认 1 个，显式指定不能超过 CPU 或 max_workers 容量，并共用节点总预算。全新隔离进程中的真实 DuckDB/Parquet/Arrow 探针回归整个进程树 RSS、读取量与 temp 峰值，不把局部公式称为任意 allocator 的硬上界。多个 CLI/worker 的 FIFO 租约与父子令牌仍共用总容量；资源不足不改变样本、频率、参数或 seed。合成探针不进入正式运行校准总体。 |
-<!-- CAPABILITIES_TABLE:END -->
+| 问题 | 文档 |
+| --- | --- |
+| 训练、选择和最终评价 | [模型研究](walk_forward_model.md) · [研究系列与留出集](holdout-series.md) |
+| 特征表达式与基线 | [Qlib 表达式](qlib-expressions.md) · [量价与选定 Alpha](qlib-factor-baselines.md) |
+| 模型交付与报告 | [模型文件](qlib-model-results.md) · [模型和组合报告](qlib-report.md) |
+| 风险约束组合 | [组合风险目标](qlib-portfolio-risk.md) |
+| 项目分钟策略 | [LEAN 执行](lean-execution.md) · [策略协议](strategy-protocol.md) |
+| 历史分钟范围 | [项目范围](minute-project-scope.md) · [规则来源](minute_rule_provenance.md) |
+| 订单、成交和账户 | [金融计算](financial_simulation.md) · [策略协议](strategy-protocol.md) |
+| 公司行动和信用账户 | [现货与信用](spot_account.md) |
+| 金融合同参考 | [共享期货](shared_futures.md) · [历史显式订单](explicit_orders.md) |
+| 统计与选择偏差 | [稳健研究](robust_research.md) |
+
+数据可见性、标签、holdout、可用资金和交易规则在生产读取及状态转换处执行。算法正确性在开发时通过确定性案例、手算与必要差分验收。
+
+## 系统、恢复与资源
+
+- [命令行参考](cli.md)、[运行维护](operations.md)。
+- [模板和执行接续](workspace-continuation.md)、[Runtime](runtime.md)、[真实进度](runtime-progress.md)。
+- [资源预算](project_resource_budgets.md)、[资源历史](resource-history.md)与[分钟预算](minute-resource-budget.md)。
+- [数据平面](data_plane.md)、[快照布局](snapshot-layout.md)、[工件生命周期](artifact-lifecycle.md)。
+- [实现身份](implementation-identity-scope.md)、[执行与交付](research-execution-improvements.md)。
+- [研究包](research_package.md)、[框架约定](framework-contracts.md)、[架构](architecture.md)与[六张图](architecture/README.md)。
+
+## 扩展与交付
+
+- [项目扩展](../EXTENSIONS.md)、[扩展接口](../project_extensions/README.md)、[贡献](../CONTRIBUTING.md)。
+- [安装与发布](release.md)、[独立使用验收](external-acceptance.md)。
+- [第三方许可](../THIRD_PARTY_NOTICES.md)、[许可证](../LICENSE)与[安全报告](../SECURITY.md)。
+
+能力以当前 capabilities 命令和机器清单为准。local_only 表示已记录的本地适用范围，不能扩展成全市场、全历史或任意环境认证。
+
+## 常用名称
+
+| 名称 | 含义 |
+| --- | --- |
+| PIT | 在过去某一时刻只使用当时已知的信息 |
+| Catalog Lock | 认可的数据字段、来源及可见性版本 |
+| ResearchPackage | 数据、计算、样本、指标和预算的完整声明 |
+| DAG | 步骤的先后依赖 |
+| checkpoint | 可按身份与内容继续使用的已完成步骤 |
+| Result | 正式计算输出、运行摘要及配置、实现和输入引用 |
+| holdout | 开发循环之外的最终评价区间 |

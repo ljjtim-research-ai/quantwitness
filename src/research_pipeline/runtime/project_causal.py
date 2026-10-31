@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import pandas as pd
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from research_pipeline.platform.causal_time import (
     CausalTimeContractError,
@@ -40,6 +41,9 @@ class CausalReadTrace:
         source = next((source for source in self.plan.sources if source.port == fact.get("port")), None)
         if source is None or fact.get("request_id") != source.request_id:
             raise CausalTimeContractError("causal state lineage 含未允许来源")
+        expected_daily = source.to_dict().get("daily_time")
+        if fact.get("daily_time") != expected_daily:
+            raise CausalTimeContractError("causal state lineage 日频交易日历或时间规则不一致")
         if fact.get("partition_id") not in self.item.source_partitions[source.port]:
             raise CausalTimeContractError("causal state lineage 含未允许分区")
         identities = self._identities[source.port][fact["partition_id"]]
@@ -59,6 +63,21 @@ class CausalReadTrace:
             raise CausalTimeContractError("Feature lineage 引用了未来数据")
         if self.plan.kind == "label" and first <= self.item.decision_time:
             raise CausalTimeContractError("Label lineage 必须严格晚于决策")
+        delivered_dates = None
+        if expected_daily is not None:
+            delivered_dates = _names(fact.get("delivered_dates"), "lineage delivered_dates")
+            try:
+                dates = pd.to_datetime(pd.Series(delivered_dates), errors="raise")
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise CausalTimeContractError("causal 实际交付日期必须是规范 ISO 日期") from exc
+            if (tuple(sorted(delivered_dates)) != delivered_dates
+                    or tuple(day.date().isoformat() for day in dates) != delivered_dates
+                    or any(day.strftime("%Y-%m") != fact["partition_id"] for day in dates)):
+                raise CausalTimeContractError("causal 实际交付日期必须规范、递增且属于来源月份")
+            rebuilt_observations, rebuilt_available = daily_source_times(dates, expected_daily)
+            if (first != rebuilt_observations.min() or last != rebuilt_observations.max()
+                    or available != rebuilt_available.max()):
+                raise CausalTimeContractError("causal lineage 时间与实际交付日期不一致")
         key = (source.port, fact["partition_id"])
         previous = self._facts.get(key)
         self._facts[key] = {
@@ -69,6 +88,9 @@ class CausalReadTrace:
             "first_observation_time": min(first, _time(previous["first_observation_time"])).isoformat() if previous else first.isoformat(),
             "last_observation_time": max(last, _time(previous["last_observation_time"])).isoformat() if previous else last.isoformat(),
             "available_time": max(available, _time(previous["available_time"])).isoformat() if previous else available.isoformat(),
+            **({"daily_time": expected_daily,
+                "delivered_dates": sorted(set(delivered_dates) | set(previous["delivered_dates"] if previous else ()))}
+               if expected_daily is not None else {}),
         }
 
     def wrap_input(self, port: str, source_iter: Callable) -> RestrictedCausalInput:
@@ -79,7 +101,8 @@ class CausalReadTrace:
 
     def lineage(self) -> tuple[dict, ...]:
         return tuple({**fact, "columns": list(fact["columns"]),
-                      "source_partition_ids": list(fact["source_partition_ids"])}
+                      "source_partition_ids": list(fact["source_partition_ids"]),
+                      **({"delivered_dates": list(fact["delivered_dates"])} if "delivered_dates" in fact else {})}
                      for _, fact in sorted(self._facts.items()))
 
     def core_time_facts(self) -> pd.DataFrame:
@@ -141,9 +164,25 @@ class RestrictedCausalInput:
                 raise CausalTimeContractError("causal 底层交付了未允许分区")
             if not isinstance(batch, pa.RecordBatch) or batch.num_rows > batch_size:
                 raise CausalTimeContractError("causal 底层批次超出资源边界")
-            frame = batch.select(physical_columns).to_pandas()
-            observations = frame[source.observation_column].map(_time)
-            available = frame[source.available_column].map(_time)
+            observation_column = batch.column(batch.schema.get_field_index(source.observation_column))
+            row_indices = None
+            if source.daily_time is not None and pa.types.is_date(observation_column.type):
+                # 同一交易日的所有证券共享时间映射，行掩码仍按原次序展开。
+                if observation_column.null_count:
+                    raise CausalTimeContractError("日频来源必须是无时区的完整日期")
+                encoded = pc.dictionary_encode(observation_column)
+                dates = pd.Series(encoded.dictionary.to_pandas())
+                row_indices = encoded.indices.to_numpy(zero_copy_only=False)
+                observations, available = daily_source_times(dates, source.daily_time)
+            else:
+                time_columns = tuple(dict.fromkeys((source.observation_column, source.available_column)))
+                frame = batch.select(time_columns).to_pandas()
+                dates = frame[source.observation_column]
+                if source.daily_time is None:
+                    observations = dates.map(_time)
+                    available = frame[source.available_column].map(_time)
+                else:
+                    observations, available = daily_source_times(dates, source.daily_time)
             in_window = (observations >= trace.item.window_start) & (observations <= trace.item.window_end)
             if trace.plan.kind == "feature":
                 in_window &= available <= trace.item.decision_time
@@ -159,5 +198,46 @@ class RestrictedCausalInput:
                 "first_observation_time": observations[in_window].min().isoformat(),
                 "last_observation_time": observations[in_window].max().isoformat(),
                 "available_time": available[in_window].max().isoformat(),
+                **({"daily_time": source.to_dict()["daily_time"],
+                    "delivered_dates": sorted({pd.Timestamp(value).date().isoformat()
+                                               for value in dates.loc[in_window].drop_duplicates()})}
+                   if source.daily_time is not None else {}),
             })
-            yield batch.filter(pa.array(in_window.to_numpy())).select(selected)
+            row_mask = in_window.to_numpy()
+            if row_indices is not None:
+                row_mask = row_mask[row_indices]
+            yield batch.filter(pa.array(row_mask)).select(selected)
+
+
+def daily_source_times(values: pd.Series, binding: Mapping) -> tuple[pd.Series, pd.Series]:
+    """保留原始日期，由核心按已准入规则生成观测与可见时点。"""
+    from research_pipeline.domain.time import TradingSessionCalendar, TimeContractError
+
+    calendar = TradingSessionCalendar.build(binding["sessions"])
+    try:
+        dates = pd.to_datetime(values, errors="raise")
+        if dates.isna().any() or dates.dt.tz is not None or (dates != dates.dt.normalize()).any():
+            raise CausalTimeContractError("日频来源必须是无时区的完整日期")
+        rule = binding["rule"]
+        if rule == "business_effective_date":
+            observations = dates.dt.tz_localize(binding["timezone"]).dt.tz_convert("UTC")
+            available = observations.copy()
+        elif rule == "session_open":
+            if not dates.dt.date.isin(calendar.sessions).all():
+                raise CausalTimeContractError("开盘日期不在冻结日历中")
+            observations = (dates + pd.Timedelta(hours=9, minutes=30)).dt.tz_localize(binding["timezone"]).dt.tz_convert("UTC")
+            available = observations.copy()
+        elif rule == "next_session_open":
+            following = dict(zip(calendar.sessions[:-1], calendar.sessions[1:]))
+            next_dates = dates.dt.date.map(following)
+            if next_dates.isna().any():
+                raise CausalTimeContractError("日频日期不在冻结日历中或缺少后续交易日")
+            observations = (dates + pd.Timedelta(hours=15)).dt.tz_localize(binding["timezone"]).dt.tz_convert("UTC")
+            available = (pd.to_datetime(next_dates) + pd.Timedelta(hours=9, minutes=30)).dt.tz_localize(binding["timezone"]).dt.tz_convert("UTC")
+        else:
+            raise CausalTimeContractError("未支持的日期 causal 时间规则")
+    except (TimeContractError, TypeError, ValueError) as exc:
+        if isinstance(exc, CausalTimeContractError):
+            raise
+        raise CausalTimeContractError("日频来源日期或交易日历无效") from exc
+    return observations, available

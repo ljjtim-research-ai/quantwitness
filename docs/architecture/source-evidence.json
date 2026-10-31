@@ -1,0 +1,40 @@
+{
+  "scope": "当前主链的工作交接示意；不作为完整Python import图。",
+  "interfaces": [
+    {
+      "name": "Workspace",
+      "entry": "execute_workspace",
+      "source": "src/research_pipeline/application/workspace_flow.py"
+    },
+    {
+      "name": "准备",
+      "entry": "prepare_package",
+      "source": "src/research_pipeline/application/research_plan.py"
+    },
+    {
+      "name": "准入",
+      "entry": "admit_package",
+      "source": "src/research_pipeline/application/research_plan.py"
+    },
+    {
+      "name": "Runtime",
+      "entry": "RuntimeExecutionService.execute",
+      "source": "src/research_pipeline/runtime/execution_service.py"
+    },
+    {
+      "name": "结果封存",
+      "entry": "ResultAssembler",
+      "source": "src/research_pipeline/results/assembler.py"
+    },
+    {
+      "name": "直接交付",
+      "entry": "load_result_context",
+      "source": "src/research_pipeline/results/delivery.py"
+    },
+    {
+      "name": "命令",
+      "entry": "FINAL_COMMANDS",
+      "source": "src/research_pipeline/cli/parser.py"
+    }
+  ]
+}

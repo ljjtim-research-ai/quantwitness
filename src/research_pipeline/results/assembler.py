@@ -14,11 +14,11 @@ from research_pipeline.data_plane import (
 )
 from research_pipeline.platform import canonical_json, typed_canonical_hash
 from research_pipeline.platform.claim_levels import weakest_claim_level
-from research_pipeline.platform.metric_contracts import MetricReachabilityProof
+from research_pipeline.platform.metric_contracts import MetricDefinition, MetricReachabilityProof
 from research_pipeline.platform.operator_contracts import operator_dag_runtime_hash
 from .artifact_reader import ExternalArtifactReader, RuntimeArtifactReference
 from .contracts import (
-    RESULT_EMBEDDED_VERIFIER_CLOSURE_VERSION,
+    QLIB_MODEL_INVENTORY_SCHEMA_ID,
     ResultBundle,
     ResultInputRevision,
     ResultReference,
@@ -26,7 +26,6 @@ from .contracts import (
     ResultSpec,
     ResultSupportFile,
     ResultTableManifest,
-    ResultVerificationClosure,
 )
 from .errors import ResultContractError
 from .runtime_projection import OPERATOR_DAG_RUN_VERSION
@@ -35,17 +34,6 @@ from .store import ResultStore
 
 
 RESULT_REFERENCE_FILE = "result-ref.json"
-_BAR_TCA_SUPPORT_PATHS = (
-    "simulation/result-contract/manifest.json",
-    "simulation/result-contract/COMMITTED",
-    "simulation/tca/manifest.json",
-    "simulation/tca/COMMITTED",
-    "simulation/tca/oracle-input.json",
-)
-_MINUTE_FINANCIAL_CONTEXT_PATH = "simulation/context.json"
-_DAILY_ETF_FINANCIAL_CONTEXT_PATH = "simulation/daily-context.json"
-
-
 class ResultAssembler:
     """不访问数据库、不运行研究算法，也不改变任何 claim。"""
 
@@ -64,12 +52,11 @@ class ResultAssembler:
         data_references: Mapping[str, object],
         metric_proofs: tuple[MetricReachabilityProof, ...],
         implementation_manifest_hash: str,
-        verification_policy_id: str,
-        validity_producer_hash: str,
-        verifier_identity: Mapping[str, object] | None = None,
-        verifier_bundle_source: str | Path | None = None,
-        formal_input_request_ids: tuple[str, ...] | None = None,
-        input_claim_ceilings: Mapping[str, str] | None = None,
+        claim_level: str,
+        formal_input_request_ids: tuple[str, ...],
+        input_claim_ceilings: Mapping[str, str],
+        metric_definitions: tuple[MetricDefinition, ...] = (),
+        research_cost_assumption: Mapping[str, object] | None = None,
         phase_hook: Callable[[str], None] | None = None,
         published_hook: Callable[[ResultBundle, Path], None] | None = None,
     ) -> tuple[ResultBundle, Path, ResultReference]:
@@ -167,53 +154,14 @@ class ResultAssembler:
                     for path in source_files
                 },
             ))
-        validity_support, validity_facts = self._validity_support_file(
-            record=record,
-            external=external,
-            commits=commits,
-        )
-        data_pit = validity_facts.get("data_pit")
-        if not isinstance(data_pit, Mapping):
-            raise ResultContractError("validity facts 缺少 data_pit")
-        runtime_request_ids = data_pit.get("consumed_request_ids")
-        runtime_ceilings = data_pit.get("input_claim_ceilings")
-        runtime_effective = data_pit.get("effective_claim_ceiling")
-        if (
-            not isinstance(runtime_request_ids, list)
-            or not isinstance(runtime_ceilings, Mapping)
-        ):
-            raise ResultContractError("validity facts 缺少输入 claim lineage")
-        selected_request_ids = tuple(
-            str(item) for item in (
-                runtime_request_ids
-                if formal_input_request_ids is None
-                else formal_input_request_ids
-            )
-        )
-        selected_ceilings = {
-            str(key): str(value)
-            for key, value in (
-                runtime_ceilings
-                if input_claim_ceilings is None
-                else input_claim_ceilings
-            ).items()
-        }
-        effective_input_ceiling = weakest_claim_level(
-            *selected_ceilings.values()
-        )
-        if (
-            list(selected_request_ids) != runtime_request_ids
-            or selected_ceilings != dict(runtime_ceilings)
-            or effective_input_ceiling != runtime_effective
-        ):
-            raise ResultContractError(
-                "Result plan claim lineage 与 Runtime validity facts 不一致"
-            )
+        selected_request_ids = tuple(formal_input_request_ids)
+        selected_ceilings = dict(input_claim_ceilings)
+        effective_input_ceiling = weakest_claim_level(*selected_ceilings.values())
         support_files = self._support_files(
-            result_spec,
-            commits,
-            external=external,
-            validity_support=validity_support,
+            result_spec, commits, external=external, tables=tuple(tables),
+            include_model_ledger=any(
+                table.artifact_type == "research.model-locked-holdout.v2" for table in tables
+            ),
         )
         audit_environment = record.get("audit_environment")
         if not isinstance(audit_environment, Mapping):
@@ -251,29 +199,7 @@ class ResultAssembler:
             mode=run_projection.mode,
             fixed_clock=run_projection.fixed_clock,
             node_statuses=run_projection.node_statuses,
-        )
-        if verifier_identity is None and verifier_bundle_source is not None:
-            raise ResultContractError(
-                "未冻结 Verifier identity 的 Result 不得携带 bundle"
-            )
-        verifier_bundle_path = None
-        verification_contract = None
-        if verifier_identity is not None and verifier_bundle_source is not None:
-            verifier_bundle_path = f"verifiers/{verifier_identity['bundle_hash']}"
-            verification_contract = RESULT_EMBEDDED_VERIFIER_CLOSURE_VERSION
-        verification_kwargs = {}
-        if verification_contract is not None:
-            verification_kwargs["contract_version"] = verification_contract
-        verification = ResultVerificationClosure(
-            policy_id=verification_policy_id,
-            validity_artifact_key=validity_support.artifact_key,
-            validity_source_path=validity_support.source_path,
-            validity_content_hash=validity_support.content_hash,
-            validity_producer_hash=validity_producer_hash,
-            run=run_summary,
-            verifier_identity=verifier_identity,
-            verifier_bundle_path=verifier_bundle_path,
-            **verification_kwargs,
+            limitations=tuple(completion_metadata.get("limitations", ())),
         )
         bundle = ResultBundle.build(
             project_id=project_id,
@@ -285,6 +211,7 @@ class ResultAssembler:
             formal_input_request_ids=selected_request_ids,
             input_claim_ceilings=selected_ceilings,
             effective_input_claim_ceiling=effective_input_ceiling,
+            claim_level=claim_level,
             execution_identity_hash=execution_identity_hash,
             runtime_hash=runtime_hash,
             implementation_manifest_hash=implementation_manifest_hash,
@@ -292,8 +219,10 @@ class ResultAssembler:
             result_spec=result_spec,
             metric_proofs=tuple(sorted(metric_proofs, key=lambda item: item.metric_ref)),
             tables=tuple(tables),
-            verification=verification,
+            run=run_summary,
             support_files=support_files,
+            metric_definitions=tuple(sorted(metric_definitions, key=lambda item: item.metric_ref)),
+            research_cost_assumption=research_cost_assumption,
         )
         published_reported = False
 
@@ -312,7 +241,6 @@ class ResultAssembler:
         destination = self.store.publish(
             bundle,
             run_root=root,
-            verifier_bundle_source=verifier_bundle_source,
             phase_hook=track_publish,
         )
         # 幂等 finalize 命中既有同一 Result 时不会再次触发 renamed。
@@ -346,6 +274,13 @@ class ResultAssembler:
                 reference = DatasetArtifactRef.from_dict(payload)
             except Exception as exc:
                 raise ResultContractError("data reference 合同无效") from exc
+            if reference.contract_version == "direct-dataset-ref-v1":
+                from .contracts import ResultSourceRevision
+                revisions.append(ResultSourceRevision(
+                    request_id=request_id, source_identity=reference.source_identity,
+                    descriptor_hash=reference.descriptor_hash, schema_hash=reference.schema_hash,
+                    source_revision_hash=reference.source_revision_hash))
+                continue
             revisions.append(ResultInputRevision(
                 request_id=request_id,
                 physical_snapshot_id=reference.physical_snapshot_id,
@@ -356,154 +291,142 @@ class ResultAssembler:
         return tuple(revisions)
 
     @staticmethod
-    def _validity_support_file(
-        *,
-        record: Mapping[str, object],
-        external: ExternalArtifactReader,
-        commits: dict[str, object],
-    ) -> tuple[ResultSupportFile, Mapping[str, object]]:
-        """从 Runtime 终态选择唯一 validity facts，不依赖 run-root 约定路径。"""
-
-        outputs = record.get("outputs")
-        if not isinstance(outputs, Mapping):
-            raise ResultContractError("Runtime 终态缺少 validity 输出")
-        matches: list[RuntimeArtifactReference] = []
-        for node_outputs in outputs.values():
-            if not isinstance(node_outputs, Mapping):
-                continue
-            for raw_reference in node_outputs.values():
-                if not isinstance(raw_reference, Mapping):
-                    continue
-                reference = RuntimeArtifactReference.from_dict(raw_reference)
-                if reference.artifact_type == "research.validity-facts.v1":
-                    matches.append(reference)
-        if len(matches) != 1:
-            raise ResultContractError("Result 必须绑定唯一 validity facts 输出")
-        reference = matches[0]
-        commit = commits.get(reference.artifact_key)
-        if commit is None:
-            commit = external.inspect(reference.artifact_key)
-            commits[reference.artifact_key] = commit
-        if commit.artifact_reference != reference or "result.json" not in commit.files:
-            raise ResultContractError("validity facts 输出未完整提交")
-        try:
-            payload = json.loads(
-                external.read_bytes(commit, "result.json").decode("utf-8")
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ResultContractError("validity facts result.json 无法读取") from exc
-        required_fact_sections = {
-            "data_pit",
-            "label_split",
-            "search_holdout",
-            "statistics",
-            "financial_tradability",
-        }
-        if (
-            not isinstance(payload, Mapping)
-            or payload.get("contract_version") != "research-validity-facts-v1"
-            or not required_fact_sections.issubset(payload)
-        ):
-            raise ResultContractError(
-                "Result 只接受完整 research validity facts，不能封存 gates 摘要"
-            )
-        return (
-            ResultSupportFile(
-                artifact_key=commit.semantic_hash,
-                artifact_type="research.validity-facts.v1",
-                source_path="result.json",
-                relative_path=f"support/{commit.semantic_hash}/result.json",
-                content_hash=commit.files["result.json"],
-            ),
-            payload,
-        )
-
-    @staticmethod
     def _support_files(
         result_spec: ResultSpec,
         commits: Mapping[str, object],
         *,
         external: ExternalArtifactReader,
-        validity_support: ResultSupportFile,
+        tables: tuple[ResultTableManifest, ...] = (),
+        include_model_ledger: bool = False,
     ) -> tuple[ResultSupportFile, ...]:
-        """封装 validity facts，以及按 ResultSpec 条件触发的金融控制文件。"""
-
-        from .contracts import BAR_TCA_SCHEMA_IDS
+        """按正式表声明封存正式报告所需控制与模型状态。"""
 
         declared = {item.schema_id for item in result_spec.tables}
-        if not declared & set(BAR_TCA_SCHEMA_IDS.values()):
-            return (validity_support,)
-        selected = [validity_support]
-        financial_commits: dict[str, object] = {}
-        for source_path in _BAR_TCA_SUPPORT_PATHS:
-            matches = tuple(commit for commit in commits.values() if source_path in commit.files)
-            if len(matches) != 1:
-                raise ResultContractError(f"Bar TCA Result 缺少唯一控制文件: {source_path}")
-            commit = matches[0]
-            financial_commits[source_path] = commit
-            selected.append(ResultSupportFile(
-                artifact_key=commit.semantic_hash,
-                artifact_type="research.financial-control.v1",
-                source_path=source_path,
-                relative_path=f"support/{commit.semantic_hash}/{source_path}",
-                content_hash=commit.files[source_path],
-            ))
-        try:
-            simulation_manifest = json.loads(
-                external.read_bytes(
-                    financial_commits["simulation/result-contract/manifest.json"],
-                    "simulation/result-contract/manifest.json",
-                ).decode("utf-8")
-            )
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ResultContractError("SimulationResult manifest 无法读取") from exc
-        semantics = simulation_manifest.get("semantics")
-        requires_daily_etf_context = (
-            isinstance(semantics, Mapping)
-            and semantics.get("asset_class") == "cn_etf"
-            and semantics.get("frequency") == "daily"
-        )
-        context_matches = tuple(
-            commit for commit in commits.values()
-            if _MINUTE_FINANCIAL_CONTEXT_PATH in commit.files
-        )
-        if len(context_matches) > 1:
-            raise ResultContractError("分钟金融上下文必须来自唯一仿真工件")
-        if context_matches:
-            commit = context_matches[0]
-            selected.append(ResultSupportFile(
-                artifact_key=commit.semantic_hash,
-                artifact_type="research.financial-control.v1",
-                source_path=_MINUTE_FINANCIAL_CONTEXT_PATH,
-                relative_path=(
-                    f"support/{commit.semantic_hash}/"
-                    f"{_MINUTE_FINANCIAL_CONTEXT_PATH}"
-                ),
-                content_hash=commit.files[_MINUTE_FINANCIAL_CONTEXT_PATH],
-            ))
-        daily_context_matches = tuple(
-            commit for commit in commits.values()
-            if _DAILY_ETF_FINANCIAL_CONTEXT_PATH in commit.files
-        )
-        if len(daily_context_matches) > 1:
-            raise ResultContractError("ETF 日频金融上下文必须来自唯一仿真工件")
-        if requires_daily_etf_context and len(daily_context_matches) != 1:
-            raise ResultContractError("ETF 日频 Result 缺少受控市场规则上下文")
-        if daily_context_matches:
-            commit = daily_context_matches[0]
-            selected.append(ResultSupportFile(
-                artifact_key=commit.semantic_hash,
-                artifact_type="research.financial-control.v1",
-                source_path=_DAILY_ETF_FINANCIAL_CONTEXT_PATH,
-                relative_path=(
-                    f"support/{commit.semantic_hash}/"
-                    f"{_DAILY_ETF_FINANCIAL_CONTEXT_PATH}"
-                ),
-                content_hash=commit.files[_DAILY_ETF_FINANCIAL_CONTEXT_PATH],
-            ))
+        selected = []
+        selected.extend(ResultAssembler._model_support_files(
+            tables, commits, external=external,
+        ))
+        if include_model_ledger:
+            holdout_keys = {
+                item.artifact_key for item in tables
+                if item.artifact_type == "research.model-locked-holdout.v2"
+            }
+            if len(holdout_keys) != 1:
+                raise ResultContractError("模型有效性要求唯一正式 holdout 工件")
+            commit = commits[next(iter(holdout_keys))]
+            if "holdout-ledger/plan.json" not in commit.files:
+                raise ResultContractError("模型 Result 缺少完整 holdout 账本")
+            plan = json.loads(external.read_bytes(commit, "holdout-ledger/plan.json"))
+            ledger_names = ["plan", "prepared", "opened", "terminal"]
+            if "research_series" in plan.get("freeze_payload", {}):
+                ledger_names.append("series")
+            for name in ledger_names:
+                source_path = f"holdout-ledger/{name}.json"
+                if source_path not in commit.files:
+                    raise ResultContractError("模型 Result 缺少完整 holdout 账本")
+                selected.append(ResultSupportFile(
+                    artifact_key=commit.semantic_hash,
+                    artifact_type="research.model-locked-holdout.v2",
+                    source_path=source_path,
+                    relative_path=f"support/{commit.semantic_hash}/{source_path}",
+                    content_hash=commit.files[source_path],
+                ))
+        from research_pipeline.platform.lean_contract import LEAN_ARTIFACT_TYPE, LEAN_SCHEMA_IDS, LEAN_SUPPORT_PATHS
+
+        if declared & set(LEAN_SCHEMA_IDS.values()):
+            lean_tables = [table for table in tables if table.schema_id in LEAN_SCHEMA_IDS.values()]
+            if {table.schema_id for table in lean_tables} != set(LEAN_SCHEMA_IDS.values()):
+                raise ResultContractError("LEAN Result 缺少完整执行表")
+            keys = {table.artifact_key for table in lean_tables}
+            if len(keys) != 1 or any(table.artifact_type != LEAN_ARTIFACT_TYPE for table in lean_tables):
+                raise ResultContractError("LEAN Result 执行表必须来自同一已提交工件")
+            lean_commit = commits[next(iter(keys))]
+            for source_path in LEAN_SUPPORT_PATHS:
+                if source_path not in lean_commit.files:
+                    raise ResultContractError(f"LEAN Result 缺少支持文件: {source_path}")
+                selected.append(ResultSupportFile(
+                    artifact_key=lean_commit.semantic_hash,
+                    artifact_type=LEAN_ARTIFACT_TYPE,
+                    source_path=source_path,
+                    relative_path=f"support/{lean_commit.semantic_hash}/{source_path}",
+                    content_hash=lean_commit.files[source_path],
+                ))
         return tuple(sorted(
             selected, key=lambda item: (item.artifact_key, item.source_path)
         ))
+
+    @staticmethod
+    def _model_support_files(
+        tables: tuple[ResultTableManifest, ...],
+        commits: Mapping[str, object],
+        *,
+        external: ExternalArtifactReader,
+    ) -> tuple[ResultSupportFile, ...]:
+        """只封存 ResultSpec 选中清单里成功模型明确引用的文件。"""
+
+        selected: dict[tuple[str, str], ResultSupportFile] = {}
+        for table in tables:
+            if table.schema_id != QLIB_MODEL_INVENTORY_SCHEMA_ID:
+                continue
+            commit = commits[table.artifact_key]
+            source_prefix = f"{table.path_prefix}/"
+            for source_path in sorted(commit.files):
+                if not source_path.startswith(source_prefix) or not source_path.endswith(".parquet"):
+                    continue
+                inventory = external.read_parquet(commit, source_path)
+                required = {"status", "config_path", "model_path"}
+                if not required.issubset(inventory.column_names):
+                    raise ResultContractError("Qlib 模型清单缺少状态或文件路径")
+                for row in inventory.to_pylist():
+                    if row["status"] != "fitted":
+                        continue
+                    config_path = row["config_path"]
+                    if not isinstance(config_path, str) or config_path not in commit.files:
+                        raise ResultContractError(f"Qlib 模型引用未提交文件: {config_path}")
+                    try:
+                        config = json.loads(external.read_bytes(commit, config_path))
+                    except (UnicodeDecodeError, json.JSONDecodeError, TypeError) as exc:
+                        raise ResultContractError("Qlib 模型配置无法读取") from exc
+                    if not isinstance(config, dict) or config.get("model_path") != row["model_path"]:
+                        raise ResultContractError("Qlib 模型清单与配置的模型路径不一致")
+                    processor_files = config.get("processor_files")
+                    if not isinstance(processor_files, dict) or set(processor_files) != {"infer", "learn"}:
+                        raise ResultContractError("Qlib 模型配置缺少 Processor 文件清单")
+                    paths = [config_path, row["model_path"]]
+                    if config.get("schema") not in {"research.qlib-model-bundle.v1", "research.qlib-sequence-model-bundle.v2"}:
+                        raise ResultContractError("Qlib 模型配置 schema 不受支持")
+                    if config["schema"] == "research.qlib-sequence-model-bundle.v2":
+                        sequence = config.get("sequence")
+                        sequence_files = sequence.get("files") if isinstance(sequence, dict) else None
+                        if (not isinstance(sequence, dict)
+                                or sequence.get("schema") != "research.qlib-sequence-input.v2"
+                                or not isinstance(sequence_files, dict)
+                                or set(sequence_files) != {"context", "targets", "members"}):
+                            raise ResultContractError("Qlib 序列模型配置缺少窗口文件清单")
+                        paths.append(config.get("weights_path"))
+                        paths.extend(sequence_files[name] for name in ("context", "targets", "members"))
+                    if config.get("candidate", {}).get("model", {}).get("class") == "GeneratedModel":
+                        generated = config.get("generated")
+                        if not isinstance(generated, dict):
+                            raise ResultContractError("生成模型配置缺少源码与权重清单")
+                        paths.extend((generated.get("source_path"), generated.get("weights_path")))
+                    for role in ("infer", "learn"):
+                        if not isinstance(processor_files[role], list):
+                            raise ResultContractError("Qlib Processor 文件清单必须为列表")
+                        paths.extend(processor_files[role])
+                    for path in paths:
+                        if not isinstance(path, str) or path not in commit.files:
+                            raise ResultContractError(f"Qlib 模型引用未提交文件: {path}")
+                    for path in paths:
+                        key = (commit.semantic_hash, path)
+                        selected[key] = ResultSupportFile(
+                            artifact_key=commit.semantic_hash,
+                            artifact_type=table.artifact_type,
+                            source_path=path,
+                            relative_path=f"support/{commit.semantic_hash}/{path}",
+                            content_hash=commit.files[path],
+                        )
+        return tuple(selected[key] for key in sorted(selected))
 
     @staticmethod
     def _write_reference(root: Path, reference: ResultReference) -> None:

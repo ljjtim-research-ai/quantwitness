@@ -1,22 +1,41 @@
-# QuantWitness 架构
+# QuantWitness 如何组成
 
-QuantWitness 的正式主链是：
+QuantWitness 面向个人的 AI 协作研究：用声明固定问题、数据、时点和算法，按依赖执行，发布 Result，再生成报告或开发反馈。
+
+[![QuantWitness 模块架构：研究声明、数据准入、Runtime、Qlib、LEAN 与 Result 交付](docs/architecture/research-pipeline-architecture.svg)](https://ljjtim.github.io/QuantWitness/research-pipeline-architecture.html)
+
+点击图片打开 Archify 详细交互架构图，可搜索节点、追踪关系、切换主题和视觉风格；其他视角见[在线图册](https://ljjtim.github.io/QuantWitness/)和[图册说明](docs/architecture/README.md)。离线可直接打开 `docs/architecture/index.html`。
+
+## 三层职责
+
+| 层 | 解决的问题 | 主要组件 |
+| --- | --- | --- |
+| 研究提出 | 检验什么，下一轮试什么 | 人、可选 RD-Agent、ResearchPackage |
+| 研究执行 | 数据何时可见，计算如何排序，交易和账户如何演化 | Catalog、数据平面、Runtime、Qlib、日线与一分钟 LEAN |
+| 结果交付 | 输出来自哪里，怎样分析、导出和继续 | Result、ResultContext、报告、比较与 Dashboard |
+
+RD-Agent 使用成功 Result 的开发指标提出下一轮候选。最终 test/holdout 不进入开发反馈；金融规则、PIT和标签读取限制在实际数据与计算入口执行。
+
+## 一次完整研究
 
 ```text
-ResearchPackage
-→ package lint
-→ package admit
-→ Runtime typed DAG
-→ Result
-→ verify
-→ VerificationResult
-→ report
+研究问题 / 人工确认的公式 / AI 候选
+  → ResearchPackage
+  → 一次准备与准入
+  → 执行数据、模型或交易节点，保存 checkpoint
+  → 原子发布 Result
+  → 报告 / 比较 / 分析 / 导出 / 开发指标反馈
 ```
 
-框架核心由 Catalog/PIT、ResearchPackage 编译、列式数据平面、Runtime、金融领域合同、模拟、研究原语、证据和 CLI 构成。数据源保持只读；运行工件写入显式工作目录。
+独立 `package lint` 用于主动诊断。Workspace `execute` 在同次流程内交接准备好的声明与编译对象，持久计划用于后续执行及恢复；新进程仍检查实际来源和输入。
 
-项目特有逻辑不进入框架核心。项目使用声明、recipe 和受控 extension bundle 提供算法、字段组合、资产规则和研究假设。公共 Operator 晋级必须证明异构复用、稳定合同、独立 oracle 和攻击测试。
+恢复复用身份、输入和配置相符的成功节点。Result 组装失败可接续组装，发布成功后保持只读。holdout按持久账本消费，失败打开不重置资格。
 
-Result 是运行完成后封存的不可变研究结果。VerificationResult 由独立验证步骤生成，不能由 Runtime 自报成功代替。报告和比较只消费已封存的 Result 与 VerificationResult。
+## 模块与图册
 
-详细合同见 [文档索引](docs/index.md) 和 [项目扩展说明](EXTENSIONS.md)。
+- [模块职责与代码边界](docs/architecture.md)
+- [六种视角的图册](docs/architecture/README.md)
+- [运行与恢复](docs/runtime.md)
+- [正式结果与消费](docs/evidence.md)
+
+算法正确性通过开发期手算、确定性案例和必要差分测试验收。数据采集、数据库修复、因子发布和实盘交易按各自独立流程授权。

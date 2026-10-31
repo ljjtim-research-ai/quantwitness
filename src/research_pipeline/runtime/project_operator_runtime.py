@@ -18,6 +18,7 @@ import psutil
 
 from research_pipeline.platform.process_resources import (
     _measure_attempt_tree_bytes, _project_process_usage, _terminate_process_tree,
+    _project_sampling_scope,
 )
 
 from research_pipeline.extensions import (
@@ -61,6 +62,34 @@ def _declared_request_ids(parameters: Mapping[str, object]) -> frozenset[str]:
         elif name.endswith("_request_ids") and isinstance(raw, (list, tuple)):
             values.update(item for item in raw if isinstance(item, str) and item)
     return frozenset(values)
+
+
+def _request_table_descriptors(request_tables, parameters):
+    """只序列化节点显式声明的 request，保留原始来源身份和准入事实。"""
+    selected = _declared_request_ids(parameters)
+    requests = []
+    for request_id, descriptor in sorted(request_tables.items()):
+        if request_id not in selected:
+            continue
+        request = {
+            "request_id": request_id,
+            "source_identity": str(descriptor["source_identity"]),
+            "schema_hash": str(descriptor["schema_hash"]),
+            **({"admission": dict(descriptor["admission"])} if "admission" in descriptor else {}),
+        }
+        if descriptor.get("source_kind") == "direct":
+            request.update(
+                source_kind="direct", direct_reference=dict(descriptor["direct_reference"]),
+                direct_root=str(Path(descriptor["direct_root"]).resolve(strict=True)),
+                source_revision_hash=descriptor["source_revision_hash"],
+                admitted_plan_hash=descriptor["admitted_plan_hash"],
+            )
+        else:
+            request["files"] = [dict(file) for file in descriptor["files"]]
+        requests.append(request)
+    if not requests:
+        raise RuntimeIntegrityError("项目异构数据输入没有绑定节点参数中的 request_id")
+    return requests
 
 
 @dataclass(frozen=True)
@@ -295,7 +324,16 @@ def project_worker_adapter_hash() -> str:
             name: hashlib.sha256(runtime_path.with_name(name).read_bytes()).hexdigest()
             for name in ("project_table_input.py", "project_output.py", "project_causal.py",
                          "project_causal_worker.py", "project_causal_execution.py",
-                         "project_causal_minute.py")
+                         "project_causal_minute.py", "causal_facts_codec.py", "causal_worker_session.py",
+                         "worker_process_session.py", "lean_strategy_execution.py", "lean_strategy_inputs.py", "lean_engine_worker.py",
+                         "lean_market_source.py", "lean_day_stream.py",
+                         "strategy_signal_inputs.py", "portfolio_target_inputs.py")
+        },
+        "strategy_contracts": {
+            name: hashlib.sha256(runtime_path.parent.parent.joinpath(name).read_bytes()).hexdigest()
+            for name in ("domain/strategy_protocol.py", "domain/strategy_declaration.py", "results/contracts.py", "platform/lean_contract.py",
+                         "platform/lean_runtime.py", "platform/daily_projection.py", "data_plane/daily_stream.py", "data_plane/dataset_files.py",
+                         "data_plane/dataset_artifacts.py", "data_plane/direct_sources.py", "data_plane/archive_read.py")
         },
         "resource_contracts": {
             name: hashlib.sha256(
@@ -331,8 +369,11 @@ def execute_project_worker_attempt(
     verified_partition_id: str | None = None,
     state_in: ProjectWorkerState | None = None,
     causal_context: Mapping[str, object] | None = None,
+    worker_session=None,
 ) -> ProjectWorkerAttemptResult:
     """只执行一次受控 Worker；checkpoint、重试和缓存统一由正式 Runtime 管理。"""
+    if "worker_lifecycle" in parameters and parameters["worker_lifecycle"] != "stateless_session":
+        raise RuntimeIntegrityError("未知的worker_lifecycle")
     token = registry.project_token_by_implementation(implementation_id)
     if not isinstance(token, ProjectOperatorImplementationToken):
         raise RuntimeIntegrityError("项目实现未被当前组合注册表准入")
@@ -341,16 +382,30 @@ def execute_project_worker_attempt(
     ):
         raise RuntimeIntegrityError("项目 Worker 进程槽必须至少容纳 Supervisor 和 Worker")
     spec = token.manifest.operator_spec
+    if parameters.get("worker_lifecycle") == "stateless_session" and any(
+        port.artifact_type == "data.minute-bars.v1" for port in spec.input_ports
+    ):
+        raise RuntimeIntegrityError("stateless_session仅支持非分钟输入")
     normalized_parameters = validate_parameters(
         parameters,
         spec.parameters,
         "project.parameters",
     )
-    identity = project_runtime_identity(
-        registry,
-        spec.operator_id,
-        spec.operator_version,
-    )
+    if worker_session is not None:
+        if (causal_context is None or parameters.get("worker_lifecycle") != "stateless_session"
+                or spec.determinism_mode not in {"deterministic", "seeded"}):
+            raise RuntimeIntegrityError("Worker session要求显式stateless确定性因果声明")
+        if worker_session.identity is not None and (
+            worker_session.registry is not registry or worker_session.implementation_id != implementation_id
+        ):
+            raise RuntimeIntegrityError("Worker session不能跨注册表或实现复用")
+    identity = worker_session.identity if worker_session is not None else None
+    if identity is None:
+        identity = project_runtime_identity(registry, spec.operator_id, spec.operator_version)
+        if worker_session is not None:
+            worker_session.identity = identity
+            worker_session.registry = registry
+            worker_session.implementation_id = implementation_id
     bundle_path = registry.bundle_paths[implementation_id]
     clock = datetime.fromisoformat(fixed_clock)
     if (
@@ -416,6 +471,7 @@ def execute_project_worker_attempt(
         verified_partition_id=verified_partition_id,
         state_in=state_in,
         causal_context=causal_context,
+        worker_session=worker_session,
     )
     outputs, state, measurement_status, cleanup_status, causal_facts, request_traces = result
     return ProjectWorkerAttemptResult(
@@ -449,6 +505,7 @@ def _run_project_worker(
     verified_partition_id: str | None,
     state_in: ProjectWorkerState | None,
     causal_context: Mapping[str, object] | None,
+    worker_session=None,
 ) -> tuple[
     tuple[ProjectWorkerOutput, ...],
     ProjectWorkerState | None,
@@ -457,10 +514,11 @@ def _run_project_worker(
     Mapping[str, object] | None,
     Mapping[str, object] | None,
 ]:
-    staged_bundle = attempt_root / identity.bundle_hash
-    shutil.copytree(bundle_path, staged_bundle)
-    if verify_project_operator_bundle(staged_bundle).bundle_hash != identity.bundle_hash:
-        raise RuntimeIntegrityError("项目 bundle 暂存后身份不一致")
+    staged_bundle = (worker_session.root if worker_session is not None else attempt_root) / identity.bundle_hash
+    if worker_session is None or not staged_bundle.exists():
+        shutil.copytree(bundle_path, staged_bundle)
+        if verify_project_operator_bundle(staged_bundle).bundle_hash != identity.bundle_hash:
+            raise RuntimeIntegrityError("项目 bundle 暂存后身份不一致")
     input_contracts = []
     input_root = attempt_root / "inputs"
     invocation = {"run_id": run_id, "attempt_id": attempt_id}
@@ -499,16 +557,6 @@ def _run_project_worker(
                 },
             })
         elif item.request_tables:
-            declared_request_ids = _declared_request_ids(parameters)
-            selected = {
-                request_id: descriptor
-                for request_id, descriptor in item.request_tables.items()
-                if request_id in declared_request_ids
-            }
-            if not selected:
-                raise RuntimeIntegrityError(
-                    "项目异构数据输入没有绑定节点参数中的 request_id"
-                )
             input_contracts.append({
                 "input_kind": "request_tables",
                 "invocation": invocation,
@@ -516,16 +564,7 @@ def _run_project_worker(
                 "artifact_type": item.artifact.artifact_type,
                 "source_identity": item.artifact.artifact_key,
                 "source_root": str(item.source_root.resolve(strict=True)),
-                "requests": [
-                    {
-                        "request_id": request_id,
-                        "source_identity": str(descriptor["source_identity"]),
-                        "schema_hash": str(descriptor["schema_hash"]),
-                        **({"admission": dict(descriptor["admission"])} if "admission" in descriptor else {}),
-                        "files": [dict(file) for file in descriptor["files"]],
-                    }
-                    for request_id, descriptor in sorted(selected.items())
-                ],
+                "requests": _request_table_descriptors(item.request_tables, parameters),
             })
         elif item.request_admissions:
             declared_request_ids = _declared_request_ids(parameters)
@@ -635,6 +674,8 @@ def _run_project_worker(
     if causal_context is not None:
         task["causal_context"] = dict(causal_context)
     result_path = attempt_root / "result.json"
+    if worker_session is not None:
+        worker_session.bind(task)
     task_path.write_text(canonical_json(task), encoding="utf-8")
     command = [
         sys.executable,
@@ -648,10 +689,9 @@ def _run_project_worker(
         str(result_path),
     ]
     try:
-        process = subprocess.Popen(
-            command,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        process = (
+            subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if worker_session is None else worker_session.dispatch(command, task_path)
         )
     except BaseException:
         task_path.unlink(missing_ok=True)
@@ -659,43 +699,58 @@ def _run_project_worker(
     started = time.monotonic()
     failure = None
     exceeded: dict[str, dict[str, int]] = {}
-    observed_descendants: dict[int, float] = {}
+    observed_descendants: dict[int, float] = ({} if worker_session is None else worker_session.observed_descendants)
+    done_path = attempt_root / "session-done.json"
     measurement_status = "available"
-    try:
-        while True:
-            finished = process.poll() is not None
-            try:
-                rss, process_count = _project_process_usage(
-                    None if finished else process.pid, observed_descendants
-                )
-                size = _measure_attempt_tree_bytes(attempt_root)
-            except (psutil.Error, OSError, RuntimeError):
-                measurement_status = "measurement_unavailable"
-                failure = "project_worker_measurement_unavailable"
-                break
-            if time.monotonic() - started > budget.wall_seconds:
-                failure = "project_worker_timeout"
-            elif process_slots is not None and process_count > process_slots:
-                failure = "project_worker_process_slots_exceeded"
-            elif rss > budget.memory_bytes or size > budget.temp_bytes:
-                failure = "project_worker_resource_exceeded"
-                exceeded = {
-                    name: {"actual": actual, "limit": limit}
-                    for name, actual, limit in (
-                        ("memory_bytes", rss, budget.memory_bytes),
-                        ("temp_bytes", size, budget.temp_bytes),
-                    )
-                    if actual > limit
-                }
-            if failure or finished:
-                break
-            time.sleep(0.02)
-    finally:
-        cleanup_status = _terminate_process_tree(
-            process, observed_descendants=observed_descendants,
-        )
-        task_path.unlink(missing_ok=True)
-    if failure is None and cleanup_status != "complete":
+    with _project_sampling_scope(attempt_root) as shared_sampler:
+        try:
+            while True:
+                exited = process.poll() is not None
+                finished = exited if worker_session is None else done_path.is_file() or exited
+                try:
+                    if shared_sampler is not None:
+                        scratch_roots = (attempt_root,) if worker_session is None else (attempt_root, worker_session.root)
+                        rss, process_count, size = shared_sampler.sample_project_usage(
+                            None if exited else process.pid, observed_descendants, scratch_roots,
+                        )
+                    else:
+                        rss, process_count = _project_process_usage(
+                            None if exited else process.pid, observed_descendants
+                        )
+                        size = _measure_attempt_tree_bytes(attempt_root)
+                        if worker_session is not None:
+                            size += _measure_attempt_tree_bytes(worker_session.root)
+                except (psutil.Error, OSError, RuntimeError):
+                    measurement_status = "measurement_unavailable"
+                    failure = "project_worker_measurement_unavailable"
+                    break
+                if budget.wall_seconds and time.monotonic() - started > budget.wall_seconds:
+                    failure = "project_worker_timeout"
+                elif process_slots is not None and process_count > process_slots:
+                    failure = "project_worker_process_slots_exceeded"
+                elif rss > budget.memory_bytes or size > budget.temp_bytes:
+                    failure = "project_worker_resource_exceeded"
+                    exceeded = {
+                        name: {"actual": actual, "limit": limit}
+                        for name, actual, limit in (
+                            ("memory_bytes", rss, budget.memory_bytes),
+                            ("temp_bytes", size, budget.temp_bytes),
+                        )
+                        if actual > limit
+                    }
+                if failure or finished:
+                    break
+                time.sleep(0.02)
+        finally:
+            if worker_session is None:
+                cleanup_status = _terminate_process_tree(process, observed_descendants=observed_descendants)
+            elif failure or not done_path.is_file():
+                worker_session.close()
+                cleanup_status = worker_session.cleanup_status
+            else:
+                cleanup_status = "session_active"
+            task_path.unlink(missing_ok=True)
+    if failure is None and cleanup_status not in {"complete", "session_active"}:
         failure = "project_worker_cleanup_failed"
     if failure is not None:
         raise RuntimeWorkerError(
@@ -711,7 +766,12 @@ def _run_project_worker(
                 **({"exceeded": exceeded} if exceeded else {}),
             },
         )
-    if process.returncode != 0 or not result_path.is_file():
+    returncode = process.returncode if worker_session is None else (
+        json.loads(done_path.read_text(encoding="utf-8"))["returncode"] if done_path.is_file() else process.returncode
+    )
+    if returncode != 0 or not result_path.is_file():
+        if worker_session is not None:
+            worker_session.close()
         if result_path.is_file():
             try:
                 failed = json.loads(result_path.read_text(encoding="utf-8"))
@@ -823,6 +883,10 @@ def _run_project_worker(
     causal_facts = result.get("causal_facts")
     if causal_context is not None and not isinstance(causal_facts, Mapping):
         raise RuntimeIntegrityError("项目因果输出缺少核心实际交付事实")
+    if causal_context is not None:
+        from .causal_facts_codec import read_causal_facts
+
+        causal_facts = read_causal_facts(causal_facts, attempt_root)
     request_traces = result.get("request_traces")
     if request_traces is not None and not isinstance(request_traces, Mapping):
         raise RuntimeIntegrityError("项目 request 消费轨迹无效")

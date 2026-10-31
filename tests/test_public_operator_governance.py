@@ -11,7 +11,6 @@ from research_pipeline.platform.semantic_governance import (
 from research_pipeline.runtime.operator_definitions import build_mainline_operator_manifest
 from research_pipeline.runtime.operator_promotion import (
     BUILTIN_OPERATOR_IDENTITIES,
-    LEGACY_OPERATOR_DISPOSITIONS,
     operator_identity,
     validate_mainline_operator_promotions,
 )
@@ -19,7 +18,6 @@ from research_pipeline.runtime.operator_promotion import (
 
 def test_public_operator_inventory_is_only_approved_builtins() -> None:
     manifest = build_mainline_operator_manifest()
-    assert LEGACY_OPERATOR_DISPOSITIONS == {}
     assert {operator_identity(item) for item in manifest.definitions} == BUILTIN_OPERATOR_IDENTITIES
     validate_mainline_operator_promotions(manifest)
 

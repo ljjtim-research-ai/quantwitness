@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from research_pipeline.extensions import OperatorDefinition, ParameterType
+from research_pipeline.extensions import OperatorDefinition, ParameterSpec, ParameterType
 
 from ..operator_definition_factory import _GIB, _MIB, _definition, _parameter
 
@@ -22,7 +22,7 @@ def build_data_event_daily_operator_definitions() -> tuple[OperatorDefinition, .
                 _parameter("execution_estimates_hash", ParameterType.STRING),
             ),
             resource_profile={
-                "memory_bytes": 256 * _MIB,
+                "memory_bytes": _GIB,
                 "cpu_slots": 1,
                 "temp_bytes": 64 * _MIB,
                 "wall_seconds": 300,
@@ -50,27 +50,10 @@ def build_data_event_daily_operator_definitions() -> tuple[OperatorDefinition, .
             module_name="research_pipeline.data_plane.service",
             symbol_name="materialize_dataset_plan",
             implementation_scope="core",
-        ),
-        _definition(
-            "research.validity.data-observation",
-            "research.validity.data-observation.v1",
-            inputs=(("data", "data.columnar-bundle.v1"),),
-            outputs=(("validity", "research.validity-facts.v1"),),
-            parameters=(),
-            resource_profile={
-                "memory_bytes": 256 * _MIB,
-                "cpu_slots": 1,
-                "temp_bytes": 256 * _MIB,
-                "wall_seconds": 300,
-            },
-            code_fingerprint="dataset-manifest-observation-validity-v1",
-            capability="research.validity-facts.v1",
-            module_name="research_pipeline.runtime.operator_graph_evidence",
-            symbol_name="build_dataset_observation_validity_facts",
-            implementation_scope="core",
             dependency_modules=(
-                "research_pipeline.runtime.validity_facts_common",
+                "research_pipeline.data_plane.direct_sources",
+                "research_pipeline.data_plane.snapshots",
+                "research_pipeline.data_plane.snapshot_layout",
             ),
-            cache_compatibility_mode="byte_exact",
         ),
     )

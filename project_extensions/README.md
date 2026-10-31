@@ -2,6 +2,8 @@
 
 本文说明尚未达到框架核心晋级条件的项目算子合同。扩展源码目录只允许 Python 文件，以便生成内容寻址的受控 bundle；薄声明放在源码目录旁，不进入源码闭包。
 
+内部策略Worker复用已构建bundle及其依赖复验，回调接收context、event和state，返回交易意图与JSON状态。该回调属于内部执行协议，尚未接入ResearchPackage的公共算子调用；合同和限制见[策略事件协议](../docs/strategy-protocol.md)。
+
 Python 项目算子的公开构建路径为：
 
 ```powershell
@@ -11,7 +13,7 @@ python -m research_pipeline operator build --spec project_extensions/<name>.oper
 
 命令只读取显式声明和显式源码目录，不扫描当前目录，也不自动安装依赖。生成的内容寻址目录再通过 `--extension-bundle` 显式交给 package 准入和 Runtime。
 
-项目 Verifier 使用独立 bundle，不复用 Operator bundle。Verifier 单独声明 verifier ID、版本、源码闭包、依赖锁，以及允许读取的 Result schema 和支持工件类型；项目专属 Metric 定义也随该 bundle 进入当前 Package 组合并冻结到 Result，不进入公共 Metric discovery。Result 未冻结对应身份、授权输入或 bundle 版本不一致时，verify 直接失败。需要支持列数多于有效观察行数的统计矩阵时，Verifier 使用 `project-verifier-output-v2` 从正式 Result 表复算矩阵行数、非零有效行数、列数和秩，公共门禁不采信 Operator 单方面声明。
+项目专属指标通过研究声明的 `metric_definitions` 保存计算口径和生产实现引用，随 Result 保留。公式正确性由生产算法的手算与确定性测试覆盖。E004 构建入口返回生产算子路径和 `metric_definitions`；指标定义分别保存在 `e004_grid_robustness.metrics.yaml` 与 `e004_random_stability.metrics.yaml`。
 
 项目特有的图、固定日期、参数网格、参考组合和验收语义留在 ResearchPackage；项目算法由
 Python Worker bundle 实现。项目算子身份、Artifact 类型和策略只进入当前 Package 的组合
@@ -50,13 +52,16 @@ package lint/admit 会在数据库打开和正式运行前用真实冻结 contex
 
 项目算子默认 `reuse_scope: same_run`。只有正式输出完全由 typed 输入、参数、fixed clock 和 seed 决定，且不依赖 project/run/node/attempt 等易变 ID 时，薄声明才可显式写 `reuse_scope: cross_run`。Runtime 还会同时检查确定性合同和 `artifact_write_scope: output_only`；没有该字段的既有声明保持同 run 恢复语义。
 
-公开分发只保留本目录的扩展合同；使用者自行提供项目源码、声明和独立 Verifier。可执行的合成示例位于独立公开源码仓库的 `examples/`，私人研究项目及其专用构建脚本不随包分发。
+公开分发只保留本目录的扩展合同；使用者自行提供项目源码、声明和指标定义。可执行的合成示例位于独立公开源码仓库的 `examples/`，私人研究项目及其专用构建脚本不随包分发。
+
+本地 CNE5 风险扩展在读取输入前检查 publication、下一交易日可见规则和来源截止时间，只提交风险估计表及指标。
 
 ## 分批输入、输出和状态
 
 分钟输入保留 `ProjectPartitionInput.iter_batches()` 与普通跨月 state。非分钟 Parquet
 输入支持同一已验证工件下的多个文件，按稳定文件顺序调用 `iter_batches(columns=...,
 batch_size=...)`，必须完整消费；未允许的列、过大批次或漏读会失败。
+普通同构 request 句柄在构造时核对各文件 schema，并在该句柄首次消费时复用；新句柄重新核对，实际数据仍逐文件读取。异构表按确切路径读取时各自检查 schema。
 `output_root` 保留 Path 行为，并提供 `write_batches(port=..., artifact_type=...,
 relative_path=..., schema=..., batches=...)` 与 `write_state(relative_path=...,
 schema_hash=..., chunks=...)`；每批或块最多 32 MiB，返回原 commit 字典。
@@ -117,3 +122,73 @@ causal_plan:
 `state_scope: independent` 每个键批独立；`carry` 在下一键批前由核心检查继承来源和时间
 窗口，超界失败，不静默清空。输出事实与 state 同时继承本次交付和已有来源的并集。
 这是受支持 ABI 的因果约束，不是恶意 Python 沙箱；不能用绕开 ABI 的文件读取声称合规。
+
+### 中国股票日频来源
+
+Catalog 以 `available.daily.v1/next_session_open` 准入的原始日线，可以在 source 中
+显式绑定日期列和冻结交易日历：
+
+```yaml
+sources:
+  - port: bars
+    request_id: daily_prices
+    columns: [date, code, close]
+    observation_column: date
+    available_column: date
+    daily_time:
+      rule: next_session_open
+      timezone: Asia/Shanghai
+      calendar_id: cn-equity-example
+      calendar_source: 已归档交易日历的来源和提取范围
+      sessions: ['2024-01-04', '2024-01-05', '2024-01-08', '2024-01-09']
+```
+
+`sessions` 必须严格递增，覆盖请求范围以及最后一个输入日之后的下一交易日，缺失行情
+不能压缩日历。`calendar_id` 和 `calendar_source` 标识日历及其来源，完整绑定随计划、
+输出元数据和继承来源冻结。日历变更不能继承旧时间证据或复用旧计划身份。
+示例日期仅用于说明结构，真实研究须提供其实际冻结日历。
+
+核心把 D 日数据的观测时间解释为 D 日 15:00，把可见时间解释为日历中下一交易日
+09:30，时区固定为 `Asia/Shanghai`。项目不能自填更早的时点；原始 `date` 列仍以
+日期交给算子。Feature 仅收到决定时点已可见的窗口内输入；Label 使用未来观测窗口，
+其成熟时间由最后实际观测对应的下一交易日开盘确定。Label 请求不得流入 Feature。
+
+同一 `daily_time` 结构也支持以下已准入日期规则：
+
+| rule | 观测时间 | 可见时间 | 日历要求 |
+| --- | --- | --- | --- |
+| `next_session_open` | D 日 15:00 | 下一实际交易日 09:30 | 含全部输入日及末日的下一交易日 |
+| `session_open` | D 日 09:30 | D 日 09:30 | 开盘日期须在冻结日历中，覆盖请求范围 |
+| `business_effective_date` | D 日 00:00 | D 日 00:00 | 覆盖请求日期范围，业务生效日可为非交易日 |
+
+时间统一按 `Asia/Shanghai` 解释；原始日期列保持不变。`session_open` 必须与 Catalog 的
+开盘可见日期角色一致；`business_effective_date` 只接纳已批准的逐日业务状态记录，不能把
+上市日期当作整条证券参考记录的观测日期，也不能据此提前交付退市等属性。
+`current_source_snapshot` 与 `research_observation` 的来源和结论上限继续保留，不表示存在
+供应商历史发布版本链。日期窗口按来源本地日期核对，不随固定时钟显示时区改变。
+
+新规则的准入调用须提供与请求身份一致的冻结 Catalog。规则、日历和来源身份随计划及
+lineage 保存，继承状态不得改换规则或日历。独立证据入口
+`evidence.project_causal_time.rebuild_daily_source_times` 从封存日期重建时间，
+`verify_daily_source_lineage` 核对实际交付日期的聚合时间事实；调用方须提供对应的实际交付
+日期，不能用自报最早、最晚时间替代原始来源证据。
+
+日频正式输出使用 `features/` 或 `labels/` 表目录，核心生成 `artifact-metadata.json`，
+绑定当前 `ResearchSemantics`、表内容和完整因果计划。每个键批单独保存为 Parquet；
+用于机器学习的 Label 键批须保持单一 `label_end_time` 与 `horizon_sessions`，使开发区
+读取可在物理行组边界排除 holdout。日期行键在计划中采用 ISO 字符串，在 Arrow 输出中
+可采用 date 类型，由核心按输出 schema 对齐后附加逐行时间事实。日频模型工件中的
+观察、决定、标签区间和可见时间统一保存为带 UTC 时区的时间戳，保留同一实际时刻。项目仍不得填写
+`CORE_FEATURE_TIME_COLUMNS` 或 `CORE_LABEL_TIME_COLUMNS` 中的核心列。
+
+## 待著而救统计指标
+
+覆盖率使用输入全集分母，分组成员变化使用前后成员并集分母。指标身份、独立复核和历史结果边界见 [待著而救指标合同](dai_zhu_er_jiu_metrics.md)。
+
+## 日频模型预测有效性
+
+`qlib_prediction_validity/` 从已提交的 Feature、Label、切分、拟合审计、预测、选模、模型配置和 holdout 账本收集预测诊断事实。数据观察算子不适用于包含模型训练和候选选择的研究。
+
+该扩展输出 `research-validity-facts-v1`，其中 `model_diagnostics.mode` 为 `walk_forward_prediction_v1` 或 `walk_forward_development_v1`，新写 `table_storage=result_tables_v2`。JSON 仅保留正式表绑定和控制事实，正式表、模型配置、序列窗口及账本由独立 verifier 从已验证 Result 读取；框架独立复核时间切分、拟合范围、逐时点选模、唯一 holdout 收据和 MSE。研究公式与原始输入的对应关系仍由研究包冻结的项目 Verifier 检查。正式指标从独立的 `project.stage3.prediction-metrics.v1` 端口输出，保留汇总MSE原值，并从封存预测补齐单位、观察日期范围、样本数和计算状态；这些字段由核心统计门禁核对。
+
+Result 显式交付模型清单及 holdout 表时，模型诊断同时封存四阶段 holdout 账本。验证从 Result 读取，不访问原运行目录。该合同用于原始收益标签的回归诊断，只有交易仿真门禁不适用；标签、选模、holdout和统计诊断均需实际通过，结论上限为 `research_observation`。

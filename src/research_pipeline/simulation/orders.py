@@ -37,6 +37,7 @@ class Order:
     status: str = "created"
     filled_quantity: int = 0
     rejection_code: str | None = None
+    protection_price: Price | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.order_id, str) or not self.order_id.strip():
@@ -65,6 +66,11 @@ class Order:
             raise SimulationContractError("limit 订单必须提供限价")
         if self.order_type == "market" and self.limit_price is not None:
             raise SimulationContractError("market 订单不能提供限价")
+        if self.protection_price is not None and (
+            self.order_type != "market" or not isinstance(self.protection_price, Price)
+            or self.protection_price.currency != self.instrument.currency
+        ):
+            raise SimulationContractError("保护价仅用于与标的同币种的市价委托")
         if self.time_in_force not in {"DAY", "IOC"}:
             raise SimulationContractError("首版 TIF 只支持 DAY/IOC")
         require_aware_datetime(self.submitted_at, "submitted_at")
@@ -86,6 +92,8 @@ class Order:
             "filled_quantity": self.filled_quantity,
             "rejection_code": self.rejection_code,
         }
+        if self.protection_price is not None:
+            payload["protection_price"] = self.protection_price.to_dict()
         if isinstance(self.instrument, InstrumentKey):
             payload["position_effect"] = self.position_effect
             payload["intent_hash"] = self.intent_hash
@@ -107,7 +115,7 @@ def transition_order(order: Order, *, action: str, fill_quantity: int = 0, rejec
         return replace(order, status="submitted")
     if action == "accept" and order.status == "submitted":
         return replace(order, status="accepted")
-    if action == "reject" and order.status == "submitted" and rejection_code:
+    if action == "reject" and order.status in {"submitted", "accepted"} and rejection_code:
         return replace(order, status="rejected", rejection_code=rejection_code)
     if action == "fill" and order.status in {"accepted", "partially_filled"}:
         quantity = require_integer_quantity(fill_quantity, "fill_quantity")
@@ -116,7 +124,8 @@ def transition_order(order: Order, *, action: str, fill_quantity: int = 0, rejec
             raise SimulationContractError("累计成交量超过订单量")
         return replace(order, status="filled" if total == order.quantity else "partially_filled", filled_quantity=total)
     if action in {"cancel", "expire"} and order.status in {"submitted", "accepted", "partially_filled"}:
-        return replace(order, status="cancelled" if action == "cancel" else "expired")
+        return replace(order, status="cancelled" if action == "cancel" else "expired",
+                       rejection_code=rejection_code)
     raise SimulationContractError(f"非法订单转换: {order.status}->{action}")
 
 

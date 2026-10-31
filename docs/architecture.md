@@ -1,50 +1,58 @@
-# 架构与边界
+# 模块职责与依赖
 
-## 主链
+QuantWitness 面向个人通过 AI 进行研究。ResearchPackage 冻结问题、输入、算法和范围；application 组织一次准备与准入，runtime 执行，Result 直接交给报告和开发反馈。
 
-```text
-ResearchPackage
-  → Catalog/PIT Admission
-  → Typed Operator DAG
-  → Runtime
-  → self-contained Result
-  → independent VerificationResult
+```mermaid
+flowchart LR
+    A[个人与可选 RD-Agent] --> B[ResearchPackage / Workspace]
+    B --> C[声明编译与 Catalog 准入]
+    C --> D[只读 Data Plane]
+    D --> E[Runtime / Qlib / LEAN]
+    E --> F[Result]
+    F --> G[报告 / 比较 / Dashboard]
+    F --> A
 ```
 
-项目 extension 和 core 算子只在实现来源处分叉；从 lint 起回到同一条主链。
+## 从问题找到模块
 
-## 模块职责
+| 问题 | 模块 | 负责的事实 |
+| --- | --- | --- |
+| 数据是什么、何时可见 | `catalog/` | 字段、来源绑定、可见性与版本 |
+| 研究要计算什么 | `packages/` | 研究声明、图编译、指标与输入准入 |
+| 怎样读取大表 | `data_plane/` | 只读查询、有界批次和列式工件 |
+| 怎样执行与恢复 | `runtime/` | 调度、资源、项目 Worker、事件和检查点 |
+| 如何表示市场与账户 | `domain/`、`simulation/` | 时间、规则、订单、资金、持仓与权益 |
+| 如何计算特征与训练 | `research/` | 特征、标签、模型、统计与留出消费 |
+| 如何交付结果 | `results/` | ResultSpec、原子发布、只读加载与直接消费 |
+| 如何生成图表与分析 | 报告及分析模块 | 按显式请求读取 Result 的相关列 |
+| 如何接入项目算法 | `extensions/` | 算子 bundle、参数、入口和依赖 |
+| 如何连接入口 | `application/` | CLI、Workspace 与 RD-Agent 共用的流程服务 |
+| 如何诊断和发现能力 | `cli/`、`operations/`、`platform/` | 参数解析、诊断、公共类型和能力目录 |
 
-- `catalog/`：数据集、字段、可见性、修订、binding 和漂移合同。
-- `packages/`：ResearchPackage schema、纯编译和 ResultSpec。
-- `data_plane/`：唯一数据库读取边界，输出列式工件。
-- `extensions/`：受控项目 bundle、算子合同和准入。
-- `runtime/`：typed DAG、事件、checkpoint、资源租约和恢复。
-- `domain/`、`simulation/`：金融时间、市场规则、订单、成交和账本。
-- `research/`：研究算法、标签、统计、holdout 和负控制，不直接查库。
-- `results/`：自包含 Result 的选择、原子发布和只读快照。
-- `evidence/`：独立读取 Result，重算 validity 并生成 VerificationResult。
-- `cli/`：参数解析和编排，不复制领域算法。
+## 计算实现的边界
 
-## 单一事实源
+Qlib 提供日频处理器与模型。框架负责训练窗口、标签可见时间、候选选择和持久 holdout 账本。项目日线与一分钟策略使用 LEAN，正式输入、策略参数、公司行动和市场规则来自准入计划。
 
-- 能力：`capabilities.json`
-- 数据：Catalog Lock
-- 研究：ResearchPackage
-- 通用算子：唯一 OperatorDefinition manifest
-- 项目实现：计划内已准入 bundle 闭包
-- 运行：当前 invocation、事件链和 checkpoint
-- 结果：ResultStore
-- 可消费结论：VerificationResult
+金融约束在读取与状态转换处执行：盘中数据必须已完成，规则必须当时可见，可用资金和可卖数量在订单与账户变更时处理。生产算法通过开发测试验收，完成的研究直接发布 Result。
 
-Markdown 只解释这些合同，不替代它们。
+RD-Agent 位于研究提案层，经正式 Workspace 执行候选并读取开发指标。它不绕过数据准入，也不将最终 test／holdout 用于迭代。失败候选的诊断和成功候选的指标分别表达。
+
+## 正式记录
+
+| 问题 | 记录 |
+| --- | --- |
+| 当前支持什么 | `capabilities.json` |
+| 允许使用哪些来源与时点 | Catalog Lock 和准入计划 |
+| 本次研究问题和参数 | ResearchPackage |
+| 使用什么实现 | 计划中的算子及项目 bundle |
+| 执行到哪里 | 事件、资源观测和已提交 checkpoint |
+| 得到了什么 | Result |
+| 最终留出数据是否已消费 | 持久研究系列账本 |
+
+同次调用直接交接已经解析的对象。持久计划和检查点用于跨进程执行及恢复；恢复重新检查输入、配置、实现与发布完整性，不能复用陈旧或未提交输出。
 
 ## 依赖方向
 
-平台和领域层不反向依赖项目目录。core 实现不得读取 `project_extensions` 或某个研究包；项目 bundle 也不得反向导入框架内部、数据库兼容层、采集器或因子发布器。
+数据读取集中在 Data Plane，核心算法不导入采集器、数据库兼容 API 或因子发布器。项目代码通过正式接口接入，Dashboard 单向依赖结果接口。受信任的本地项目 Worker 提供进程隔离与资源限制，不是任意 Python 的安全沙箱。
 
-Result 不执行研究算法，Verifier 不导入生产仿真实现。两者可共用纯 schema 合同，但金融守恒和 TCA 必须由独立实现重算。
-
-## 数据安全
-
-研究数据库只读。准入和运行都记录 size/mtime 前后不变；任何采集、修复、建表、因子重算或发布属于另一条需单独授权的流程。
+数据库访问只读；输入目录与输出目录分离。采集、修复和因子发布有独立授权要求。数据与实现合同见[数据平面](data_plane.md)、[研究包](research_package.md)、[运行与恢复](runtime.md)及[项目扩展](../EXTENSIONS.md)。

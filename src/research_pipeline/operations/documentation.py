@@ -17,18 +17,41 @@ REQUIRED_DOCS = frozenset(
         "catalog.md",
         "cli.md",
         "data_plane.md",
+        "snapshot-layout.md",
+        "artifact-lifecycle.md",
         "evidence.md",
         "framework-contracts.md",
         "getting-started.md",
         "workspace-quickstart.md",
+        "workspace-continuation.md",
+        "runtime-progress.md",
+        "implementation-identity-scope.md",
+        "research-execution-improvements.md",
         "index.md",
         "minute_rule_provenance.md",
+        "minute-project-scope.md",
+        "strategy-protocol.md",
+        "lean-execution.md",
         "operations.md",
         "release.md",
+        "external-acceptance.md",
         "research_package.md",
         "runtime.md",
+        "resource-history.md",
         "walk_forward_model.md",
+        "holdout-series.md",
+        "qlib-model-results.md",
+        "qlib-report.md",
+        "qlib-expressions.md",
+        "qlib-factor-baselines.md",
+        "qlib-portfolio-risk.md",
         "project_resource_budgets.md",
+        "spot_account.md",
+        "financial_simulation.md",
+        "robust_research.md",
+        "minute-resource-budget.md",
+        "explicit_orders.md",
+        "shared_futures.md",
     }
 )
 
@@ -39,8 +62,9 @@ FORBIDDEN_PATTERNS = (
         r"(?:dataset|field)\s+search\s+--query\b"
     ),
     re.compile(
-        r"python\s+-m\s+research_pipeline\s+verify\b[^\n]*--result-id\b"
+        r"python\s+-m\s+research_pipeline\s+verify\b"
     ),
+    re.compile(r"--(?:verification-result|verification-process-slots|verifier-bundle)\b"),
     re.compile(r"--source-visibility\b"),
     re.compile(r"minute-source-visibility-v1\b"),
     re.compile(r"cn_equity\.minute_bar\.raw_reconstructed\b"),
@@ -75,13 +99,17 @@ def audit_documentation(root: Path) -> dict[str, object]:
     for name in sorted(REQUIRED_DOCS - {"index.md"}):
         if f"({name})" not in indexed_text:
             errors.append({"kind": "missing_current_doc_link", "path": f"docs/{name}"})
-    for raw_target in LINK_PATTERN.findall(indexed_text):
+    history = re.search(r"^## 历史记录\s*\n(?P<links>.*?)(?=^## |\Z)", indexed_text, flags=re.MULTILINE | re.DOTALL)
+    for match in LINK_PATTERN.finditer(indexed_text):
+        raw_target = match.group(1)
+        historical = history is not None and history.start("links") <= match.start() < history.end("links")
         target = _relative_link_target(docs_root / "index.md", raw_target)
         if (
             target is not None
             and target.parent == docs_root.resolve()
             and target.suffix.lower() == ".md"
             and target.name not in REQUIRED_DOCS
+            and not historical
         ):
             errors.append(
                 {

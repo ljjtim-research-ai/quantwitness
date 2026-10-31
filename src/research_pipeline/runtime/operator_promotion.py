@@ -1,11 +1,10 @@
-"""公共 OperatorDefinition 的内建、待迁出与正式晋级门禁。"""
+"""公共 OperatorDefinition 的内建、本地准入与正式晋级门禁。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from hashlib import sha256
 from types import MappingProxyType
-from typing import Iterable, Mapping
+from typing import Iterable
 
 from research_pipeline.extensions import (
     CompiledOperatorManifest,
@@ -23,7 +22,6 @@ from research_pipeline.platform.semantic_governance import (
 
 
 BUILTIN_CLASSIFICATION = "builtin"
-LEGACY_EXIT_CLASSIFICATION = "legacy_exit"
 PROMOTED_CLASSIFICATION = "promoted"
 OperatorIdentity = tuple[str, str, str, str]
 BUILTIN_ARTIFACT_TYPE_IDENTITIES = frozenset({
@@ -38,30 +36,21 @@ BUILTIN_ARTIFACT_TYPE_IDENTITIES = frozenset({
     "research.minute-labels.v1",
     "research.minute-observation.v1",
     "research.minute-signals.v1",
-    "research.minute-simulation.v1",
     "research.minute-statistics.v1",
     "research.minute-targets.v1",
-    "research.model-fits.v1",
-    "research.model-fold-metrics.v1",
-    "research.model-locked-holdout.v1",
-    "research.model-preprocessed-folds.v1",
-    "research.model-selection.v1",
-    "research.model-split-manifest.v1",
-    "research.model-validation-predictions.v1",
-    "research.validity-facts.v1",
+    "research.model-fits.v2",
+    "research.model-fold-metrics.v2",
+    "research.model-locked-holdout.v2",
+    "research.model-selection.v2",
+    "research.model-split-manifest.v2",
+    "research.model-validation-predictions.v2",
 })
 
 
 # 公共定义集合经审查固定；有意修改实现需同步复核本常量。
 BUILTIN_OPERATOR_DEFINITION_SET_HASH = (
-    "8a69f5105d675f1a6b622ddd2a638d103908c28b567fd3a17e5ee23ebbcee77f"
+    "b6816452eca17a2778a983b9e96c4dc49c233c036fd5a49882ab7b0e9214bcd7"
 )
-
-
-@dataclass(frozen=True)
-class LegacyOperatorDisposition:
-    remediation_item: str
-    target: str
 
 
 # 该清单固定 00A 验收后的既有公共合同，不从 manifest 或 baseline 自动生成。
@@ -92,12 +81,6 @@ BUILTIN_OPERATOR_IDENTITIES: frozenset[OperatorIdentity] = frozenset(
             "research_pipeline.data_plane.minute_scan",
         ),
         (
-            "finance.simulation.intraday",
-            "3.0.0",
-            "finance.simulation.intraday.v3",
-            "research_pipeline.simulation.minute_execution",
-        ),
-        (
             "research.bars.minute_adjust",
             "1.0.0",
             "research.bars.minute_adjust.v1",
@@ -123,44 +106,38 @@ BUILTIN_OPERATOR_IDENTITIES: frozenset[OperatorIdentity] = frozenset(
         ),
         (
             "research.model.fit",
-            "1.0.0",
-            "research.model.fit.v1",
+            "2.0.0",
+            "research.model.fit.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.fold-metrics",
-            "1.0.0",
-            "research.model.fold-metrics.v1",
+            "2.0.0",
+            "research.model.fold-metrics.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.locked-holdout",
-            "1.0.0",
-            "research.model.locked-holdout.v1",
+            "2.0.0",
+            "research.model.locked-holdout.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.predict",
-            "1.0.0",
-            "research.model.predict.v1",
-            "research_pipeline.runtime.walk_forward_model_execution",
-        ),
-        (
-            "research.model.preprocess-fit",
-            "1.0.0",
-            "research.model.preprocess-fit.v1",
+            "2.0.0",
+            "research.model.predict.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.selection",
-            "1.0.0",
-            "research.model.selection.v1",
+            "2.0.0",
+            "research.model.selection.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
             "research.model.split-manifest",
-            "1.0.0",
-            "research.model.split-manifest.v1",
+            "2.0.0",
+            "research.model.split-manifest.v2",
             "research_pipeline.runtime.walk_forward_model_execution",
         ),
         (
@@ -187,42 +164,10 @@ BUILTIN_OPERATOR_IDENTITIES: frozenset[OperatorIdentity] = frozenset(
             "research.targets.intraday.v1",
             "research_pipeline.runtime.adapters.minute_research",
         ),
-        (
-            "research.validity.adjusted-minute-observation",
-            "1.0.0",
-            "research.validity.adjusted-minute-observation.v1",
-            "research_pipeline.runtime.adapters.minute_data",
-        ),
-        (
-            "research.validity.data-observation",
-            "1.0.0",
-            "research.validity.data-observation.v1",
-            "research_pipeline.runtime.operator_graph_evidence",
-        ),
-        (
-            "research.validity.minute",
-            "1.0.0",
-            "research.validity.minute.v1",
-            "research_pipeline.runtime.operator_graph_evidence",
-        ),
-        (
-            "research.validity.minute-observation",
-            "1.0.0",
-            "research.validity.minute-observation.v1",
-            "research_pipeline.runtime.adapters.minute_data",
-        ),
     }
 )
 
-LEGACY_OPERATOR_DISPOSITIONS: Mapping[OperatorIdentity, LegacyOperatorDisposition] = (
-    MappingProxyType({})
-)
-
-LEGACY_OPERATOR_DEFINITION_HASHES: Mapping[OperatorIdentity, str] = MappingProxyType(
-    {}
-)
-
-# 新增公共业务算子只能在这里持有已批准的 OperatorPromotionReview；当前没有。
+# 通用晋级记录与一次性的 local_only 人工准入分别保存。
 MAINLINE_OPERATOR_PROMOTION_REVIEWS: tuple[OperatorPromotionReview, ...] = ()
 
 
@@ -246,14 +191,6 @@ def operator_mainline_governance(
         return {
             "mainline_classification": BUILTIN_CLASSIFICATION,
             "promotion_status": "not_required",
-        }
-    disposition = LEGACY_OPERATOR_DISPOSITIONS.get(identity)
-    if disposition is not None:
-        return {
-            "mainline_classification": LEGACY_EXIT_CLASSIFICATION,
-            "promotion_status": "pending_removal",
-            "remediation_item": disposition.remediation_item,
-            "target": disposition.target,
         }
     matches = tuple(
         review
@@ -294,12 +231,6 @@ def validate_mainline_operator_promotions(
     )
     if len(set(review_keys)) != len(review_keys):
         raise ExtensionError("公共算子晋级记录的 operator/version 重复")
-    overlap = BUILTIN_OPERATOR_IDENTITIES.intersection(LEGACY_OPERATOR_DISPOSITIONS)
-    if overlap:
-        raise ExtensionError("内建算子与待迁出存量分类重叠")
-    if set(LEGACY_OPERATOR_DEFINITION_HASHES) != set(LEGACY_OPERATOR_DISPOSITIONS):
-        raise ExtensionError("待迁出存量定义摘要与责任清单不一致")
-
     definitions_by_identity = {
         operator_identity(item): item for item in manifest.definitions
     }
@@ -329,16 +260,6 @@ def validate_mainline_operator_promotions(
             module_name=reference.module_name,
             dependency_modules=reference.dependency_modules,
         )
-        identity = operator_identity(definition)
-        expected_legacy_hash = LEGACY_OPERATOR_DEFINITION_HASHES.get(identity)
-        if (
-            expected_legacy_hash is not None
-            and definition.definition_hash != expected_legacy_hash
-        ):
-            raise ExtensionError(
-                f"待迁出公共算子定义已漂移: {definition.name}@{definition.version}"
-            )
-
     approved = tuple(item for item in review_items if item.is_public)
     for review in approved:
         identity = (
@@ -347,12 +268,9 @@ def validate_mainline_operator_promotions(
             review.implementation_id,
             review.module_name,
         )
-        if (
-            identity in BUILTIN_OPERATOR_IDENTITIES
-            or identity in LEGACY_OPERATOR_DISPOSITIONS
-        ):
+        if identity in BUILTIN_OPERATOR_IDENTITIES:
             raise ExtensionError(
-                f"既有内建或待迁出算子不得重复伪造晋级: "
+                f"既有内建算子不得重复伪造晋级: "
                 f"{review.operator_id}@{review.operator_version}"
             )
         definition = definitions_by_identity.get(identity)
@@ -410,12 +328,8 @@ __all__ = [
     "BUILTIN_CLASSIFICATION",
     "BUILTIN_OPERATOR_DEFINITION_SET_HASH",
     "BUILTIN_OPERATOR_IDENTITIES",
-    "LEGACY_EXIT_CLASSIFICATION",
-    "LEGACY_OPERATOR_DISPOSITIONS",
-    "LEGACY_OPERATOR_DEFINITION_HASHES",
     "MAINLINE_OPERATOR_PROMOTION_REVIEWS",
     "PROMOTED_CLASSIFICATION",
-    "LegacyOperatorDisposition",
     "operator_identity",
     "operator_mainline_governance",
     "validate_mainline_operator_promotions",

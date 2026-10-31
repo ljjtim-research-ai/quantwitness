@@ -41,30 +41,24 @@ _MIB = 1024 * 1024
 _GIB = 1024 * _MIB
 # 明确登记共同变化的算子族；不从导入或调用图推断实现身份。
 _ADAPTER_MODULES_BY_SYMBOL = {
-    "execute_data_catalog_admission_v1": "research_pipeline.runtime.adapters.validity",
+    "execute_data_catalog_admission_v1": "research_pipeline.runtime.adapters.catalog",
     "execute_data_columnar_materialize_v1": "research_pipeline.application.grid_data",
     "execute_data_minute_adjustment_snapshot_v1": "research_pipeline.runtime.adapters.minute_adjustment",
     "execute_data_minute_scan_v1": "research_pipeline.runtime.adapters.minute_data",
-    "execute_finance_simulation_intraday_v3": "research_pipeline.runtime.adapters.minute_simulation",
     "execute_research_bars_minute_adjust_v1": "research_pipeline.runtime.adapters.minute_adjustment",
     "execute_research_bars_minute_resample_v1": "research_pipeline.runtime.adapters.minute_data",
     "execute_research_features_intraday_v1": "research_pipeline.runtime.adapters.minute_research",
     "execute_research_labels_intraday_v1": "research_pipeline.runtime.adapters.minute_research",
-    "execute_research_model_fit_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_fold_metrics_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_locked_holdout_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_predict_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_preprocess_fit_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_selection_v1": "research_pipeline.runtime.adapters.model",
-    "execute_research_model_split_manifest_v1": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_fit_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_fold_metrics_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_locked_holdout_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_predict_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_selection_v2": "research_pipeline.runtime.adapters.model",
+    "execute_research_model_split_manifest_v2": "research_pipeline.runtime.adapters.model",
     "execute_research_observation_minute_bars_v1": "research_pipeline.runtime.adapters.minute_data",
     "execute_research_signals_intraday_v1": "research_pipeline.runtime.adapters.minute_research",
     "execute_research_statistics_minute_v1": "research_pipeline.runtime.adapters.minute_statistics",
     "execute_research_targets_intraday_v1": "research_pipeline.runtime.adapters.minute_research",
-    "execute_research_validity_adjusted_minute_observation_v1": "research_pipeline.runtime.adapters.minute_data",
-    "execute_research_validity_data_observation_v1": "research_pipeline.runtime.adapters.validity",
-    "execute_research_validity_minute_observation_v1": "research_pipeline.runtime.adapters.minute_data",
-    "execute_research_validity_minute_v1": "research_pipeline.runtime.adapters.minute_statistics",
 }
 
 
@@ -79,27 +73,38 @@ _COMMON_ADAPTER_DEPENDENCIES = (
     "research_pipeline.research.semantics",
 )
 _MINUTE_IO_DEPENDENCIES = (
+    "research_pipeline.domain.minute_scope_input",
     "research_pipeline.runtime.adapters.minute_io",
     "research_pipeline.data_plane.minute_scan",
+    "research_pipeline.data_plane.archived_inputs",
+    "research_pipeline.data_plane.archive_read",
+    "research_pipeline.data_plane.dataset_files",
     "research_pipeline.data_plane.minute_resampling",
+    "research_pipeline.platform.arrow_rows",
     "research_pipeline.data_plane.partitioned_artifacts",
     "research_pipeline.domain.session_calendar",
+    "research_pipeline.domain.minute_request_scope",
+    "research_pipeline.domain.minute_rule_snapshots",
     "research_pipeline.research.minute_operators",
 )
 _ADAPTER_FAMILY_DEPENDENCIES = {
+
+
     "research_pipeline.runtime.adapters.model": (
+        "research_pipeline.runtime.model_fit_parallel",
+        "research_pipeline.research.validation.search_manifest",
         "research_pipeline.runtime.walk_forward_model_execution",
+        "research_pipeline.runtime.model_sequence",
+        "research_pipeline.research.modeling.sequence",
+        "research_pipeline.research.modeling.inputs",
+        "research_pipeline.research.dataframe_budget",
         "research_pipeline.research.validation.holdout",
     ),
-    "research_pipeline.runtime.adapters.validity": (
-        "research_pipeline.runtime.operator_graph_evidence",
-        "research_pipeline.runtime.validity_facts_common",
+    "research_pipeline.runtime.adapters.catalog": (
     ),
     "research_pipeline.runtime.adapters.minute_data": (
         *_MINUTE_IO_DEPENDENCIES,
         "research_pipeline.data_plane.minute_quality",
-        "research_pipeline.runtime.operator_graph_evidence",
-        "research_pipeline.runtime.validity_facts_common",
         "research_pipeline.platform.metric_contracts",
     ),
     "research_pipeline.runtime.adapters.minute_adjustment": (
@@ -108,6 +113,9 @@ _ADAPTER_FAMILY_DEPENDENCIES = {
         "research_pipeline.data_plane.minute_adjustment",
         "research_pipeline.data_plane.minute_quality",
         "research_pipeline.data_plane.dataset_artifacts",
+        "research_pipeline.data_plane.dataset_files",
+        "research_pipeline.data_plane.archive_read",
+        "research_pipeline.data_plane.direct_sources",
         "research_pipeline.simulation.corporate_actions",
     ),
     "research_pipeline.runtime.adapters.minute_research": (
@@ -115,36 +123,28 @@ _ADAPTER_FAMILY_DEPENDENCIES = {
         "research_pipeline.catalog.minute",
         "research_pipeline.data_plane.minute_adjustment",
     ),
-    "research_pipeline.runtime.adapters.minute_simulation": (
-        *_MINUTE_IO_DEPENDENCIES,
-        "research_pipeline.data_plane.minute_adjustment",
-        "research_pipeline.domain.minute_rule_snapshots",
-        "research_pipeline.domain.trading",
-        "research_pipeline.platform.minute_operator_contracts",
-        "research_pipeline.simulation.bar_tca",
-        "research_pipeline.simulation.events",
-        "research_pipeline.simulation.minute_execution",
-        "research_pipeline.simulation.result_contract",
-        "research_pipeline.runtime.bar_tca_adapter",
-    ),
+
     "research_pipeline.runtime.adapters.minute_statistics": (
         *_MINUTE_IO_DEPENDENCIES,
         "research_pipeline.platform.metric_contracts",
         "research_pipeline.research.statistics.minute_profile",
-        "research_pipeline.runtime.operator_graph_evidence",
-        "research_pipeline.runtime.validity_facts_common",
     ),
     "research_pipeline.application.grid_data": (
         "research_pipeline.application.grid_data_contract",
         "research_pipeline.data_plane.service",
+        "research_pipeline.data_plane.archived_inputs",
         "research_pipeline.data_plane.admitted_plan_codec",
         "research_pipeline.data_plane.dataset_artifacts",
+        "research_pipeline.data_plane.dataset_files",
+        "research_pipeline.data_plane.archive_read",
+        "research_pipeline.data_plane.direct_sources",
         "research_pipeline.data_plane.execution_budget",
         "research_pipeline.data_plane.execution_estimate",
         "research_pipeline.data_plane.errors",
         "research_pipeline.platform.metric_contracts",
     ),
 }
+
 
 
 def _parameter(name: str, value_type: ParameterType) -> ParameterSpec:
@@ -189,28 +189,15 @@ def _bar_tca_parameters(
 
 
 def _walk_forward_model_parameters() -> tuple[ParameterSpec, ...]:
-    """模型阶段共享的冻结候选、预处理、目标和确定性合同。"""
+    """Qlib 候选、目标及确定性合同。"""
     return (
         _parameter("candidate_jsons", ParameterType.STRING_LIST),
-        _choice_parameter(
-            "target_kind", ParameterType.STRING, ("regression", "classification")
-        ),
-        _choice_parameter(
-            "objective",
-            ParameterType.STRING,
-            ("neg_mean_squared_error", "neg_mean_absolute_error", "accuracy"),
-        ),
+        _choice_parameter("target_kind", ParameterType.STRING, ("regression",)),
+        _choice_parameter("objective", ParameterType.STRING, ("neg_mean_squared_error", "neg_mean_absolute_error")),
         _choice_parameter("direction", ParameterType.STRING, ("maximize", "minimize")),
         _parameter("search_id", ParameterType.STRING),
         _parameter("search_frozen_at", ParameterType.STRING),
-        _choice_parameter(
-            "preprocessing",
-            ParameterType.STRING,
-            ("median_standardize_v1", "median_only_v1"),
-        ),
-        _parameter("feature_selection_k", ParameterType.INTEGER),
         _parameter("research_identity_hash", ParameterType.STRING),
-        _parameter("simple_model_gate_passed", ParameterType.BOOLEAN),
         _parameter("thread_count", ParameterType.INTEGER),
     )
 

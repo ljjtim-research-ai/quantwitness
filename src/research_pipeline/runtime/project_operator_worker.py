@@ -110,7 +110,8 @@ def _bind_windows_descendants_to_worker_lifetime() -> bool:
     kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
     kernel32.CloseHandle.restype = ctypes.c_int
 
-    handle = kernel32.CreateJobObjectW(None, None)
+    from research_pipeline.platform.process_resources import _WINDOWS_WORKER_JOB_ENV
+    handle = kernel32.CreateJobObjectW(None, os.environ.pop(_WINDOWS_WORKER_JOB_ENV, None))
     if not handle:
         return False
     limits = _WindowsJobExtendedLimitInformation()
@@ -132,6 +133,49 @@ def _bind_windows_descendants_to_worker_lifetime() -> bool:
     # Job handle，并终止仍存活的后代；监督器的 psutil 清理继续作为跨平台兜底。
     _WINDOWS_JOB_HANDLE = int(handle)
     return True
+
+
+def _make_worker_descendant_check():
+    """检查当前Worker的存活后代；Windows只查询已绑定Job的进程集合。"""
+    import psutil
+
+    if sys.platform != "win32":
+        process = psutil.Process()
+        return lambda: any(child.is_running() for child in process.children(recursive=True))
+    if _WINDOWS_JOB_HANDLE is None:
+        raise ValueError("project_worker_job_binding_failed")
+    handle = _WINDOWS_JOB_HANDLE
+    query = ctypes.WinDLL("kernel32", use_last_error=True).QueryInformationJobObject
+    query.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)
+    query.restype = ctypes.c_int
+    # JobObjectBasicProcessIdList含两个DWORD和可变长ULONG_PTR数组。
+    capacity = 8
+    buffer = ctypes.create_string_buffer(8 + ctypes.sizeof(ctypes.c_size_t) * capacity)
+    current_pid = os.getpid()
+
+    def has_descendants():
+        nonlocal buffer, capacity
+        while True:
+            succeeded = query(handle, 3, buffer, ctypes.sizeof(buffer), None)
+            assigned, returned = (ctypes.c_uint32 * 2).from_buffer(buffer)
+            if succeeded and returned == assigned:
+                break
+            if not succeeded and ctypes.get_last_error() != 234:
+                raise ValueError("project_worker_job_query_failed")
+            capacity = max(capacity * 2, assigned)
+            buffer = ctypes.create_string_buffer(8 + ctypes.sizeof(ctypes.c_size_t) * capacity)
+        process_ids = (ctypes.c_size_t * returned).from_buffer(buffer, 8)
+        for pid in process_ids:
+            if pid == current_pid:
+                continue
+            try:
+                if psutil.Process(pid).is_running():
+                    return True
+            except psutil.NoSuchProcess:
+                continue
+        return False
+
+    return has_descendants
 
 
 @dataclass(frozen=True)
@@ -213,11 +257,23 @@ def _load_project_entry_module(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attempt-root", required=True)
-    parser.add_argument("--task", required=True)
-    parser.add_argument("--result", required=True)
+    parser.add_argument("--attempt-root")
+    parser.add_argument("--task")
+    parser.add_argument("--result")
+    parser.add_argument("--session-root")
     args = parser.parse_args(argv)
     windows_job_bound = _bind_windows_descendants_to_worker_lifetime()
+    if args.session_root:
+        if sys.platform == "win32" and not windows_job_bound:
+            raise ValueError("project_worker_job_binding_failed")
+        from .causal_worker_session import run_session
+        return run_session(args.session_root, _execute_task)
+    if not all((args.attempt_root, args.task, args.result)):
+        parser.error("单批执行必须提供attempt-root、task和result")
+    return _execute_task(args, windows_job_bound=windows_job_bound)
+
+
+def _execute_task(args, *, session=None, windows_job_bound=True):
     attempt_root = Path(args.attempt_root).resolve(strict=True)
     task_path = Path(args.task).resolve(strict=True)
     result_path = Path(args.result).resolve()
@@ -232,21 +288,27 @@ def main(argv: list[str] | None = None) -> int:
         identity, manifest, context, inputs, output_contracts = _validate_task(
             task,
             attempt_root=attempt_root,
+            session=session,
         )
-        _validate_installed_dependencies(manifest.dependency_lock)
+        if session is None or not session.get("dependencies_verified"):
+            _validate_installed_dependencies(manifest.dependency_lock)
+            if session is not None:
+                session["dependencies_verified"] = True
         output_root = ProjectOutputRoot(attempt_root / "outputs")
         output_root.mkdir()
         if "causal_context" in task:
             from .project_causal_worker import run_causal_entry
         sys.dont_write_bytecode = True
-        source_root = attempt_root / str(task["bundle_relative_path"]) / "sources"
-        sys.path.insert(0, str(source_root))
-        synthetic_root = f"_research_project_{identity['identity_hash'][:16]}"
-        module = _load_project_entry_module(
-            source_root=source_root,
-            entry_module=manifest.entry_module,
-            synthetic_root=synthetic_root,
-        )
+        source_root = (session["root"] if session is not None else attempt_root) / str(task["bundle_relative_path"]) / "sources"
+        module = session.get("module") if session is not None else None
+        if module is None:
+            sys.path.insert(0, str(source_root))
+            synthetic_root = f"_research_project_{identity['identity_hash'][:16]}"
+            module = _load_project_entry_module(
+                source_root=source_root, entry_module=manifest.entry_module, synthetic_root=synthetic_root,
+            )
+            if session is not None:
+                session["module"] = module
         entry = getattr(module, manifest.entry_function, None)
         if not callable(entry):
             raise ValueError("project_entry_missing")
@@ -259,6 +321,10 @@ def main(argv: list[str] | None = None) -> int:
             if "causal_plan" in context.parameters:
                 raise ValueError("project_causal_context_missing")
             raw_commits = entry(context, inputs, output_root)
+        if session is not None:
+            import psutil
+            if any(child.is_running() for child in psutil.Process().children(recursive=True)):
+                raise ValueError("project_worker_session_descendants_remaining")
         for item in inputs:
             if "causal_context" not in task and isinstance(
                 item,
@@ -299,7 +365,9 @@ def main(argv: list[str] | None = None) -> int:
         if request_traces:
             payload["request_traces"] = request_traces
         if causal_facts is not None:
-            payload["causal_facts"] = causal_facts
+            from .causal_facts_codec import write_causal_facts
+
+            payload["causal_facts"] = write_causal_facts(causal_facts, attempt_root)
         result_handle.write(canonical_json(payload))
         result_handle.flush()
         os.fsync(result_handle.fileno())
@@ -351,6 +419,7 @@ def _validate_task(
     task: object,
     *,
     attempt_root: Path,
+    session=None,
 ) -> tuple[
     Mapping[str, object],
     object,
@@ -382,7 +451,21 @@ def _validate_task(
         raise ValueError("project_runtime_identity_hash_invalid")
     if task["bundle_relative_path"] != identity["bundle_hash"]:
         raise ValueError("project_bundle_location_invalid")
-    manifest = verify_project_operator_bundle(attempt_root / str(task["bundle_relative_path"]))
+    if session is not None:
+        import copy
+        from .causal_worker_session import session_binding
+        binding = session_binding(task)
+        if "binding" in session and binding != session["binding"]:
+            raise ValueError("project_worker_session_binding_changed")
+        if "binding" not in session:
+            session["binding"] = copy.deepcopy(binding)
+    manifest = session.get("manifest") if session is not None else None
+    first_task = manifest is None
+    if first_task:
+        bundle_root = session["root"] if session is not None else attempt_root
+        manifest = verify_project_operator_bundle(bundle_root / str(task["bundle_relative_path"]))
+        if session is not None:
+            session["manifest"] = manifest
     checks = {
         "project_id": manifest.project_id,
         "bundle_hash": manifest.bundle_hash,
@@ -394,10 +477,11 @@ def _validate_task(
     }
     if any(identity[key] != value for key, value in checks.items()):
         raise ValueError("project_bundle_runtime_identity_mismatch")
-    if identity["adapter_hash"] != project_worker_adapter_hash():
-        raise ValueError("project_worker_adapter_drift")
-    if identity["runtime_environment_hash"] != environment_fingerprint():
-        raise ValueError("project_worker_environment_drift")
+    if first_task:
+        if identity["adapter_hash"] != project_worker_adapter_hash():
+            raise ValueError("project_worker_adapter_drift")
+        if identity["runtime_environment_hash"] != environment_fingerprint():
+            raise ValueError("project_worker_environment_drift")
     if not isinstance(task["context"], Mapping):
         raise ValueError("project_context_invalid")
     context = ProjectOperatorContext.from_dict(task["context"])
@@ -500,6 +584,28 @@ def _load_input(
             raise ValueError("project_request_table_input_invalid")
         normalized: dict[str, Mapping[str, object]] = {}
         for request in requests:
+            if isinstance(request, Mapping) and request.get("source_kind") == "direct":
+                from research_pipeline.data_plane.direct_sources import DirectDatasetRef
+
+                expected = {"request_id", "source_identity", "schema_hash", "source_kind",
+                            "source_revision_hash", "admitted_plan_hash", "direct_reference", "direct_root"}
+                if (set(request) not in (expected, expected | {"admission"})
+                        or not isinstance(request["request_id"], str) or not request["request_id"]
+                        or not isinstance(request["direct_reference"], Mapping)
+                        or not isinstance(request["direct_root"], str)
+                        or ("admission" in request and not isinstance(request["admission"], Mapping))):
+                    raise ValueError("project_request_table_input_invalid")
+                request_id = request["request_id"]
+                if request_id in normalized:
+                    raise ValueError("project_request_table_input_invalid")
+                reference = DirectDatasetRef.from_dict(request["direct_reference"])
+                if any(getattr(reference, name) != request[name]
+                       for name in ("source_identity", "schema_hash", "source_revision_hash")):
+                    raise ValueError("project_direct_table_identity_mismatch")
+                descriptor = {key: value for key, value in request.items() if key != "request_id"}
+                # 只传来源引用；首次打开 request 时由 Worker 自己解析并复验。
+                normalized[request_id] = descriptor
+                continue
             if (
                 not isinstance(request, Mapping)
                 or set(request) not in (

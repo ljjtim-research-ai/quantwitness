@@ -1,4 +1,10 @@
-# ResearchPackage
+# 研究包：把研究问题写成可执行说明
+
+ResearchPackage 可以理解成一份实验配方：研究什么、用哪些数据、按什么步骤计算、如何评价以及需要什么输出。它把这些约定放在四份 YAML 文件中，方便检查、复用和交给别人继续研究。
+
+自动创建的草稿仍需要填写。下面说明文件布局和必须明确的内容。
+
+## 参数与行为说明
 
 ResearchPackage 是研究意图的唯一声明入口。它包含四个文件：
 
@@ -15,7 +21,7 @@ spec/research.yaml
 
 `package expand-variants --base <基包> --manifest <清单> --output-root <目录>` 从一个完整基包原子生成多个普通 ResearchPackage。清单必须绑定基包 hash，并为每个变体提供稳定 `variant_id`、package slug、显示名、版本、graph ID，以及用 `node_id + parameter_name` 定位的既有参数覆盖。它不支持深层合并、表达式、模板、Python 或 SQL。
 
-任一变体引用未知节点、未知参数、重复标识或不兼容值类型时，整个输出目录不发布。成功生成的包没有特殊运行语义，仍分别经过原有 loader、Operator 参数 schema、lint、admit、PIT、ResultSpec、run 和 verify。
+任一变体引用未知节点、未知参数、重复标识或不兼容值类型时，整个输出目录不发布。成功生成的包没有特殊运行语义，仍分别经过原有 loader、Operator 参数 schema、lint、admit、PIT、ResultSpec、run 和 report。
 
 ## package.yaml
 
@@ -45,6 +51,8 @@ spec/research.yaml
 - 指标和 claim 合同
 - 研究语义、holdout 和复现要求
 
+指标按 ResultSpec 中的来源节点、端口和声明表结构绑定。同类观察节点可以分别输出正式指标表与诊断表；诊断表使用独立结构标识，不参与正式指标选择。多个节点同时声明同一指标结构时仍拒绝准入。
+
 compiler 只执行 typed ports、DAG、Feature/Label 祖先、ResearchSemantics、时间、PIT、seed、
 资源和金融规则等通用不变量，不会按 operator 集合猜测完整工作流。当前没有获准的公共
 workflow profile，因此正式 ResearchPackage 不接受未填的占位值；单项目完整流程由项目
@@ -59,6 +67,8 @@ python -m research_pipeline package lint --package <package目录> --json
 ```
 
 完整包的 lint 一次完成不需要数据库的纯检查：严格 schema、QueryIR、typed ports、DAG 无环、参数、ResultSpec、指标可达性、来源和 OperatorDefinition 已声明的资源预算。输出 `execution_ready=false`，并给出缺失项和下一条 admit 命令；草稿 lint 以 `issues` 一次报告独立可判断的缺口，包含 code、file、field、message、action；YAML 解析失败不伪造依赖检查结果。诊断不产生半完整研究包，也不授予执行资格。
+
+同一次包处理复用四份 YAML 的解析内容，lint、严格加载、编译准备和准入仍分别执行各自的检查。下一次命令重新读取文件；参数变体和来源导入修改声明后重新加载。返回的研究声明保持不可变，不会被其他阶段改写。
 
 ## admit
 
@@ -103,6 +113,6 @@ Catalog 时间角色，Runtime 用受限 iterator 的实际交付及继承状态
 
 ## 通用算子晋级
 
-只有两个异构真实项目已经消费同一语义，并有独立 oracle、PIT/标签/边界攻击测试、通用参数与 Artifact 合同，且 core 不依赖项目目录时，才做人工晋级判断。晋级后所有消费者重新 lint/admit/run/verify；不迁移旧计划和 checkpoint。
+只有两个异构真实项目已经消费同一语义，并有独立 oracle、PIT/标签/边界攻击测试、通用参数与 Artifact 合同，且 core 不依赖项目目录时，才做人工晋级判断。晋级后所有消费者重新 lint/admit/run/report；不迁移旧计划和 checkpoint。
 
 公共发现只读取已批准的定义和身份，不在日常运行中查找私有项目。正式晋级审查须显式传入两个项目的目录映射与 pytest 证据根；审查验证声明可编译、算子图异构、实际消费目标算子，并执行不同的 oracle 与攻击节点。私有项目可在线下审查，不进入公开发行包或公开 CI；仅有临时合成包和能执行的测试节点不足以证明真实跨项目复用。证据测试如涉及写库，执行前另行确认。
