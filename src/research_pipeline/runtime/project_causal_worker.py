@@ -46,7 +46,8 @@ class _CausalSourceVerification(RunScopedArtifactVerification):
                 paths = (*value[1], root / "manifest.json", root / "COMMITTED")
             elif namespace == "parquet_snapshot":
                 root = Path(descriptor["path"])
-                paths = tuple(root / item["relative_path"] for item in value["files"])
+                manifest, _ = value
+                paths = tuple(root / item["relative_path"] for item in manifest["files"])
                 paths = (*paths, root / "manifest.json", root / "COMMITTED")
             self._file_stats[key] = tuple((path, self._stat(path)) for path in paths)
         return value
