@@ -163,7 +163,13 @@ def _run_causal_entry(entry, context, inputs, output_root, causal_context, *, ar
                 return
             if direct is not None:
                 filters = _direct_window_filters(direct, source, item, source_timezone)
-                if direct.manifest.get("temporal_source"):
+                if (direct.manifest.get("temporal_source") and plan.kind == "feature" and source.daily_time is not None
+                        and source.daily_time["rule"] == "next_session_open_following_publication_date"):
+                    # 公告事件不选修订快照，由下游冻结日历计算各条事件的可见开盘。
+                    batches = direct.iter_temporal_fact_batches(
+                        plan=direct.plan, columns=columns, filters=filters, batch_size=batch_size,
+                    )
+                elif direct.manifest.get("temporal_source"):
                     batches = direct.iter_batches_at(
                         plan=direct.plan, consumer_time=item.decision_time,
                         columns=columns, filters=filters, batch_size=batch_size,
